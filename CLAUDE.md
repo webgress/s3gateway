@@ -211,19 +211,50 @@ Use `log/slog` with JSON handler. Log every request: method, path, status, durat
 ### 12. Common Response Headers
 Every response should include: `x-amz-request-id` (UUID), `Server: S3Gateway`
 
+## Unit Test Requirements
+
+Every package MUST have comprehensive unit tests. Write tests ALONGSIDE the code in each phase — do not defer testing. Run `go test ./... -race -v` after each phase and fix all failures before moving on.
+
+### storage package tests (filesystem_test.go, metadata_test.go)
+- Bucket: create, create duplicate (error), delete empty, delete non-empty (error), list, invalid names rejected
+- Object: PutObject+GetObject round trip (small), PutObject+GetObject round trip (50MB streaming), overwrite existing, HeadObject metadata, DeleteObject removes file+sidecar, GetObject non-existent (error), Content-Type preserved, user metadata (x-amz-meta-*) preserved, ETag is correct quoted MD5
+- Path security: `../` rejected, absolute paths rejected, null bytes rejected, unicode keys work, deeply nested keys work, keys with spaces, zero-byte files
+- Listing: prefix filter, delimiter (CommonPrefixes), marker/pagination, maxKeys limit, IsTruncated, empty bucket
+- Multipart: create→put 3 parts→complete round trip, composite ETag format, abort cleans up, list uploads, list parts, part overwrite, wrong ETag on complete (error), wrong part order (error)
+- Metadata: write+read round trip, all fields, empty optional fields, corrupt JSON handling, missing file handling
+- Concurrent: concurrent PutObject to different keys, concurrent Put+Get same key
+
+### auth package tests (sigv4_test.go, credentials_test.go)
+- Credentials: load valid config, empty config (error), missing fields (error), lookup found, lookup not found
+- SigV4: basic GET request signing with known test vectors (construct a request with known access/secret key, date, region — compute expected signature, verify our code matches), PUT with body (content-sha256), presigned URL validation, clock skew >15min (rejected), invalid access key (rejected), invalid signature (rejected), malformed Authorization header parsing, credential header parsing, encodePath with unicode/special chars, canonical request construction with multiple headers and query params
+
+### handler package tests (bucket_test.go, object_test.go, list_test.go, multipart_test.go)
+Use `httptest.NewRecorder()` + `httptest.NewRequest()`. Create temp data-dir per test.
+- Bucket: create→200, duplicate→409, head existing→200, head missing→404, list empty→200, create 3+list→3 entries, delete empty→204, delete non-empty→409
+- Object: PUT+GET round trip verify content and headers, PUT with Content-Type preserved, PUT with x-amz-meta-* preserved in GET, HEAD correct metadata, DELETE+GET→404, GET non-existent→NoSuchKey, PUT to non-existent bucket→NoSuchBucket
+- List: PUT 10 objects + list all, prefix filter, delimiter grouping, max-keys=3 + pagination with continuation-token, start-after, empty bucket
+- Multipart: create→upload 3 parts→complete verify assembled file content, abort verify cleanup, list uploads, invalid part order→error
+
+### s3response package tests (errors_test.go)
+- All error codes map to correct HTTP status
+- XML serialization has correct namespaces
+- Error XML has no namespace
+- ListAllMyBucketsResult serializes correctly
+- ListBucketResultV2 serializes correctly
+
 ## Implementation Order
 
-Execute phases in this order. After each phase, run `go vet ./...` and `go test ./... -race` and fix any issues before proceeding.
+Execute phases in this order. After each phase, run `go vet ./...` and `go test ./... -race -v` and fix ALL failures before proceeding.
 
-1. **Phase 1**: Project skeleton — go.mod, directories, Makefile, main.go
-2. **Phase 2**: Storage layer — filesystem.go, metadata.go + tests → verify `go test ./internal/storage/...`
-3. **Phase 3**: Auth — credentials.go, sigv4.go, chunked_reader.go + tests → verify `go test ./internal/auth/...`
-4. **Phase 4**: S3 response layer — xml.go, errors.go + tests → verify `go test ./internal/s3response/...`
+1. **Phase 1**: Project skeleton — go.mod, directories, Makefile, main.go → verify: `go build ./...`
+2. **Phase 2**: Storage layer — filesystem.go, metadata.go + ALL storage tests → verify: `go test ./internal/storage/... -race -v` ALL PASS
+3. **Phase 3**: Auth — credentials.go, sigv4.go, chunked_reader.go + ALL auth tests → verify: `go test ./internal/auth/... -race -v` ALL PASS
+4. **Phase 4**: S3 response layer — xml.go, errors.go + ALL response tests → verify: `go test ./internal/s3response/... -race -v` ALL PASS
 5. **Phase 5**: Server + routing — server.go, router.go
-6. **Phase 6**: Handlers — bucket.go, object.go, list.go, multipart.go + tests → verify `go test ./...`
-7. **Phase 7**: Integration tests — install aws-cli/boto3, start server, run test scripts
+6. **Phase 6**: Handlers — bucket.go, object.go, list.go, multipart.go + ALL handler tests → verify: `go test ./... -race -v` ALL PASS
+7. **Phase 7**: Integration tests — install aws-cli/boto3, start server, run ALL three test scripts, ALL must pass
 8. **Phase 8**: Documentation — README.md, TESTING.md
-9. **Phase 9**: Commit and push
+9. **Phase 9**: git add all files, commit with descriptive message, push to origin main
 
 ## Integration Testing
 
