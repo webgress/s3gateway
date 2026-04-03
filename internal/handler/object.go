@@ -107,9 +107,9 @@ func (h *ObjectHandler) GetObject(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("ETag", meta.ETag)
 	w.Header().Set("Last-Modified", meta.LastModified.UTC().Format(http.TimeFormat))
 
-	// Set user metadata headers
+	// Set user metadata headers — use direct map assignment to preserve lowercase
 	for k, v := range meta.UserMetadata {
-		w.Header().Set(k, v)
+		w.Header()[http.CanonicalHeaderKey(k)] = []string{v}
 	}
 	if meta.ContentDisposition != "" {
 		w.Header().Set("Content-Disposition", meta.ContentDisposition)

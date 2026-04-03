@@ -324,12 +324,14 @@ func extractSignedHeaders(signedHeaders []string, r *http.Request) http.Header {
 }
 
 // GetCanonicalRequest builds the canonical request string.
+// For S3 service, paths are NOT double-encoded (disableDoubleEncoding=true).
+// The URL path is used as-is since it's already percent-encoded by the client.
 func GetCanonicalRequest(method, urlPath, queryString string, signedHeaders http.Header, hashedPayload string) string {
 	rawQuery := strings.ReplaceAll(queryString, "+", "%20")
-	encoded := EncodePath(urlPath)
+	// Use the path as-is — S3 uses disableDoubleEncoding
 	return strings.Join([]string{
 		method,
-		encoded,
+		urlPath,
 		rawQuery,
 		getCanonicalHeaders(signedHeaders),
 		getSignedHeadersList(signedHeaders),
