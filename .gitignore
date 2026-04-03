@@ -30,3 +30,5 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+bin/
+scripts/test-s3-go/test-s3-go
