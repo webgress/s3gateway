@@ -304,6 +304,14 @@ Out of scope by design — this gateway favors throughput on a narrow API surfac
   memory before applying `max-keys`/pagination, so listing memory scales with the
   number of objects in the bucket. This is fine for typical buckets; very large
   buckets would need a persistent key index (not implemented).
+- **Every `x-amz-*` request header must be covered by `SignedHeaders`.** The
+  gateway strictly enforces (AWS-conformant) that any `x-amz-*` header present on
+  the request — including in a presigned URL — is listed in the signature's
+  `SignedHeaders`; otherwise it returns `SignatureDoesNotMatch`. Standard SDKs
+  (aws-cli, boto3, AWS Go SDK) sign all `x-amz-*` headers they send, so this is
+  transparent in practice. A client that hand-adds an unsigned `x-amz-*` header
+  (e.g. appending `x-amz-meta-*` to a presigned URL after signing) will be
+  rejected.
 
 ## License
 

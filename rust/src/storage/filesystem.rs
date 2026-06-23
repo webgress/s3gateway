@@ -952,9 +952,14 @@ impl Filesystem {
         // directory segment that the ListObjectsV2 walk would silently skip.
         // (e.g. `foo.s3meta` shadows a sidecar; `a.parts.new.x/obj` is hidden by
         // the `.parts.` skip; `foo.s3meta.tmp` collides with the sidecar temp;
-        // `.multipart` is the per-bucket working dir.)
-        for seg in key.split('/') {
-            if is_reserved_segment(seg) {
+        // `.multipart` is the per-bucket working dir.) The predicate is
+        // position-aware: intermediate (directory) segments are matched against
+        // walk_dir's directory-skip set, the final (file) segment against its
+        // file-skip set, so the rejected set equals exactly what listing hides.
+        let seg_count = key.split('/').count();
+        for (i, seg) in key.split('/').enumerate() {
+            let is_final = i + 1 == seg_count;
+            if key_segment_is_reserved(seg, is_final) {
                 return Err(StorageError::ReservedKey);
             }
         }
@@ -1152,14 +1157,47 @@ fn tmp_sibling(path: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
-/// B3: True if a single key path segment collides with one of our internal
-/// on-disk names and must be rejected as a reserved key. The forms mirror exactly
-/// what storage creates: `{key}.s3meta` sidecars, `{key}.parts` part stores,
-/// `{key}.s3meta.tmp` sidecar temps, `{path}.tmp.<uuid>` data/part temps,
-/// `{key}.parts.new.<uuid>` Complete staging dirs, and the per-bucket
-/// `.multipart` working dir. Lexical only (no IO). Ordinary keys with dots —
-/// e.g. `report.parts-list.txt` — are unaffected.
-fn is_reserved_segment(seg: &str) -> bool {
+/// B3: True if a path segment collides with one of our internal on-disk names
+/// and must be rejected as a reserved key. The predicate is split by segment
+/// POSITION because `walk_dir` hides directories and files by DIFFERENT rules,
+/// and the reserved set must equal exactly the keys `walk_dir` would hide —
+/// no more (over-rejecting legit filenames), no less (accepted-but-invisible).
+///
+/// `key.split('/')` is fed to these so that for a key `a/b/c`, `a` and `b` are
+/// directory segments and `c` is the final (file) segment.
+fn key_segment_is_reserved(seg: &str, is_final: bool) -> bool {
+    if is_final {
+        is_reserved_final_segment(seg)
+    } else {
+        is_reserved_dir_segment(seg)
+    }
+}
+
+/// Intermediate (directory) segments must mirror `walk_dir`'s DIRECTORY skip:
+/// `.multipart` working dir, `{key}.parts` part stores, and ANY `.parts.`
+/// transient swap dir (`{key}.parts.new.<uuid>` staging, `{key}.parts.old.<uuid>`
+/// aside) — `contains(".parts.")` subsumes both. Also keep the sidecar / temp
+/// directory collision forms so a client dir can't shadow a sidecar or temp.
+/// Note `report.parts.bar.txt` as a DIRECTORY segment IS rejected here, which is
+/// correct: `walk_dir` would skip such a directory, so any object beneath it
+/// would be invisible.
+fn is_reserved_dir_segment(seg: &str) -> bool {
+    seg == MULTIPART_DIR
+        || seg.ends_with(META_SUFFIX)
+        || seg.ends_with(".parts")
+        || seg.contains(".parts.")
+        || seg.ends_with(".s3meta.tmp")
+        || seg.contains(".tmp.")
+}
+
+/// The final (file) segment must mirror `walk_dir`'s FILE skip, which only hides
+/// `{key}.s3meta` sidecars and `.tmp.` temps (the listing callback filter), plus
+/// the on-disk name collisions a leaf would clobber: `{key}.parts` store dir,
+/// `{key}.s3meta.tmp` sidecar temp, and `{key}.parts.new.<uuid>` staging dir.
+/// Crucially it does NOT add a bare `contains(".parts.")`: a legit FILE such as
+/// `report.parts.bar.txt` is surfaced by `walk_dir` (the file callback applies no
+/// `.parts` filter) and must remain a valid key.
+fn is_reserved_final_segment(seg: &str) -> bool {
     seg == MULTIPART_DIR
         || seg.ends_with(META_SUFFIX)
         || seg.ends_with(".parts")
@@ -2849,15 +2887,22 @@ mod tests {
 
     #[test]
     fn reserved_name_segment_gaps_rejected() {
-        // B3: the reserved-name check must apply to EVERY path segment and cover
-        // the sidecar-temp collision form and the staging-dir form, while still
-        // accepting ordinary keys that merely contain the tokens mid-name.
+        // B3: the reserved-name check must apply to EVERY path segment and the
+        // set of rejected keys must equal EXACTLY the set of keys that
+        // `walk_dir` would hide from ListObjectsV2 — covering directory segments
+        // (`.multipart`, `*.parts`, any `*.parts.*` swap dir, sidecar/temp
+        // collisions) and the final-file segment (sidecar/temp collisions and
+        // the `.parts.new.<uuid>` staging form), while still accepting ordinary
+        // filenames that merely contain the tokens mid-name.
         let (_d, f) = fs();
         f.create_bucket("buck").unwrap();
         for bad in [
             "foo.s3meta.tmp",    // collides with the sidecar temp form
             "a.parts.new.x/obj", // intermediate staging-dir segment (hidden by walk)
+            "a.parts.old.x/obj", // intermediate Complete-swap aside dir (hidden by walk)
+            "x.parts.y/obj",     // ANY intermediate `.parts.` dir is hidden by walk
             "x/.multipart/y",    // the per-bucket working dir name as a segment
+            "p/.multipart/o",    // .multipart as an intermediate segment
             "dir/inner.s3meta",  // sidecar in a sub-segment
             "deep/a.parts/leaf", // part-store dir as an intermediate segment
         ] {
@@ -2866,11 +2911,16 @@ mod tests {
                     f.put_object("buck", bad, &b"x"[..], "", um()),
                     Err(StorageError::ReservedKey)
                 ),
-                "put_object should reject reserved key {bad:?}"
+                "put_object should reject reserved key {bad:?} (walk_dir hides it)"
             );
         }
         // Ordinary keys with dots must still work (NOT the exact internal forms).
+        // In particular `report.parts.bar.txt` as a FINAL (file) segment is NOT
+        // hidden by walk_dir's file filter, so it must remain valid — this is the
+        // load-bearing case that fails if the final-segment predicate over-rejects
+        // bare `.parts.`.
         for good in [
+            "report.parts.bar.txt",
             "report.parts-list.txt",
             "notes.parts.txt",
             "x.s3meta.txt",
@@ -2879,6 +2929,81 @@ mod tests {
         ] {
             f.put_object("buck", good, &b"ok"[..], "", um())
                 .unwrap_or_else(|e| panic!("good key {good:?} should be accepted, got {e:?}"));
+        }
+    }
+
+    #[test]
+    fn reserved_key_set_matches_walk_dir_hidden_set() {
+        // B3 (load-bearing): for a representative corpus of keys, the reserved-key
+        // predicate must reject a key IFF `walk_dir`'s skip logic would hide it.
+        // This is the invariant the bracket review demanded; it FAILS if the
+        // directory predicate is reverted to the `.parts.new.`-only form, because
+        // `x.parts.y/obj` and `a.parts.old.x/obj` would then be accepted-but-hidden.
+
+        // Mirror walk_dir's actual skip predicates (filesystem.rs walk_dir):
+        //  - DIRECTORY segment skipped if: == MULTIPART_DIR, ends_with(".parts"),
+        //    or contains(".parts.")  (plus our sidecar/temp dir-collision forms).
+        //  - FINAL/FILE segment hidden if the listing callback would drop it:
+        //    ends_with(".s3meta") or contains(".tmp."), OR it collides with an
+        //    on-disk name a leaf would clobber (.parts store, .s3meta.tmp temp,
+        //    .parts.new.<uuid> staging).
+        fn dir_hidden(seg: &str) -> bool {
+            seg == MULTIPART_DIR
+                || seg.ends_with(".parts")
+                || seg.contains(".parts.")
+                || seg.ends_with(META_SUFFIX)
+                || seg.ends_with(".s3meta.tmp")
+                || seg.contains(".tmp.")
+        }
+        fn file_hidden(seg: &str) -> bool {
+            seg.ends_with(META_SUFFIX)
+                || seg.contains(".tmp.")
+                || seg.ends_with(".parts")
+                || seg.ends_with(".s3meta.tmp")
+                || seg.contains(".parts.new.")
+                || seg == MULTIPART_DIR
+        }
+        fn walk_would_hide(key: &str) -> bool {
+            let segs: Vec<&str> = key.split('/').collect();
+            let n = segs.len();
+            segs.iter().enumerate().any(|(i, s)| {
+                if i + 1 == n {
+                    file_hidden(s)
+                } else {
+                    dir_hidden(s)
+                }
+            })
+        }
+
+        let corpus = [
+            "x.parts.y/obj",
+            "a.parts.old.x/obj",
+            "a.parts.new.x/obj",
+            "p/.multipart/o",
+            "deep/a.parts/leaf",
+            "foo.s3meta.tmp",
+            "dir/inner.s3meta",
+            "report.parts.bar.txt",
+            "report.parts-list.txt",
+            "notes.parts.txt",
+            "x.s3meta.txt",
+            "a/b/c.txt",
+            "my.multipart.notes.txt",
+            "data.parts",
+            "obj.s3meta",
+            "tmp.in.middle/.tmp.x/leaf",
+        ];
+        for key in corpus {
+            let seg_count = key.split('/').count();
+            let predicate_rejects = key
+                .split('/')
+                .enumerate()
+                .any(|(i, seg)| key_segment_is_reserved(seg, i + 1 == seg_count));
+            assert_eq!(
+                predicate_rejects,
+                walk_would_hide(key),
+                "reserved predicate vs walk_dir-hidden mismatch for {key:?}"
+            );
         }
     }
 

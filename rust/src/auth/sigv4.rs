@@ -1290,38 +1290,81 @@ mod tests {
         assert_eq!(res.access_key_id, "AKID");
     }
 
-    #[test]
-    fn presigned_unsigned_amz_header_rejected() {
-        // B2: the same rule applies to presigned requests. A presigned URL whose
-        // SignedHeaders omits a present `x-amz-meta-*` header is rejected.
-        let store = CredentialStore::from_json(
-            br#"{"credentials":[{"accessKeyId":"AKID","secretAccessKey":"SECRET"}]}"#,
-        )
-        .unwrap();
-        let now = 1_700_000_000;
-        let amz_date = t::iso8601_from_unix(now);
-        let yyyymmdd = &amz_date[..8];
-        let region = "us-east-1";
+    /// B2 helper: build a presigned GET that signs exactly `signed_header_names`
+    /// over the header map `h`, computing a VALID `X-Amz-Signature`. Returns the
+    /// query map ready to verify; `h` is left holding only the request headers.
+    fn presign_request_with(
+        secret: &str,
+        access: &str,
+        region: &str,
+        now_unix: i64,
+        h: &BTreeMap<String, Vec<String>>,
+        signed_header_names: &[&str],
+    ) -> BTreeMap<String, Vec<String>> {
         let service = "s3";
+        let amz_date = t::iso8601_from_unix(now_unix);
+        let yyyymmdd = amz_date[..8].to_string();
         let mut q: BTreeMap<String, Vec<String>> = BTreeMap::new();
         q.insert("X-Amz-Algorithm".into(), vec![SIGN_V4_ALGORITHM.into()]);
         q.insert(
             "X-Amz-Credential".into(),
             vec![format!(
-                "AKID/{}/{}/{}/aws4_request",
-                yyyymmdd, region, service
+                "{}/{}/{}/{}/aws4_request",
+                access, yyyymmdd, region, service
             )],
         );
         q.insert("X-Amz-Date".into(), vec![amz_date.clone()]);
         q.insert("X-Amz-Expires".into(), vec!["3600".into()]);
-        q.insert("X-Amz-SignedHeaders".into(), vec!["host".into()]);
-        // A signature value is irrelevant: the amz-header check runs before the
-        // signature comparison.
-        q.insert("X-Amz-Signature".into(), vec!["deadbeef".into()]);
+        let signed: Vec<String> = signed_header_names.iter().map(|s| s.to_string()).collect();
+        q.insert("X-Amz-SignedHeaders".into(), vec![signed.join(";")]);
+
+        // Build the canonical request over ONLY the signed headers, mirroring
+        // verify_presigned (which uses the presigned=true query-canonicalization).
+        let req = SignableRequest {
+            method: "GET",
+            escaped_path: "/bucket/key",
+            query: &q,
+            headers: h,
+            host: "localhost:8333",
+        };
+        let extracted = extract_signed_headers(&signed, &req);
+        let canonical = get_canonical_request(
+            "GET",
+            "/bucket/key",
+            &encode_query(&q, true),
+            &extracted,
+            UNSIGNED_PAYLOAD,
+        );
+        let scope = get_scope(&yyyymmdd, region, service);
+        let sts = get_string_to_sign(&canonical, &amz_date, &scope);
+        let key = get_signing_key(secret, &yyyymmdd, region, service);
+        let sig = get_signature(&key, &sts);
+        q.insert("X-Amz-Signature".into(), vec![sig]);
+        q
+    }
+
+    #[test]
+    fn presigned_unsigned_amz_header_rejected() {
+        // B2 (discriminating): a presigned URL with a VALID signature whose
+        // SignedHeaders OMITS a present `x-amz-meta-*` header must be rejected
+        // (SignatureDoesNotMatch). The signature is genuinely valid for the
+        // canonical request WITHOUT the meta header, so the rejection can only
+        // come from `assert_all_amz_headers_signed` — not a signature mismatch.
+        // Mutation evidence: neuter that call in `verify_presigned` and this test
+        // FAILS (the request would verify successfully).
+        let store = CredentialStore::from_json(
+            br#"{"credentials":[{"accessKeyId":"AKID","secretAccessKey":"SECRET"}]}"#,
+        )
+        .unwrap();
+        let now = 1_700_000_000;
+        let region = "us-east-1";
         let mut h = BTreeMap::new();
         h.insert("host".into(), vec!["localhost:8333".into()]);
-        // Present x-amz-meta-* header NOT in SignedHeaders (only host signed).
+        // Sign over host ONLY (the meta header is deliberately not signed).
+        let q = presign_request_with("SECRET", "AKID", region, now, &h, &["host"]);
+        // Inject an UNSIGNED x-amz-meta-* header AFTER signing.
         h.insert("x-amz-meta-foo".into(), vec!["evil".into()]);
+
         let req = SignableRequest {
             method: "GET",
             escaped_path: "/bucket/key",
@@ -1331,5 +1374,41 @@ mod tests {
         };
         let err = verify_request(&req, &store, region, now).unwrap_err();
         assert_eq!(err, SigV4Error::SignatureMismatch);
+    }
+
+    #[test]
+    fn presigned_signed_amz_header_accepted() {
+        // B2 (positive, presigned): when the same `x-amz-meta-foo` header IS in
+        // SignedHeaders (and signed), the presigned request succeeds. Paired with
+        // `presigned_unsigned_amz_header_rejected` this proves the check
+        // discriminates on whether the header is covered, not on signature alone.
+        let store = CredentialStore::from_json(
+            br#"{"credentials":[{"accessKeyId":"AKID","secretAccessKey":"SECRET"}]}"#,
+        )
+        .unwrap();
+        let now = 1_700_000_000;
+        let region = "us-east-1";
+        let mut h = BTreeMap::new();
+        h.insert("host".into(), vec!["localhost:8333".into()]);
+        h.insert("x-amz-meta-foo".into(), vec!["good".into()]);
+        // Sign INCLUDING x-amz-meta-foo.
+        let q = presign_request_with(
+            "SECRET",
+            "AKID",
+            region,
+            now,
+            &h,
+            &["host", "x-amz-meta-foo"],
+        );
+
+        let req = SignableRequest {
+            method: "GET",
+            escaped_path: "/bucket/key",
+            query: &q,
+            headers: &h,
+            host: "localhost:8333",
+        };
+        let res = verify_request(&req, &store, region, now).unwrap();
+        assert_eq!(res.access_key_id, "AKID");
     }
 }

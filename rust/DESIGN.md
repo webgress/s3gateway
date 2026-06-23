@@ -120,6 +120,14 @@ SigV4 **seed** signature is verified, at request-auth time. The per-chunk
 `chunk-signature` values are intentionally not re-verified — that would impose a
 per-byte HMAC on the hot path for no benefit beyond what TLS already provides.
 
+We also enforce the AWS-conformant rule that **every `x-amz-*` request header must
+be covered by `SignedHeaders`** (for both header-auth and presigned requests). An
+`x-amz-*` header present on the wire but absent from the signature's
+`SignedHeaders` yields `SignatureDoesNotMatch`. Standard SDKs sign all `x-amz-*`
+headers they emit, so this is invisible in normal use; it specifically blocks a
+client from smuggling an unsigned `x-amz-*` header (e.g. tacking `x-amz-meta-*`
+onto a presigned URL after it was signed).
+
 ## Durability: crash-safe publication (the `--fsync` knob)
 
 Object publication is made durable by default. PUT writes the data to a temp file
