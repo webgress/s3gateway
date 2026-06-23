@@ -33,6 +33,15 @@ pub async fn put_object(ctx: &Ctx, req: HandlerRequest) -> Result<Response<RespB
 
     let is_streaming = super::is_chunked_upload(&req.headers);
 
+    // E4: the de-framed payload size the signature covers. For a STREAMING-*
+    // (aws-chunked) body the header is REQUIRED — without it we cannot verify the
+    // body wasn't truncated/padded relative to what was signed, so reject as
+    // InvalidArgument. `ChunkedReader` then enforces the count at EOF.
+    let expected_len = super::decoded_content_length(&req.headers)?;
+    if is_streaming && expected_len.is_none() {
+        return Err(S3ErrorCode::InvalidArgument);
+    }
+
     // Turn the hyper Incoming body into a blocking std::io::Read:
     //   BodyStream (Stream of Frames) -> data-only bytes -> StreamReader
     //   (AsyncRead) -> SyncIoBridge (blocking Read).
@@ -41,8 +50,9 @@ pub async fn put_object(ctx: &Ctx, req: HandlerRequest) -> Result<Response<RespB
     let fs = ctx.fs.clone();
     let etag = tokio::task::spawn_blocking(move || -> Result<String, StorageError> {
         if is_streaming {
-            // De-frame the SigV4 chunked payload before storing.
-            let reader = ChunkedReader::new(bridge);
+            // De-frame the SigV4 chunked payload before storing, verifying the
+            // de-framed byte total matches x-amz-decoded-content-length (E4).
+            let reader = ChunkedReader::new(bridge, expected_len);
             fs.put_object(&bucket, &key, reader, &content_type, user_meta)
         } else {
             fs.put_object(&bucket, &key, bridge, &content_type, user_meta)

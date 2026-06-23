@@ -68,6 +68,11 @@ pub type Result<T> = std::result::Result<T, StorageError>;
 /// hash maps cheaply; large enough that unrelated keys almost never collide.
 const KEY_LOCK_SHARDS: usize = 256;
 
+/// E7: hard cap on the number of uploads ListMultipartUploads returns in one
+/// response (mirrors S3's default/maximum `max-uploads`). Bounds memory/response
+/// size regardless of the client-supplied `max-uploads`.
+pub const MAX_UPLOADS_CAP: usize = 1000;
+
 /// Root-anchored filesystem store.
 #[derive(Debug, Clone)]
 pub struct Filesystem {
@@ -291,6 +296,30 @@ mod publish_pause {
             st.lock_contended
         }
 
+        /// Like [`wait_b_disposition`] but bounded by `timeout`. Returns
+        /// `Some(blocked_on_lock)` if a disposition was observed, or `None` on
+        /// timeout (used by the E3 test so a MISSING lock surfaces as a clean
+        /// assertion failure instead of an indefinite hang).
+        pub(super) fn wait_b_disposition_timeout(
+            &self,
+            timeout: std::time::Duration,
+        ) -> Option<bool> {
+            let deadline = std::time::Instant::now() + timeout;
+            let mut st = self.state.lock().unwrap();
+            while !st.lock_contended && !st.second_window {
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    return None;
+                }
+                let (g, res) = self.cv.wait_timeout(st, deadline - now).unwrap();
+                st = g;
+                if res.timed_out() && !st.lock_contended && !st.second_window {
+                    return None;
+                }
+            }
+            Some(st.lock_contended)
+        }
+
         /// Release the parked writer (writer A).
         pub(super) fn release(&self) {
             let mut st = self.state.lock().unwrap();
@@ -351,6 +380,79 @@ fn publish_window_pause(_bucket: &str, _key: &str) {
 #[inline(always)]
 fn note_lock_contention(bucket: &str, key: &str) {
     publish_pause::note_lock_contention(bucket, key);
+}
+
+/// E3 deterministic test hook: a one-shot pause armed for one `{bucket}/{key}`,
+/// fired by `complete_multipart_upload` at the validate->stage boundary (while it
+/// holds the per-key lock). A test arms it, waits for Complete to park inside the
+/// window, kicks off a concurrent `upload_part` for the same key, then asserts the
+/// upload_part is BLOCKED on the per-key lock (proving the lock serializes the two
+/// — closing the TOCTOU) before releasing Complete. `#[cfg(test)]` only: the call
+/// site compiles to an empty inline fn in production.
+#[cfg(test)]
+mod complete_pause {
+    use std::sync::{Condvar, Mutex, OnceLock};
+
+    pub(super) struct Hook {
+        pub key: String,
+        state: Mutex<State>,
+        cv: Condvar,
+    }
+    #[derive(Default)]
+    struct State {
+        arrived: bool,
+        released: bool,
+    }
+    static HOOK: OnceLock<Mutex<Option<&'static Hook>>> = OnceLock::new();
+    fn slot() -> &'static Mutex<Option<&'static Hook>> {
+        HOOK.get_or_init(|| Mutex::new(None))
+    }
+    impl Hook {
+        pub(super) fn arm(key: &str) -> &'static Hook {
+            let h: &'static Hook = Box::leak(Box::new(Hook {
+                key: key.to_string(),
+                state: Mutex::new(State::default()),
+                cv: Condvar::new(),
+            }));
+            *slot().lock().unwrap() = Some(h);
+            h
+        }
+        pub(super) fn disarm() {
+            *slot().lock().unwrap() = None;
+        }
+        pub(super) fn wait_arrived(&self) {
+            let mut st = self.state.lock().unwrap();
+            while !st.arrived {
+                st = self.cv.wait(st).unwrap();
+            }
+        }
+        pub(super) fn release(&self) {
+            let mut st = self.state.lock().unwrap();
+            st.released = true;
+            self.cv.notify_all();
+        }
+    }
+    pub(super) fn pause(bucket: &str, key: &str) {
+        let hook = { *slot().lock().unwrap() };
+        let Some(hook) = hook else { return };
+        if hook.key != format!("{bucket}/{key}") {
+            return;
+        }
+        let mut st = hook.state.lock().unwrap();
+        st.arrived = true;
+        hook.cv.notify_all();
+        while !st.released {
+            st = hook.cv.wait(st).unwrap();
+        }
+    }
+}
+
+/// E3 validate->stage pause point in `complete_multipart_upload`. No-op outside
+/// tests; see [`complete_pause`].
+#[inline(always)]
+fn complete_validate_stage_pause(_bucket: &str, _key: &str) {
+    #[cfg(test)]
+    complete_pause::pause(_bucket, _key);
 }
 
 impl Filesystem {
@@ -653,6 +755,17 @@ impl Filesystem {
             g.disarm();
         }
 
+        // E6: for a NESTED key, `create_dir_all` above may have created ancestor
+        // directories that the commit's leaf-dir fsync did not cover. Under
+        // --fsync, fsync the whole ancestor chain (leaf up to the bucket root) so
+        // newly-created ancestor dir entries survive a crash. (The leaf dir is
+        // fsync'd again here; that is an idempotent, cheap syscall.)
+        if self.fsync {
+            if let Some(parent) = obj_path.parent() {
+                fsync_dir_chain(parent, &self.root.join(bucket))?;
+            }
+        }
+
         // A single-part PUT over a prior multipart object must drop the old
         // `{key}.parts` store (the new `.s3meta` already has `multipart: None`,
         // so GetObject reads the single file; the stale parts would just leak).
@@ -827,15 +940,18 @@ impl Filesystem {
                     return Ok(());
                 }
             }
-            let md = std::fs::metadata(path)?;
-            // Prefer the `.s3meta` sidecar when present: it carries the TRUE
-            // size/etag/last-modified. This matters for completed multipart
-            // objects, whose on-disk data file is a 0-byte placeholder (the
-            // real bytes live in the `{key}.parts` store, with the size in the
-            // sidecar's content_length).
+            // E1: a listable object is ONE that GET/HEAD can serve, i.e. one with
+            // a readable `.s3meta` sidecar (it carries the TRUE size/etag/
+            // last-modified — required for completed multipart objects, whose
+            // on-disk data file is a 0-byte placeholder). A data file with NO
+            // sidecar (e.g. an interrupted write, or an externally-dropped file)
+            // would HEAD/GET as ObjectNotFound, so SKIP it here rather than
+            // surface a phantom entry with an empty ETag that LIST and GET
+            // disagree on. (Real objects — single-part AND multipart — always have
+            // a sidecar at `{key}.s3meta`, so this never hides a servable object.)
             let (size, etag, last_modified_unix) = match read_metadata(&meta_path(path)) {
                 Ok(m) => (m.content_length, m.etag, m.last_modified),
-                Err(_) => (md.len() as i64, String::new(), mtime_unix(&md)),
+                Err(_) => return Ok(()),
             };
             all_keys.push(ObjectInfo {
                 key,
@@ -973,6 +1089,17 @@ impl Filesystem {
         drop(file);
 
         let etag = format!("\"{}\"", hex::encode(hasher.finalize()));
+
+        // E3: serialize the part PUBLISH (the rename into `parts/{NNNNN}`) against a
+        // concurrent CompleteMultipartUpload for the SAME bucket/key. Complete holds
+        // this same per-key lock across its validate->stage section; without taking
+        // it here, an UploadPart could replace a part file BETWEEN complete's
+        // validate (MD5/size) and stage (rename into staging), so the published
+        // manifest/composite-ETag would not match the bytes complete actually
+        // staged. We acquire it ONLY around the rename — AFTER the streaming write
+        // loop above — so concurrent part uploads still stream fully in parallel and
+        // only serialize at the instant of publish.
+        let _publish_guard = self.lock_key(bucket, key);
         directio::rename(&tmp_path, &part_path)?;
         guard.disarm();
         Ok(etag)
@@ -998,6 +1125,19 @@ impl Filesystem {
         // the manifest is trusted, but the containment check also covers the
         // `{key}.parts` store dir we create below).
         self.validate_object_path(&upload.bucket, &upload.key)?;
+
+        // E3: acquire the per-key publish lock at the TOP — BEFORE part validation
+        // (MD5/size) and BEFORE staging — keyed by the upload's STORED bucket/key.
+        // The previous code locked only just before the publish swap, AFTER it had
+        // already validated each part's MD5/size and (further down) staged the part
+        // files. A concurrent `upload_part` for the same uploadId/key (which now
+        // also takes this same lock around its part rename, see `upload_part`) could
+        // replace a part BETWEEN this complete's validate and stage, so the
+        // published manifest/composite-ETag would not match the bytes actually
+        // staged (TOCTOU). Holding ONE guard for the whole validate->stage->commit
+        // section closes that window. There is no later re-acquisition (that would
+        // deadlock on the same shard).
+        let _publish_guard = self.lock_key(&upload.bucket, &upload.key);
 
         // B5: an empty parts list is not a valid completion (it would otherwise
         // yield a `...-0` composite ETag and a 0-byte object).
@@ -1054,6 +1194,14 @@ impl Filesystem {
             });
         }
 
+        // E3 verification hook: pause HERE — between validation (MD5/size above)
+        // and staging (the part renames below). A concurrent `upload_part` for the
+        // same key that runs in THIS window would, without the per-key lock, replace
+        // a part file and make the published manifest/ETag disagree with the staged
+        // bytes. The lock is already held (top of fn), so a concurrent upload_part
+        // blocks on `lock_key` here. No-op in production builds.
+        complete_validate_stage_pause(&upload.bucket, &upload.key);
+
         // Composite ETag: md5(concat of raw 16-byte part digests)-N.
         let composite = Md5::digest(&md5_concat);
         let etag = format!("\"{}-{}\"", hex::encode(composite), parts.len());
@@ -1078,13 +1226,55 @@ impl Filesystem {
         // failed complete does not leak a `{key}.parts.new.<uuid>` tree.
         let mut staging_guard = TmpDirGuard::new(staging.clone());
         std::fs::create_dir_all(&staging)?;
+
+        // E2: the upload's parts dir — the upload's ONLY copy of the part files.
+        // Complete MOVES (renames) each part out of here into `staging`, so on ANY
+        // pre-commit failure we must move them BACK here, leaving `.multipart/
+        // {uploadId}/parts/{NNNNN}` intact so the client can RETRY Complete. The
+        // previous code instead re-armed the staging guard, which `remove_dir_all`d
+        // the staged parts — destroying the upload's only copy and making a failed
+        // Complete non-retryable. `restore_staged_parts!` moves whatever part files
+        // are currently in `staging` back to the upload parts dir (handles the
+        // partial-staging case: only the parts already moved are restored).
+        let upload_parts_dir = upload_dir.join("parts");
+        macro_rules! restore_staged_parts {
+            () => {{
+                if let Ok(rd) = std::fs::read_dir(&staging) {
+                    for ent in rd.flatten() {
+                        let name = ent.file_name();
+                        let _ = directio::rename(&ent.path(), &upload_parts_dir.join(&name));
+                    }
+                }
+                // The staged parts (if any) are now back in the upload dir; drop the
+                // empty staging dir without deleting any part data.
+                let _ = std::fs::remove_dir_all(&staging);
+                staging_guard.disarm();
+            }};
+        }
+
         for pr in manifest.iter_mut() {
             let staged = staging.join(format!("{:05}", pr.part_number));
-            directio::rename(Path::new(&pr.path), &staged)?;
+            // E2: on a staging-loop failure, restore the parts already moved into
+            // `staging` back to the upload dir before returning, so the upload
+            // remains retryable. (`pr.path` is still the upload-dir source path here.)
+            if let Err(e) = directio::rename(Path::new(&pr.path), &staged) {
+                restore_staged_parts!();
+                return Err(e.into());
+            }
             if self.fsync {
                 // Make the staged part durable before we publish it.
-                let f = DioFile::open_read(&staged)?;
-                f.fsync()?;
+                match DioFile::open_read(&staged) {
+                    Ok(f) => {
+                        if let Err(e) = f.fsync() {
+                            restore_staged_parts!();
+                            return Err(e.into());
+                        }
+                    }
+                    Err(e) => {
+                        restore_staged_parts!();
+                        return Err(e.into());
+                    }
+                }
             }
             // The manifest records the FINAL path (post-swap), not the staging path.
             pr.path = parts_store
@@ -1131,14 +1321,10 @@ impl Filesystem {
         //   3. only AFTER the commit, remove the old store.
         // On ANY failure before the sidecar commit, restore `parts_store` from
         // `old_aside` so the old sidecar + parts remain mutually consistent.
-
-        // D3: acquire the per-key publish lock before the mutate-and-publish
-        // critical section (stage sidecar -> aside parts/data -> swap -> placeholder
-        // -> sidecar-commit). Part validation/MD5 above only read the (uuid-keyed)
-        // upload dir, so they ran lock-free; this serializes only the publish of
-        // `{key}` against concurrent PUT/Complete/Delete for the SAME key. Keyed by
-        // the upload's STORED bucket/key (same as `obj_path`).
-        let _publish_guard = self.lock_key(&upload.bucket, &upload.key);
+        //
+        // E3: the per-key publish lock is already held (acquired at the top of this
+        // fn, before validation+staging) — do NOT re-acquire it here, that would
+        // deadlock on the same shard.
 
         // 0. Stage the new sidecar to a temp (durable when --fsync) FIRST. Nothing
         // the old sidecar references has changed yet.
@@ -1196,12 +1382,20 @@ impl Filesystem {
         // Restores the parts store AND the `{key}` data file; for a FRESH complete
         // (no prior data) it removes the just-written placeholder so no LIST-visible
         // phantom object is left behind.
+        //
+        // E2: the NEW parts (the upload's only copy) must NOT be destroyed on a
+        // failed Complete — the client must be able to RETRY. So instead of
+        // re-arming the staging guard (which would `remove_dir_all` the staged
+        // parts), we move the new parts back to where they came from:
+        // `.multipart/{uploadId}/parts/{NNNNN}`. The new parts are in `parts_store`
+        // if the swap already succeeded, or still in `staging` if it didn't; in
+        // either case we funnel them into `staging` and then `restore_staged_parts!`
+        // moves them back to the upload dir, leaving the upload fully intact.
         macro_rules! restore_old {
             () => {{
                 if std::fs::metadata(&parts_store).is_ok() {
                     // The staged store is in place; move it back to `staging`.
                     let _ = directio::rename(&parts_store, &staging);
-                    staging_guard.rearm();
                 }
                 if had_old {
                     let _ = directio::rename(&old_aside, &parts_store);
@@ -1217,6 +1411,8 @@ impl Filesystem {
                     // Fresh complete: drop the placeholder so nothing is published.
                     let _ = std::fs::remove_file(&obj_path);
                 }
+                // E2: move the new parts back to the upload dir (retryable Complete).
+                restore_staged_parts!();
             }};
         }
         // 2. Move the staged store INTO place. If this fails, restore the old one.
@@ -1261,6 +1457,15 @@ impl Filesystem {
             return Err(e.into());
         }
         meta_tmp_guard.disarm();
+        // E6: a NESTED-key complete may have created ancestor directories via
+        // `create_dir_all(parent)` above. Under --fsync, fsync the ancestor chain
+        // (leaf up to the bucket root) so those new dir entries — and the object
+        // they now hold — survive a crash.
+        if self.fsync {
+            if let Some(parent) = obj_path.parent() {
+                fsync_dir_chain(parent, &self.root.join(&upload.bucket))?;
+            }
+        }
         // 5. New object fully published — now remove the old parts store and the
         // superseded `{key}` data file aside.
         if had_old {
@@ -1285,18 +1490,32 @@ impl Filesystem {
         Ok(())
     }
 
-    pub fn list_multipart_uploads(&self, bucket: &str) -> Result<Vec<MultipartUpload>> {
+    /// List in-progress multipart uploads for `bucket`, BOUNDED by `max_uploads`.
+    ///
+    /// E7: returns `(uploads, is_truncated)` with AT MOST `max_uploads` entries
+    /// (hard-capped at [`MAX_UPLOADS_CAP`]), sorted by (key, upload-id) for a stable
+    /// order. `is_truncated` is true when more matching uploads exist than were
+    /// returned, so the response (and the memory the handler holds) is bounded even
+    /// with a very large `.multipart/` working dir. (Full resumable key-marker
+    /// pagination is not implemented — see DESIGN.md; the cap + IsTruncated keep
+    /// memory/response bounded, which is the security-relevant property.)
+    pub fn list_multipart_uploads(
+        &self,
+        bucket: &str,
+        max_uploads: usize,
+    ) -> Result<(Vec<MultipartUpload>, bool)> {
         // B6: a named bucket must exist or this is NoSuchBucket. (`.multipart/` is
         // a per-root working dir; scanning it for a missing bucket would otherwise
         // return an empty success and mask the absent bucket.)
         if !bucket.is_empty() {
             self.head_bucket(bucket)?;
         }
+        let cap = max_uploads.min(MAX_UPLOADS_CAP);
         // C5: reject a symlinked `.multipart` before scanning it.
         let mp_dir = self.multipart_root()?;
         let rd = match std::fs::read_dir(&mp_dir) {
             Ok(rd) => rd,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok((Vec::new(), false)),
             Err(e) => return Err(e.into()),
         };
         let mut out = Vec::new();
@@ -1319,8 +1538,18 @@ impl Filesystem {
                 }
             }
         }
-        out.sort_by(|a, b| a.key.cmp(&b.key));
-        Ok(out)
+        // Sort by (key, upload-id) for a stable, deterministic order before capping.
+        out.sort_by(|a, b| {
+            a.key
+                .cmp(&b.key)
+                .then_with(|| a.upload_id.cmp(&b.upload_id))
+        });
+        // E7: cap to `max_uploads` (hard-capped) and report truncation if more exist.
+        let is_truncated = out.len() > cap;
+        if is_truncated {
+            out.truncate(cap);
+        }
+        Ok((out, is_truncated))
     }
 
     /// B4: `bucket`/`key` are the REQUEST path and must match the upload's stored
@@ -1611,12 +1840,6 @@ impl TmpDirGuard {
     fn disarm(&mut self) {
         self.armed = false;
     }
-    /// F7: re-arm a previously-disarmed guard. Used on the Complete rollback path
-    /// when the staged store has been renamed BACK to the staging dir after a
-    /// later step failed, so the staging dir is cleaned on drop instead of leaking.
-    fn rearm(&mut self) {
-        self.armed = true;
-    }
 }
 impl Drop for TmpDirGuard {
     fn drop(&mut self) {
@@ -1659,6 +1882,32 @@ fn tmp_sibling(path: &Path) -> PathBuf {
     let mut s = path.as_os_str().to_owned();
     s.push(format!(".tmp.{}", Uuid::new_v4()));
     PathBuf::from(s)
+}
+
+/// E6: fsync the directory chain from `leaf` UP TO AND INCLUDING `bucket_root`.
+///
+/// `put_object`/`complete` call `create_dir_all(parent)` to materialize a nested
+/// key's ancestor directories (e.g. `a/b/c` -> create `a` and `a/b`), but the
+/// object commit only fsyncs the LEAF directory (the one holding the data file +
+/// sidecar). On a crash the newly-created ANCESTOR dir entries can be lost, taking
+/// the just-committed object with them. After `create_dir_all`, walk from `leaf`
+/// up to `bucket_root` (inclusive) and fsync each directory so every new directory
+/// entry on the path is durable. Stops at `bucket_root` (the bucket dir itself was
+/// created by `create_bucket`; we do not fsync the data-root above it here).
+///
+/// Idempotent and cheap: fsync of an already-durable dir is a no-op-ish syscall.
+/// Best-effort per dir — a fsync error propagates so the caller can treat the
+/// publish as failed under `--fsync` (mirrors the leaf-dir fsync semantics).
+fn fsync_dir_chain(leaf: &Path, bucket_root: &Path) -> io::Result<()> {
+    let mut dir: Option<&Path> = Some(leaf);
+    while let Some(d) = dir {
+        fsync_dir(d)?;
+        if d == bucket_root {
+            break;
+        }
+        dir = d.parent();
+    }
+    Ok(())
 }
 
 /// B3: True if a path segment collides with one of our internal on-disk names
@@ -2441,6 +2690,76 @@ mod tests {
         assert_eq!(keys, vec!["c", "d"]);
     }
 
+    #[test]
+    fn list_skips_sidecarless_phantom() {
+        // E1 regression: a data file with NO `.s3meta` sidecar must NOT be listed —
+        // HEAD/GET require the sidecar and return ObjectNotFound, so LIST surfacing
+        // it would be a phantom entry (empty ETag) that LIST and GET disagree on.
+        // Normal single-part AND completed-multipart objects (which always have a
+        // sidecar) must still be listed.
+        //
+        // Mutation evidence: revert the listing closure's `Err(_) => return Ok(())`
+        // back to the old `(md.len(), "", mtime)` fallback and this test FAILS — the
+        // sidecar-less file appears in the listing with an empty ETag.
+        let (_d, f) = fs();
+        f.create_bucket("buck").unwrap();
+
+        // A normal single-part object (has a sidecar).
+        f.put_object("buck", "real.txt", &b"hello"[..], "text/plain", um())
+            .unwrap();
+
+        // A completed multipart object (has a sidecar; data file is a 0-byte
+        // placeholder, real bytes live in the `.parts` store).
+        let uid = f
+            .create_multipart_upload("buck", "mp.bin", "", um())
+            .unwrap();
+        let p1 = vec![1u8; 5 * 1024 * 1024];
+        let e1 = f.upload_part("buck", "mp.bin", &uid, 1, &p1[..]).unwrap();
+        f.complete_multipart_upload(
+            "buck",
+            "mp.bin",
+            &uid,
+            &[CompletePart {
+                part_number: 1,
+                etag: e1,
+            }],
+        )
+        .unwrap();
+
+        // A data file with NO sidecar — drop one directly into the bucket dir.
+        std::fs::write(f.root().join("buck").join("phantom.bin"), b"orphan").unwrap();
+        // Sanity: HEAD/GET treat it as missing (no sidecar).
+        assert!(matches!(
+            f.head_object("buck", "phantom.bin"),
+            Err(StorageError::ObjectNotFound)
+        ));
+
+        let out = f
+            .list_objects(&ListObjectsInput {
+                bucket: "buck".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let keys: Vec<_> = out.objects.iter().map(|o| o.key.as_str()).collect();
+        assert!(
+            keys.contains(&"real.txt"),
+            "normal object must be listed: {keys:?}"
+        );
+        assert!(
+            keys.contains(&"mp.bin"),
+            "completed-multipart object must be listed: {keys:?}"
+        );
+        assert!(
+            !keys.contains(&"phantom.bin"),
+            "sidecar-less data file must NOT be listed (LIST/GET would disagree): {keys:?}"
+        );
+        // No phantom -> no empty ETag in the listing.
+        assert!(
+            out.objects.iter().all(|o| !o.etag.is_empty()),
+            "every listed object must have a non-empty ETag"
+        );
+    }
+
     // ---- multipart ----
 
     #[test]
@@ -2466,9 +2785,10 @@ mod tests {
         assert_eq!(parts[0].part_number, 1);
 
         // list uploads
-        let ups = f.list_multipart_uploads("buck").unwrap();
+        let (ups, truncated) = f.list_multipart_uploads("buck", 1000).unwrap();
         assert_eq!(ups.len(), 1);
         assert_eq!(ups[0].key, "big.bin");
+        assert!(!truncated);
 
         // complete
         let etag = f
@@ -3228,7 +3548,7 @@ mod tests {
 
         // list_multipart_uploads must also reject it.
         assert!(
-            f.list_multipart_uploads("buck").is_err(),
+            f.list_multipart_uploads("buck", 1000).is_err(),
             "list_multipart_uploads must reject a symlinked .multipart"
         );
 
@@ -3393,6 +3713,78 @@ mod tests {
         let mut got2 = Vec::new();
         res2.body.read_to_end(&mut got2).unwrap();
         assert_eq!(got2, b"abc");
+    }
+
+    #[test]
+    fn nested_key_put_fsyncs_ancestor_chain_and_round_trips() {
+        // E6 regression: a NESTED-key PUT with --fsync creates ancestor dirs via
+        // create_dir_all and must fsync the WHOLE ancestor chain (leaf up to the
+        // bucket root) so newly-created ancestor dir entries are crash-durable. We
+        // can't simulate a crash in a unit test, but we assert the chain fsync runs
+        // WITHOUT error for a deep key, the object round-trips, and the same holds
+        // for a multipart complete of a deep key. (fsync_dir_chain itself is also
+        // exercised directly below.)
+        let dir = tempfile::tempdir().unwrap();
+        let f = Filesystem::with_fsync(dir.path(), true);
+        f.create_bucket("buck").unwrap();
+
+        // Deeply nested single-part PUT.
+        let key = "a/b/c/d/deep.bin";
+        let data = b"deep-nested-durable-bytes";
+        let etag = f
+            .put_object("buck", key, &data[..], "text/plain", um())
+            .unwrap();
+        assert_eq!(etag, format!("\"{}\"", hex::encode(Md5::digest(data))));
+        let mut got = Vec::new();
+        f.get_object("buck", key, None)
+            .unwrap()
+            .body
+            .read_to_end(&mut got)
+            .unwrap();
+        assert_eq!(got, data);
+
+        // Directly exercise the helper: fsync the chain leaf..bucket_root with no error.
+        let leaf = f
+            .root()
+            .join("buck")
+            .join("a")
+            .join("b")
+            .join("c")
+            .join("d");
+        fsync_dir_chain(&leaf, &f.root().join("buck")).expect("chain fsync must succeed");
+
+        // Deeply nested multipart complete also round-trips under --fsync.
+        let mkey = "x/y/z/mp.bin";
+        let uid = f.create_multipart_upload("buck", mkey, "", um()).unwrap();
+        let p1 = vec![3u8; 5 * 1024 * 1024];
+        let p2 = vec![6u8; 1234];
+        let pe1 = f.upload_part("buck", mkey, &uid, 1, &p1[..]).unwrap();
+        let pe2 = f.upload_part("buck", mkey, &uid, 2, &p2[..]).unwrap();
+        f.complete_multipart_upload(
+            "buck",
+            mkey,
+            &uid,
+            &[
+                CompletePart {
+                    part_number: 1,
+                    etag: pe1,
+                },
+                CompletePart {
+                    part_number: 2,
+                    etag: pe2,
+                },
+            ],
+        )
+        .unwrap();
+        let mut mgot = Vec::new();
+        f.get_object("buck", mkey, None)
+            .unwrap()
+            .body
+            .read_to_end(&mut mgot)
+            .unwrap();
+        let mut expected = p1.clone();
+        expected.extend_from_slice(&p2);
+        assert_eq!(mgot, expected);
     }
 
     #[test]
@@ -3746,6 +4138,95 @@ mod tests {
                 "temp/aside/swap leaked after failed complete: {name}"
             );
         }
+    }
+
+    #[test]
+    fn failed_complete_is_retryable_parts_moved_back() {
+        // E2 regression (load-bearing): a pre-commit failure during Complete must
+        // leave the upload's part files intact in `.multipart/{uploadId}/parts/`
+        // (Complete MOVES them out into staging — they are the upload's ONLY copy),
+        // so the client can RETRY Complete. A SECOND Complete must then succeed and
+        // produce the correct object.
+        //
+        // Mutation evidence: revert `restore_old!`/`restore_staged_parts!` to the
+        // old behavior (re-arm the staging guard so it `remove_dir_all`s the staged
+        // parts) and this test FAILS — after the first (failed) Complete the upload
+        // parts dir is empty, so the second Complete returns InvalidPart (the only
+        // copy of the parts was destroyed) and the object is never produced.
+        let (_d, f) = fs();
+        f.create_bucket("buck").unwrap();
+        let key = "retry.bin";
+
+        let uid = f.create_multipart_upload("buck", key, "", um()).unwrap();
+        let b1 = vec![4u8; 5 * 1024 * 1024];
+        let b2 = vec![5u8; 2000];
+        let e1 = f.upload_part("buck", key, &uid, 1, &b1[..]).unwrap();
+        let e2 = f.upload_part("buck", key, &uid, 2, &b2[..]).unwrap();
+        let want_parts = [
+            CompletePart {
+                part_number: 1,
+                etag: e1.clone(),
+            },
+            CompletePart {
+                part_number: 2,
+                etag: e2.clone(),
+            },
+        ];
+
+        // First Complete: inject a pre-commit (sidecar) failure.
+        FORCE_SIDECAR_FAIL.with(|c| c.set(true));
+        let res = f.complete_multipart_upload("buck", key, &uid, &want_parts);
+        FORCE_SIDECAR_FAIL.with(|c| c.set(false));
+        assert!(res.is_err(), "forced pre-commit failure must error");
+
+        // The upload's parts must still be present (moved BACK, not destroyed).
+        let parts_dir = f.root().join(MULTIPART_DIR).join(&uid).join("parts");
+        let mut present: Vec<String> = std::fs::read_dir(&parts_dir)
+            .expect("upload parts dir must still exist after a failed Complete")
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| !n.contains(".tmp."))
+            .collect();
+        present.sort();
+        assert_eq!(
+            present,
+            vec!["00001".to_string(), "00002".to_string()],
+            "both part files must be restored to the upload dir for retry"
+        );
+        // The upload meta.json must also still be there (upload dir intact).
+        assert!(
+            f.root()
+                .join(MULTIPART_DIR)
+                .join(&uid)
+                .join("meta.json")
+                .exists(),
+            "upload meta.json must survive a failed Complete"
+        );
+        // No partial object published.
+        assert!(matches!(
+            f.head_object("buck", key),
+            Err(StorageError::ObjectNotFound)
+        ));
+
+        // SECOND Complete (no injection) must SUCCEED and produce the correct object.
+        let etag = f
+            .complete_multipart_upload("buck", key, &uid, &want_parts)
+            .expect("retried Complete must succeed");
+        assert!(etag.ends_with("-2\""), "composite ETag must be -2: {etag}");
+        let mut got = Vec::new();
+        f.get_object("buck", key, None)
+            .unwrap()
+            .body
+            .read_to_end(&mut got)
+            .unwrap();
+        let mut expected = b1.clone();
+        expected.extend_from_slice(&b2);
+        assert_eq!(got, expected, "retried Complete produced wrong bytes");
+
+        // The upload dir is removed only after the SUCCESSFUL complete.
+        assert!(
+            !f.root().join(MULTIPART_DIR).join(&uid).exists(),
+            "successful complete must remove the upload dir"
+        );
     }
 
     #[test]
@@ -4301,17 +4782,44 @@ mod tests {
         // empty success); on an existing bucket it works.
         let (_d, f) = fs();
         assert!(matches!(
-            f.list_multipart_uploads("no-such-bucket"),
+            f.list_multipart_uploads("no-such-bucket", 1000),
             Err(StorageError::BucketNotFound)
         ));
         f.create_bucket("buck").unwrap();
         let uid = f.create_multipart_upload("buck", "k", "", um()).unwrap();
-        let ups = f.list_multipart_uploads("buck").unwrap();
+        let (ups, _) = f.list_multipart_uploads("buck", 1000).unwrap();
         assert_eq!(ups.len(), 1);
         assert_eq!(ups[0].upload_id, uid);
         // Empty-bucket arg still scans all (server passes the real bucket though).
-        let all = f.list_multipart_uploads("").unwrap();
+        let (all, _) = f.list_multipart_uploads("", 1000).unwrap();
         assert_eq!(all.len(), 1);
+    }
+
+    #[test]
+    fn list_multipart_uploads_bounded_and_truncated() {
+        // E7 regression: with MORE uploads than the cap, the result is CAPPED and
+        // IsTruncated is true; within the cap it is false. Bounds memory/response.
+        let (_d, f) = fs();
+        f.create_bucket("buck").unwrap();
+        // Create 5 uploads for distinct keys.
+        for i in 0..5 {
+            f.create_multipart_upload("buck", &format!("k{i}"), "", um())
+                .unwrap();
+        }
+        // Cap below the count: capped + truncated.
+        let (ups, truncated) = f.list_multipart_uploads("buck", 3).unwrap();
+        assert_eq!(ups.len(), 3, "must cap to max_uploads");
+        assert!(truncated, "more uploads exist than returned -> IsTruncated");
+        // Sorted by key (then upload-id): first 3 keys.
+        assert_eq!(ups[0].key, "k0");
+        assert_eq!(ups[1].key, "k1");
+        assert_eq!(ups[2].key, "k2");
+        // Cap at/above the count: all returned, not truncated.
+        let (all, truncated2) = f.list_multipart_uploads("buck", 1000).unwrap();
+        assert_eq!(all.len(), 5);
+        assert!(!truncated2);
+        // A cap ABOVE the hard cap is clamped (no panic, still bounded).
+        let (_clamped, _) = f.list_multipart_uploads("buck", usize::MAX).unwrap();
     }
 
     // ---- D3: per-key publish lock ----
@@ -4593,6 +5101,130 @@ mod tests {
         );
     }
 
+    // ---- E3: UploadPart vs Complete validate->stage TOCTOU ----
+
+    #[test]
+    fn upload_part_serializes_against_complete_validate_stage() {
+        // E3 regression (load-bearing): a concurrent UploadPart for the same key
+        // must NOT be able to replace a part file BETWEEN a Complete's validation
+        // (MD5/size) and its staging (the part rename). Both ops now take the SAME
+        // per-key lock — Complete holds it across validate->stage->commit, and
+        // UploadPart takes it around its publish rename — so an UploadPart that
+        // arrives mid-window BLOCKS on the lock instead of racing in.
+        //
+        // Deterministic protocol (no sleeps):
+        //   1. Arm `complete_pause` (parks Complete at the validate->stage gap) AND
+        //      `publish_pause` (its `note_lock_contention` records when a thread is
+        //      about to BLOCK on the held per-key lock), both for `buck/key`.
+        //   2. Thread A runs Complete; it validates, then parks in the window while
+        //      HOLDING the per-key lock.
+        //   3. Thread B runs UploadPart (part 1, DIFFERENT bytes). After its
+        //      streaming write it calls `lock_key`, finds the shard held by A, fires
+        //      `note_lock_contention`, and BLOCKS.
+        //   4. The test waits for that contention signal (proof B serialized behind
+        //      A), then releases A. A stages the bytes it VALIDATED, commits, and
+        //      frees the lock; B then proceeds.
+        //   5. The completed object's bytes/ETag must match the ORIGINAL parts A
+        //      validated — never B's mid-window replacement.
+        //
+        // Fail-without-fix evidence: remove the `lock_key` acquisition from
+        // `upload_part` (and/or move Complete's lock back to just-before-publish so
+        // it is NOT held during validate->stage). Then B feels NO contention
+        // (`wait_b_disposition` would never see `lock_contended`) and races into the
+        // upload dir, replacing part 1 mid-window — the structural assertion below
+        // (B blocked on the lock) FAILS, and the published bytes can mismatch the
+        // validated manifest.
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let f = Arc::new(Filesystem::with_fsync(dir.path(), false));
+        f.create_bucket("buck").unwrap();
+        let key = "race.bin";
+
+        let uid = f.create_multipart_upload("buck", key, "", um()).unwrap();
+        let orig1 = vec![0xA1u8; 5 * 1024 * 1024];
+        let orig2 = vec![0xB2u8; 4096];
+        let e1 = f.upload_part("buck", key, &uid, 1, &orig1[..]).unwrap();
+        let e2 = f.upload_part("buck", key, &uid, 2, &orig2[..]).unwrap();
+
+        // Arm both hooks for this exact key.
+        let cpause = complete_pause::Hook::arm(&format!("buck/{key}"));
+        let lockwatch = publish_pause::PauseHook::arm(&format!("buck/{key}"));
+
+        // Thread A: Complete. Parks at the validate->stage gap holding the lock.
+        let fa = Arc::clone(&f);
+        let uida = uid.clone();
+        let (ea1, ea2) = (e1.clone(), e2.clone());
+        let a = std::thread::spawn(move || {
+            fa.complete_multipart_upload(
+                "buck",
+                key,
+                &uida,
+                &[
+                    CompletePart {
+                        part_number: 1,
+                        etag: ea1,
+                    },
+                    CompletePart {
+                        part_number: 2,
+                        etag: ea2,
+                    },
+                ],
+            )
+        });
+
+        // Wait until A is parked in the window (lock held).
+        cpause.wait_arrived();
+
+        // Thread B: a replacement UploadPart for part 1 with DIFFERENT bytes.
+        let fb = Arc::clone(&f);
+        let uidb = uid.clone();
+        let repl = vec![0xCCu8; 5 * 1024 * 1024];
+        let b = std::thread::spawn(move || fb.upload_part("buck", key, &uidb, 1, &repl[..]));
+
+        // THE STRUCTURAL ASSERTION: B must block on the per-key lock (not race into
+        // the window). `wait_b_disposition_timeout` returns Some(true) iff a thread
+        // hit `note_lock_contention` for this key — i.e. UploadPart serialized
+        // behind Complete. Without the fix B never contends, the wait TIMES OUT
+        // (None), and the assertion below FAILS cleanly. We use a generous 30s
+        // bound (B's 5 MiB streaming write completes well within it).
+        let disposition = lockwatch.wait_b_disposition_timeout(std::time::Duration::from_secs(30));
+        // Release A regardless so threads can be joined cleanly even on failure.
+        cpause.release();
+        let ra = a.join().unwrap();
+        let _rb = b.join(); // B may succeed or fail (upload dir is gone post-complete)
+        complete_pause::Hook::disarm();
+        publish_pause::PauseHook::disarm();
+        assert_eq!(
+            disposition,
+            Some(true),
+            "UploadPart did not block on the per-key lock — the validate->stage \
+             TOCTOU window is open (E3 not fixed)"
+        );
+
+        let etag = ra.expect("Complete must succeed");
+        assert!(etag.ends_with("-2\""), "composite ETag must be -2: {etag}");
+
+        // The completed object must be the ORIGINAL parts A validated — NOT B's
+        // mid-window replacement.
+        let mut got = Vec::new();
+        f.get_object("buck", key, None)
+            .unwrap()
+            .body
+            .read_to_end(&mut got)
+            .unwrap();
+        let mut expected = orig1.clone();
+        expected.extend_from_slice(&orig2);
+        assert_eq!(
+            got, expected,
+            "completed object does not match the bytes Complete validated — a \
+             concurrent UploadPart replaced a part mid-window (TOCTOU)"
+        );
+        // And it is internally consistent (sidecar ETag/len match the bytes).
+        assert_object_consistent(&f, "buck", key)
+            .unwrap_or_else(|e| panic!("inconsistent completed object: {e}"));
+    }
+
     // ---- D4: DeleteBucket must not follow symlinks ----
 
     #[test]
@@ -4696,7 +5328,7 @@ mod tests {
         );
         // list_multipart_uploads must SKIP (not read through) the symlinked meta.json
         // — the symlinked upload must not appear in the listing.
-        let ups = f.list_multipart_uploads("buck").unwrap();
+        let (ups, _) = f.list_multipart_uploads("buck", 1000).unwrap();
         assert!(
             !ups.iter().any(|u| u.key == "victim"),
             "list_multipart_uploads read a symlinked meta.json and surfaced the external upload"

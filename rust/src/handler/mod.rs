@@ -134,6 +134,28 @@ pub fn is_chunked_upload(headers: &BTreeMap<String, Vec<String>>) -> bool {
         .unwrap_or(false)
 }
 
+/// E4/E5: parse `x-amz-decoded-content-length` — the REAL (de-framed) payload
+/// size that the SigV4 signature covers for an aws-chunked body. Returns
+/// `Some(len)` when the header is present and a valid non-negative integer,
+/// `None` when absent, and `Err(InvalidArgument)` when present but malformed.
+/// Callers thread the `Some(len)` into `ChunkedReader` so the de-framed byte
+/// count is verified at EOF.
+pub fn decoded_content_length(
+    headers: &BTreeMap<String, Vec<String>>,
+) -> Result<Option<u64>, S3ErrorCode> {
+    match headers
+        .get("x-amz-decoded-content-length")
+        .and_then(|v| v.first())
+    {
+        None => Ok(None),
+        Some(s) => s
+            .trim()
+            .parse::<u64>()
+            .map(Some)
+            .map_err(|_| S3ErrorCode::InvalidArgument),
+    }
+}
+
 /// Collect `x-amz-meta-*` headers (lowercased keys) into a user-metadata map.
 pub fn extract_user_metadata(headers: &BTreeMap<String, Vec<String>>) -> BTreeMap<String, String> {
     let mut m = BTreeMap::new();
@@ -207,6 +229,13 @@ pub fn map_storage_error(e: &StorageError) -> S3ErrorCode {
         // C3: the GET handler intercepts this BEFORE mapping (it needs the size to
         // build the 416 `Content-Range`); this mapping is the exhaustive fallback.
         StorageError::RangeNotSatisfiable { .. } => S3ErrorCode::InvalidRange,
+        // E4/E5: an `InvalidData` io error on the upload path is a CLIENT body
+        // problem — a de-framed aws-chunked length mismatch vs.
+        // x-amz-decoded-content-length, or malformed chunk framing — so map it to
+        // the 400 IncompleteBody, not a 500. Other io errors remain InternalError.
+        StorageError::Io(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+            S3ErrorCode::IncompleteBody
+        }
         StorageError::Io(_) => S3ErrorCode::InternalError,
     }
 }

@@ -309,6 +309,13 @@ Out of scope by design — this gateway favors throughput on a narrow API surfac
   memory before applying `max-keys`/pagination, so listing memory scales with the
   number of objects in the bucket. This is fine for typical buckets; very large
   buckets would need a persistent key index (not implemented).
+- **ListMultipartUploads is bounded but not resumably paginated.** The response
+  honors `max-uploads` (default and hard cap 1000), returns at most that many
+  in-progress uploads sorted by `(key, upload-id)`, and sets `IsTruncated=true`
+  when more exist — so memory and response size are bounded. Full resumable
+  `key-marker`/`upload-id-marker` pagination is **not** implemented; a client
+  cannot page past the first (capped) set. This is sufficient for typical use,
+  where the number of concurrently in-progress uploads is small.
 - **Every `x-amz-*` request header must be covered by `SignedHeaders`.** The
   gateway strictly enforces (AWS-conformant) that any `x-amz-*` header present on
   the request — including in a presigned URL — is listed in the signature's

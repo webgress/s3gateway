@@ -27,14 +27,29 @@ pub struct ChunkedReader<R: Read> {
     /// Bytes remaining in the current chunk's data section.
     remaining: u64,
     done: bool,
+    /// E4/E5: total DECODED (payload) bytes yielded so far.
+    decoded: u64,
+    /// E4/E5: the signed `x-amz-decoded-content-length`, when present. At EOF the
+    /// total decoded byte count MUST equal this, else the body was truncated or
+    /// padded relative to what the signature covered — surfaced as an io::Error.
+    expected: Option<u64>,
 }
 
 impl<R: Read> ChunkedReader<R> {
-    pub fn new(inner: R) -> Self {
+    /// Construct a de-framing reader. `expected` is the signed
+    /// `x-amz-decoded-content-length` (the real payload size); when `Some`, the
+    /// reader VERIFIES at EOF that exactly that many payload bytes were de-framed
+    /// and returns an `io::Error` (`InvalidData`) on mismatch. `None` skips the
+    /// check (e.g. when the header is absent and the caller chose not to require
+    /// it). The handlers REQUIRE the header for STREAMING-* bodies, so they pass
+    /// `Some`.
+    pub fn new(inner: R, expected: Option<u64>) -> Self {
         ChunkedReader {
             inner: BufReader::with_capacity(64 * 1024, inner),
             remaining: 0,
             done: false,
+            decoded: 0,
+            expected,
         }
     }
 
@@ -108,6 +123,18 @@ impl<R: Read> Read for ChunkedReader<R> {
                     ));
                 }
                 self.remaining -= n as u64;
+                self.decoded += n as u64;
+                // E4/E5: never yield more decoded bytes than the signed length.
+                // (Catches a body padded beyond x-amz-decoded-content-length
+                // mid-stream rather than waiting for EOF.)
+                if let Some(exp) = self.expected {
+                    if self.decoded > exp {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "decoded body exceeds x-amz-decoded-content-length",
+                        ));
+                    }
+                }
                 if self.remaining == 0 {
                     // Consume trailing CRLF after the data segment.
                     self.read_crlf()?;
@@ -134,6 +161,19 @@ impl<R: Read> Read for ChunkedReader<R> {
                 // legitimate trailer-bearing uploads.
                 self.done = true;
                 let _ = self.read_crlf();
+                // E4/E5: at end-of-stream the total de-framed payload MUST equal the
+                // signed x-amz-decoded-content-length. A short body (truncated
+                // upload) or a long body (padded relative to the signed length) is
+                // rejected so the stored object/part matches what the signature
+                // covered.
+                if let Some(exp) = self.expected {
+                    if self.decoded != exp {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "decoded body length does not match x-amz-decoded-content-length",
+                        ));
+                    }
+                }
                 return Ok(0);
             }
             self.remaining = size;
@@ -234,7 +274,8 @@ mod tests {
     fn single_chunk() {
         let payload = b"hello world";
         let framed = frame(payload);
-        let mut r = ChunkedReader::new(&framed[..]);
+        // E4/E5: with the correct expected length the read succeeds.
+        let mut r = ChunkedReader::new(&framed[..], Some(payload.len() as u64));
         let mut out = Vec::new();
         r.read_to_end(&mut out).unwrap();
         assert_eq!(out, payload);
@@ -243,7 +284,7 @@ mod tests {
     #[test]
     fn multiple_chunks() {
         let framed = frame_multi(&[b"abc", b"defgh", b"ij"]);
-        let mut r = ChunkedReader::new(&framed[..]);
+        let mut r = ChunkedReader::new(&framed[..], Some(10));
         let mut out = Vec::new();
         r.read_to_end(&mut out).unwrap();
         assert_eq!(out, b"abcdefghij");
@@ -252,7 +293,7 @@ mod tests {
     #[test]
     fn empty_payload() {
         let framed = frame(b"");
-        let mut r = ChunkedReader::new(&framed[..]);
+        let mut r = ChunkedReader::new(&framed[..], Some(0));
         let mut out = Vec::new();
         r.read_to_end(&mut out).unwrap();
         assert!(out.is_empty());
@@ -263,7 +304,7 @@ mod tests {
         // 100KB across small reads to exercise chunk-boundary logic.
         let payload: Vec<u8> = (0..100_000).map(|i| (i % 251) as u8).collect();
         let framed = frame_multi(&[&payload[..40000], &payload[40000..]]);
-        let mut r = ChunkedReader::new(&framed[..]);
+        let mut r = ChunkedReader::new(&framed[..], Some(payload.len() as u64));
         let mut out = Vec::new();
         let mut tmp = [0u8; 37]; // odd buffer size
         loop {
@@ -273,6 +314,43 @@ mod tests {
             }
             out.extend_from_slice(&tmp[..n]);
         }
+        assert_eq!(out, payload);
+    }
+
+    #[test]
+    fn decoded_length_mismatch_short_rejected() {
+        // E4/E5 (load-bearing): a body whose DECODED bytes are FEWER than the
+        // declared x-amz-decoded-content-length is rejected at EOF. Without the
+        // length check the truncated body would be accepted and stored short.
+        let payload = b"hello world"; // 11 bytes actually framed
+        let framed = frame(payload);
+        let mut r = ChunkedReader::new(&framed[..], Some(99)); // claims 99
+        let mut out = Vec::new();
+        let err = r.read_to_end(&mut out).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn decoded_length_mismatch_long_rejected() {
+        // E4/E5: a body whose DECODED bytes EXCEED the declared length is rejected
+        // (padded relative to what the signature covered).
+        let payload = b"hello world"; // 11 bytes
+        let framed = frame(payload);
+        let mut r = ChunkedReader::new(&framed[..], Some(4)); // claims only 4
+        let mut out = Vec::new();
+        let err = r.read_to_end(&mut out).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn decoded_length_unchecked_when_none() {
+        // E4/E5: with no expected length the reader de-frames without enforcing a
+        // count (used only when the caller chooses not to require the header).
+        let payload = b"abcdefghij";
+        let framed = frame(payload);
+        let mut r = ChunkedReader::new(&framed[..], None);
+        let mut out = Vec::new();
+        r.read_to_end(&mut out).unwrap();
         assert_eq!(out, payload);
     }
 
@@ -301,7 +379,7 @@ mod tests {
         let mut framed = Vec::new();
         framed.extend_from_slice(b"a;chunk-signature=x\r\n");
         framed.extend_from_slice(b"abc");
-        let mut r = ChunkedReader::new(&framed[..]);
+        let mut r = ChunkedReader::new(&framed[..], None);
         let mut out = Vec::new();
         assert!(r.read_to_end(&mut out).is_err());
     }

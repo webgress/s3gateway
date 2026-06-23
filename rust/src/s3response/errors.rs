@@ -30,6 +30,10 @@ pub enum S3ErrorCode {
     InvalidRequest,
     EntityTooLarge,
     InvalidRange,
+    /// E4/E5: the request body's actual size did not match what was declared/signed
+    /// (e.g. de-framed aws-chunked bytes != x-amz-decoded-content-length, or a
+    /// truncated body).
+    IncompleteBody,
 }
 
 /// Resolved error metadata: S3 string code, message, and HTTP status code.
@@ -149,6 +153,11 @@ impl S3ErrorCode {
                 code: "InvalidRange",
                 message: "The requested range is not satisfiable.",
                 http_status: 416,
+            },
+            IncompleteBody => ApiError {
+                code: "IncompleteBody",
+                message: "You did not provide the number of bytes specified by the Content-Length HTTP header.",
+                http_status: 400,
             },
         }
     }

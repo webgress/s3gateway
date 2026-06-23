@@ -160,6 +160,14 @@ Supporting very large buckets efficiently would require a persistent key index
 (e.g. an embedded ordered store) rather than a live filesystem walk — a deliberate
 non-goal for the current single-machine, throughput-on-large-objects target.
 
+ListMultipartUploads is **bounded but not resumably paginated**: it scans the
+per-root `.multipart/` working dir, sorts by `(key, upload-id)`, honors
+`max-uploads` (default and hard cap 1000), and sets `IsTruncated=true` when more
+uploads exist than were returned. The cap + `IsTruncated` keep memory and response
+size bounded regardless of how many uploads are in flight; full resumable
+`key-marker` pagination past the first capped set is not implemented (the number
+of concurrently in-progress uploads is expected to be small).
+
 ## Summary
 
 The research conclusion drove everything: on encrypted ZFS RaidZ3 the per-byte

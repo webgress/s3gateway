@@ -64,12 +64,20 @@ pub async fn upload_part(
     let bucket = req.bucket.clone();
     let key = req.key.clone();
 
+    // E5: same decoded-length enforcement as PutObject. Required for STREAMING-*
+    // part bodies; threaded into ChunkedReader so the de-framed part byte count is
+    // verified against x-amz-decoded-content-length at EOF.
+    let expected_len = super::decoded_content_length(&req.headers)?;
+    if is_streaming && expected_len.is_none() {
+        return Err(S3ErrorCode::InvalidArgument);
+    }
+
     let bridge = super::body_to_blocking_read(req.body);
 
     let fs = ctx.fs.clone();
     let etag = tokio::task::spawn_blocking(move || -> Result<String, StorageError> {
         if is_streaming {
-            let reader = ChunkedReader::new(bridge);
+            let reader = ChunkedReader::new(bridge, expected_len);
             fs.upload_part(&bucket, &key, &upload_id, part_number, reader)
         } else {
             fs.upload_part(&bucket, &key, &upload_id, part_number, bridge)
@@ -192,24 +200,49 @@ pub async fn list_parts(ctx: &Ctx, req: HandlerRequest) -> Result<Response<RespB
     Ok(xml_ok(result.to_xml()))
 }
 
+/// Default `max-uploads` when the client omits it (also the hard cap). Mirrors
+/// S3 and the storage-layer `MAX_UPLOADS_CAP`.
+const DEFAULT_MAX_UPLOADS: i32 = 1000;
+
 /// GET /{bucket}?uploads — ListMultipartUploads.
+///
+/// E7: honors the `max-uploads` query param (default and hard-capped at
+/// [`DEFAULT_MAX_UPLOADS`]), caps the returned entries, and sets `IsTruncated`
+/// from the storage layer so memory/response are bounded even with a huge
+/// `.multipart/` working dir.
 pub async fn list_multipart_uploads(
     ctx: &Ctx,
     req: HandlerRequest,
 ) -> Result<Response<RespBody>, S3ErrorCode> {
     let bucket = req.bucket.clone();
+
+    // Parse max-uploads: absent -> default; present must be a non-negative int
+    // (negative/garbage -> InvalidArgument); clamp to the hard cap.
+    let max_uploads: i32 = match req.query1("max-uploads") {
+        None => DEFAULT_MAX_UPLOADS,
+        Some(s) => {
+            let n: i32 = s.trim().parse().map_err(|_| S3ErrorCode::InvalidArgument)?;
+            if n < 0 {
+                return Err(S3ErrorCode::InvalidArgument);
+            }
+            n.min(DEFAULT_MAX_UPLOADS)
+        }
+    };
+
     let fs = ctx.fs.clone();
     let b = bucket.clone();
-    let uploads = tokio::task::spawn_blocking(move || fs.list_multipart_uploads(&b))
-        .await
-        .map_err(|_| S3ErrorCode::InternalError)?
-        .map_err(|e| map_storage_error(&e))?;
+    let cap = max_uploads as usize;
+    let (uploads, is_truncated) =
+        tokio::task::spawn_blocking(move || fs.list_multipart_uploads(&b, cap))
+            .await
+            .map_err(|_| S3ErrorCode::InternalError)?
+            .map_err(|e| map_storage_error(&e))?;
 
     let result = ListMultipartUploadsResult {
         bucket,
         key_marker: String::new(),
-        max_uploads: 1000,
-        is_truncated: false,
+        max_uploads,
+        is_truncated,
         uploads: uploads
             .into_iter()
             .map(|u| UploadEntry {
