@@ -257,7 +257,14 @@ impl Read for MultipartReader {
             return Ok(0);
         }
         if !self.ensure_open()? {
-            return Ok(0);
+            // Parts are exhausted but we still owe `remaining` logical bytes:
+            // the manifest advertises more data than the part files hold. Do NOT
+            // mask this as a clean EOF — that would silently truncate the object
+            // below its declared Content-Length. Signal a hard error instead.
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "multipart object truncated: parts exhausted before satisfying manifest size",
+            ));
         }
 
         let part_size = self.parts[self.cur_part].size;
@@ -269,16 +276,22 @@ impl Read for MultipartReader {
         let cap = self.buf.capacity();
         let n = file.pread_at(&mut self.buf[..cap], aligned_start)?;
         if n == 0 {
-            // Part shorter than expected; advance to next part.
-            self.cur_file = None;
-            self.cur_part += 1;
-            return self.read(out);
+            // The on-disk part is SHORTER than its manifest size: the file ended
+            // before `part_size`. Surface this as an error rather than skipping
+            // ahead, which would corrupt the reassembled stream / truncate it.
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "multipart part shorter than manifest size",
+            ));
         }
         let window_end = (aligned_start + n as u64).min(part_size);
         if window_end <= self.cur_off {
-            self.cur_file = None;
-            self.cur_part += 1;
-            return self.read(out);
+            // Same short-part condition reached via the aligned window: the bytes
+            // available do not cover `cur_off`, so the part is truncated.
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "multipart part shorter than manifest size",
+            ));
         }
         let avail_in_part = (window_end - self.cur_off) as usize;
         // Don't exceed the logical remaining count.
@@ -339,15 +352,29 @@ mod tests {
 
     #[test]
     fn parse_range_cases() {
-        assert_eq!(parse_range("bytes=0-99", 1000).unwrap().unwrap(),
-            ByteRange { start: 0, end: 99 });
-        assert_eq!(parse_range("bytes=500-", 1000).unwrap().unwrap(),
-            ByteRange { start: 500, end: 999 });
-        assert_eq!(parse_range("bytes=-100", 1000).unwrap().unwrap(),
-            ByteRange { start: 900, end: 999 });
+        assert_eq!(
+            parse_range("bytes=0-99", 1000).unwrap().unwrap(),
+            ByteRange { start: 0, end: 99 }
+        );
+        assert_eq!(
+            parse_range("bytes=500-", 1000).unwrap().unwrap(),
+            ByteRange {
+                start: 500,
+                end: 999
+            }
+        );
+        assert_eq!(
+            parse_range("bytes=-100", 1000).unwrap().unwrap(),
+            ByteRange {
+                start: 900,
+                end: 999
+            }
+        );
         // end clamps to size-1
-        assert_eq!(parse_range("bytes=0-100000", 1000).unwrap().unwrap(),
-            ByteRange { start: 0, end: 999 });
+        assert_eq!(
+            parse_range("bytes=0-100000", 1000).unwrap().unwrap(),
+            ByteRange { start: 0, end: 999 }
+        );
         // no header
         assert!(parse_range("something", 1000).unwrap().is_none());
         // unsatisfiable: start past end
@@ -371,9 +398,24 @@ mod tests {
         let f2 = write_file(dir.path(), "00002", &p2);
         let f3 = write_file(dir.path(), "00003", &p3);
         let parts = vec![
-            PartRef { part_number: 1, path: f1.to_string_lossy().into(), size: p1.len() as u64, md5_hex: md5_hex(&p1) },
-            PartRef { part_number: 2, path: f2.to_string_lossy().into(), size: p2.len() as u64, md5_hex: md5_hex(&p2) },
-            PartRef { part_number: 3, path: f3.to_string_lossy().into(), size: p3.len() as u64, md5_hex: md5_hex(&p3) },
+            PartRef {
+                part_number: 1,
+                path: f1.to_string_lossy().into(),
+                size: p1.len() as u64,
+                md5_hex: md5_hex(&p1),
+            },
+            PartRef {
+                part_number: 2,
+                path: f2.to_string_lossy().into(),
+                size: p2.len() as u64,
+                md5_hex: md5_hex(&p2),
+            },
+            PartRef {
+                part_number: 3,
+                path: f3.to_string_lossy().into(),
+                size: p3.len() as u64,
+                md5_hex: md5_hex(&p3),
+            },
         ];
         let mut r = MultipartReader::new(parts, None);
         let mut out = Vec::new();
@@ -395,12 +437,30 @@ mod tests {
         let f2 = write_file(dir.path(), "00002", &p2);
         let f3 = write_file(dir.path(), "00003", &p3);
         let parts = vec![
-            PartRef { part_number: 1, path: f1.to_string_lossy().into(), size: 1000, md5_hex: md5_hex(&p1) },
-            PartRef { part_number: 2, path: f2.to_string_lossy().into(), size: 1000, md5_hex: md5_hex(&p2) },
-            PartRef { part_number: 3, path: f3.to_string_lossy().into(), size: 1000, md5_hex: md5_hex(&p3) },
+            PartRef {
+                part_number: 1,
+                path: f1.to_string_lossy().into(),
+                size: 1000,
+                md5_hex: md5_hex(&p1),
+            },
+            PartRef {
+                part_number: 2,
+                path: f2.to_string_lossy().into(),
+                size: 1000,
+                md5_hex: md5_hex(&p2),
+            },
+            PartRef {
+                part_number: 3,
+                path: f3.to_string_lossy().into(),
+                size: 1000,
+                md5_hex: md5_hex(&p3),
+            },
         ];
         // Logical range [500, 2499]: last 500 of p1, all of p2, first 500 of p3.
-        let r = ByteRange { start: 500, end: 2499 };
+        let r = ByteRange {
+            start: 500,
+            end: 2499,
+        };
         let mut rd = MultipartReader::new(parts, Some(r));
         let mut out = Vec::new();
         rd.read_to_end(&mut out).unwrap();
@@ -410,6 +470,63 @@ mod tests {
         expected.extend_from_slice(&p3[..500]);
         assert_eq!(out.len(), 2000);
         assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn multipart_missing_part_errors_not_truncates() {
+        // F10 regression: a manifest referencing a missing part (or a part
+        // shorter than its declared size) must make GET streaming ERROR rather
+        // than silently return fewer bytes than the advertised Content-Length.
+        let dir = tempfile::tempdir().unwrap();
+        let p1 = vec![1u8; 1000];
+        let f1 = write_file(dir.path(), "00001", &p1);
+        // 00002 is referenced by the manifest but never written to disk.
+        let missing = dir.path().join("00002");
+        let parts = vec![
+            PartRef {
+                part_number: 1,
+                path: f1.to_string_lossy().into(),
+                size: 1000,
+                md5_hex: md5_hex(&p1),
+            },
+            PartRef {
+                part_number: 2,
+                path: missing.to_string_lossy().into(),
+                size: 1000,
+                md5_hex: "00".into(),
+            },
+        ];
+        let mut rd = MultipartReader::new(parts, None);
+        let mut out = Vec::new();
+        // Opening the missing part fails (ENOENT) -> read_to_end errors.
+        let err = rd.read_to_end(&mut out).unwrap_err();
+        assert!(err.kind() == io::ErrorKind::NotFound || out.len() < 2000);
+
+        // A part that EXISTS but is SHORT of its manifest size must also error
+        // (UnexpectedEof) rather than truncate.
+        let dir2 = tempfile::tempdir().unwrap();
+        let q1 = vec![1u8; 1000];
+        let q2_short = vec![2u8; 10]; // manifest claims 1000
+        let g1 = write_file(dir2.path(), "00001", &q1);
+        let g2 = write_file(dir2.path(), "00002", &q2_short);
+        let parts2 = vec![
+            PartRef {
+                part_number: 1,
+                path: g1.to_string_lossy().into(),
+                size: 1000,
+                md5_hex: md5_hex(&q1),
+            },
+            PartRef {
+                part_number: 2,
+                path: g2.to_string_lossy().into(),
+                size: 1000, // larger than the 10 bytes actually on disk
+                md5_hex: md5_hex(&q2_short),
+            },
+        ];
+        let mut rd2 = MultipartReader::new(parts2, None);
+        let mut out2 = Vec::new();
+        let err2 = rd2.read_to_end(&mut out2).unwrap_err();
+        assert_eq!(err2.kind(), io::ErrorKind::UnexpectedEof);
     }
 
     #[test]
@@ -424,15 +541,27 @@ mod tests {
         let f1 = write_file(dir.path(), "00001", &p1);
         let f2 = write_file(dir.path(), "00002", &p2);
         let parts = vec![
-            PartRef { part_number: 1, path: f1.to_string_lossy().into(), size: p1.len() as u64, md5_hex: md5_hex(&p1) },
-            PartRef { part_number: 2, path: f2.to_string_lossy().into(), size: p2.len() as u64, md5_hex: md5_hex(&p2) },
+            PartRef {
+                part_number: 1,
+                path: f1.to_string_lossy().into(),
+                size: p1.len() as u64,
+                md5_hex: md5_hex(&p1),
+            },
+            PartRef {
+                part_number: 2,
+                path: f2.to_string_lossy().into(),
+                size: p2.len() as u64,
+                md5_hex: md5_hex(&p2),
+            },
         ];
         let mut rd = MultipartReader::new(parts, None);
         let mut out = Vec::new();
         let mut tmp = [0u8; 4099];
         loop {
             let n = rd.read(&mut tmp).unwrap();
-            if n == 0 { break; }
+            if n == 0 {
+                break;
+            }
             out.extend_from_slice(&tmp[..n]);
         }
         let mut expected = p1.clone();

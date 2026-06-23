@@ -16,10 +16,11 @@ pub async fn list_objects_v2(
     let delimiter = req.query1("delimiter").unwrap_or("").to_string();
     let start_after = req.query1("start-after").unwrap_or("").to_string();
     let continuation_token = req.query1("continuation-token").unwrap_or("").to_string();
-    let max_keys: i32 = req
-        .query1("max-keys")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1000);
+    // F14: preserve ABSENT vs explicit value. `None` -> storage defaults to 1000;
+    // `Some(0)` -> empty page with IsTruncated. The wire `max-keys` echoed back in
+    // the response uses the effective value (1000 when absent).
+    let max_keys: Option<i32> = req.query1("max-keys").and_then(|s| s.parse().ok());
+    let effective_max_keys = max_keys.unwrap_or(1000);
 
     let input = ListObjectsInput {
         bucket: req.bucket.clone(),
@@ -41,7 +42,7 @@ pub async fn list_objects_v2(
         name: req.bucket.clone(),
         prefix,
         delimiter,
-        max_keys,
+        max_keys: effective_max_keys,
         is_truncated: out.is_truncated,
         key_count,
         start_after,

@@ -113,8 +113,19 @@ architecture rationale.
 | `--log-level`   | string | `info`            | `debug`, `info`, `warn`, or `error`.                               |
 | `--workers`     | int    | num CPUs          | Number of pinned per-core tokio runtimes (thread-per-core count).  |
 | `--ktls`        | bool   | `true`            | Use kernel-TLS offload. When `false`, stays in userspace rustls.   |
+| `--fsync`       | bool   | `true`            | Durable object publication (fsync data + sidecar + parent dir). When `false`, skip the sidecar/dir fsyncs for throughput (the data file is still fsync'd). |
 
 TLS is active only when both `--tls-cert` and `--tls-key` are supplied.
+
+**Durability vs. throughput (`--fsync`).** By default object publication is
+crash-safe: PUT and CompleteMultipartUpload fsync the object data, fsync the
+`.s3meta` sidecar, and fsync the parent directory before returning success, so a
+power loss cannot leave a just-acknowledged object with missing data, missing
+metadata, or an unflushed directory entry. Setting `--fsync false` skips the
+sidecar and directory fsyncs (the object data file is still fsync'd) for maximum
+throughput, at the cost of durability for the metadata/rename on an unclean
+shutdown — appropriate only when the underlying storage or workload makes that
+trade acceptable.
 
 ### Credentials format
 
@@ -184,8 +195,14 @@ payloads (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD`), `UNSIGNED-PAYLOAD`, and a
   directory, a placeholder `{key}` file is written, and the `.s3meta` sidecar
   records the ordered part manifest (path, size, MD5 per part). GET keys off the
   sidecar and reassembles the parts on read; no concatenated copy is ever made.
-- `.s3meta` is written atomically (temp file + rename); object and part data are
-  written to a temp sibling, fsynced, then atomically renamed into place.
+- Object and part data are written to a temp sibling, fsynced, then atomically
+  renamed into place. The `.s3meta` sidecar is written to a temp file and
+  atomically renamed; with `--fsync` (default) the sidecar bytes are fsynced
+  before the rename and the object's parent directory is fsynced afterward, so
+  the full publication (data file + sidecar + directory entry) is crash-safe.
+  `CompleteMultipartUpload` stages the new parts into a fresh temp store and
+  swaps it into place only after the new manifest is written, so a crash or error
+  mid-complete never destroys the previously-published object.
 
 ## TLS & kTLS Offload
 
@@ -262,6 +279,31 @@ Out of scope by design — this gateway favors throughput on a narrow API surfac
 - No batch/`DeleteObjects` multi-delete
 - Path-style addressing only (no virtual-hosted-style)
 - Single-region SigV4; no STS / temporary credentials
+
+### Security & integrity model (by design)
+
+- **Body integrity is bound to the transport, not re-hashed server-side.** SigV4
+  binds the signature to the client-declared `x-amz-content-sha256` value; the
+  gateway does **not** re-hash the request body to verify it matches (that would
+  be a second full CPU pass over every payload byte, defeating the one-pass-MD5
+  design). Cryptographic integrity of the bytes in transit is therefore provided
+  by **TLS**. Both `UNSIGNED-PAYLOAD` and the streaming chunked payload formats
+  are supported under this model.
+  - **Run plaintext mode only on trusted networks.** Without TLS (or if a
+    mutable component sits between TLS termination and this process) there is
+    **no cryptographic body-integrity guarantee** — the gateway relies on TLS for
+    payload-integrity binding. Use `--tls-cert`/`--tls-key` for any untrusted
+    network path.
+- **Streaming chunked uploads verify only the seed signature.** For
+  `STREAMING-AWS4-HMAC-SHA256-PAYLOAD` (and the `-TRAILER` variants), the SigV4
+  seed signature is verified during request authentication; per-chunk chunk
+  signatures are intentionally **not** re-verified (this avoids a per-byte HMAC
+  on the hot path). Per-chunk integrity again relies on TLS.
+- **ListObjectsV2 walks and buffers the whole bucket before paginating.** A
+  listing recursively scans every key in the bucket and buffers the entries in
+  memory before applying `max-keys`/pagination, so listing memory scales with the
+  number of objects in the bucket. This is fine for typical buckets; very large
+  buckets would need a persistent key index (not implemented).
 
 ## License
 

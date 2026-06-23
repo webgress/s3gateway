@@ -31,7 +31,7 @@ fn main() {
         }
     };
 
-    let fs = Filesystem::new(&cfg.data_dir);
+    let fs = Filesystem::with_fsync(&cfg.data_dir, cfg.fsync);
     if let Err(e) = std::fs::create_dir_all(fs.root()) {
         eprintln!("failed to create data dir {}: {e}", cfg.data_dir);
         std::process::exit(1);
@@ -43,6 +43,7 @@ fn main() {
         region = %cfg.region,
         workers = cfg.workers,
         ktls = cfg.ktls,
+        fsync = cfg.fsync,
         tls = cfg.tls_enabled(),
         credentials = store.len(),
         "s3gateway-rs starting"

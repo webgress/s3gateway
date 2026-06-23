@@ -22,8 +22,7 @@ use super::time as t;
 type HmacSha256 = Hmac<Sha256>;
 
 pub const SIGN_V4_ALGORITHM: &str = "AWS4-HMAC-SHA256";
-pub const EMPTY_SHA256: &str =
-    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+pub const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 pub const UNSIGNED_PAYLOAD: &str = "UNSIGNED-PAYLOAD";
 pub const STREAMING_PAYLOAD: &str = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD";
 /// Max permitted clock skew, in seconds (15 minutes).
@@ -118,11 +117,17 @@ pub struct SignableRequest<'a> {
 impl<'a> SignableRequest<'a> {
     fn header(&self, name: &str) -> Option<&str> {
         let lname = name.to_ascii_lowercase();
-        self.headers.get(&lname).and_then(|v| v.first()).map(|s| s.as_str())
+        self.headers
+            .get(&lname)
+            .and_then(|v| v.first())
+            .map(|s| s.as_str())
     }
 
     fn query1(&self, name: &str) -> Option<&str> {
-        self.query.get(name).and_then(|v| v.first()).map(|s| s.as_str())
+        self.query
+            .get(name)
+            .and_then(|v| v.first())
+            .map(|s| s.as_str())
     }
 
     fn is_presigned(&self) -> bool {
@@ -219,11 +224,22 @@ fn verify_presigned(
         .ok_or(SigV4Error::MissingQueryParam("X-Amz-Date"))?;
     let req_time = t::parse_iso8601(date_str).ok_or(SigV4Error::MalformedDate)?;
 
+    // F8: reject a URL dated too far in the FUTURE. The 7-day cap below bounds the
+    // window LENGTH but not its START, so without this a far-future `X-Amz-Date`
+    // (with any Expires) would be accepted once wall-clock reached it / would pass
+    // the `now > req_time + expires` test trivially. Apply the same 15-minute
+    // not-before skew the header-auth path uses.
+    if req_time - now_unix > MAX_CLOCK_SKEW_SECS {
+        return Err(SigV4Error::Skewed);
+    }
+
     let expires_str = req
         .query1("X-Amz-Expires")
         .filter(|s| !s.is_empty())
         .ok_or(SigV4Error::MissingQueryParam("X-Amz-Expires"))?;
-    let expires: i64 = expires_str.parse().map_err(|_| SigV4Error::InvalidExpires)?;
+    let expires: i64 = expires_str
+        .parse()
+        .map_err(|_| SigV4Error::InvalidExpires)?;
     if !(0..=604_800).contains(&expires) {
         return Err(SigV4Error::InvalidExpires);
     }
@@ -348,7 +364,9 @@ fn parse_signed_headers_field(s: &str) -> Result<Vec<String>, SigV4Error> {
         .split_once('=')
         .ok_or_else(|| SigV4Error::MalformedAuth("missing SignedHeaders tag".into()))?;
     if k != "SignedHeaders" {
-        return Err(SigV4Error::MalformedAuth("missing SignedHeaders tag".into()));
+        return Err(SigV4Error::MalformedAuth(
+            "missing SignedHeaders tag".into(),
+        ));
     }
     if v.is_empty() {
         return Err(SigV4Error::MalformedAuth("empty signed headers".into()));
@@ -507,7 +525,11 @@ fn canonical_headers(headers: &BTreeMap<String, Vec<String>>) -> String {
     for (k, vals) in headers {
         buf.push_str(k);
         buf.push(':');
-        let joined = vals.iter().map(|v| trim_all(v)).collect::<Vec<_>>().join(",");
+        let joined = vals
+            .iter()
+            .map(|v| trim_all(v))
+            .collect::<Vec<_>>()
+            .join(",");
         buf.push_str(&joined);
         buf.push('\n');
     }
@@ -578,10 +600,9 @@ pub(crate) fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
 /// SigV4 path encoding (Go `EncodePath`). Reserved set `[A-Za-z0-9-_.~/]` passes
 /// through; everything else is UTF-8 percent-encoded with uppercase hex.
 pub fn encode_path(path_name: &str) -> String {
-    if path_name
-        .bytes()
-        .all(|b| matches!(b, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/'))
-        && !path_name.is_empty()
+    if path_name.bytes().all(
+        |b| matches!(b, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/'),
+    ) && !path_name.is_empty()
     {
         return path_name.to_string();
     }
@@ -671,15 +692,17 @@ mod tests {
     #[test]
     fn deterministic_signature_vector() {
         let secret = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY";
-        let (date, region, service, amz_date) =
-            ("20130524", "us-east-1", "s3", "20130524T000000Z");
+        let (date, region, service, amz_date) = ("20130524", "us-east-1", "s3", "20130524T000000Z");
 
         let mut h = BTreeMap::new();
         h.insert(
             "host".to_string(),
             vec!["examplebucket.s3.amazonaws.com".to_string()],
         );
-        h.insert("x-amz-content-sha256".to_string(), vec![EMPTY_SHA256.into()]);
+        h.insert(
+            "x-amz-content-sha256".to_string(),
+            vec![EMPTY_SHA256.into()],
+        );
         h.insert("x-amz-date".to_string(), vec![amz_date.to_string()]);
 
         let canonical = get_canonical_request("GET", "/test.txt", "", &h, EMPTY_SHA256);
@@ -823,7 +846,10 @@ mod tests {
         let key = get_signing_key(secret, yyyymmdd, region, service);
         let sig = get_signature(&key, &sts);
 
-        let cred_str = format!("{}/{}/{}/{}/aws4_request", access, yyyymmdd, region, service);
+        let cred_str = format!(
+            "{}/{}/{}/{}/aws4_request",
+            access, yyyymmdd, region, service
+        );
         let auth = format!(
             "{} Credential={}, SignedHeaders={}, Signature={}",
             SIGN_V4_ALGORITHM,
@@ -843,7 +869,13 @@ mod tests {
         )
         .unwrap();
         let now = 1_700_000_000;
-        let (h, q) = build_signed_request(&store, "test-access-key", "test-secret-key", "us-east-1", now);
+        let (h, q) = build_signed_request(
+            &store,
+            "test-access-key",
+            "test-secret-key",
+            "us-east-1",
+            now,
+        );
         let req = SignableRequest {
             method: "GET",
             escaped_path: "/test-bucket",
@@ -957,7 +989,10 @@ mod tests {
         q.insert("X-Amz-Algorithm".into(), vec![SIGN_V4_ALGORITHM.into()]);
         q.insert(
             "X-Amz-Credential".into(),
-            vec![format!("AKID/{}/{}/{}/aws4_request", yyyymmdd, region, service)],
+            vec![format!(
+                "AKID/{}/{}/{}/aws4_request",
+                yyyymmdd, region, service
+            )],
         );
         q.insert("X-Amz-Date".into(), vec![amz_date.clone()]);
         q.insert("X-Amz-Expires".into(), vec!["3600".into()]);
@@ -1029,5 +1064,72 @@ mod tests {
         // now is well past expiry.
         let err = verify_request(&req, &store, "us-east-1", sign_time + 3600).unwrap_err();
         assert_eq!(err, SigV4Error::Expired);
+    }
+
+    #[test]
+    fn presigned_future_dated_rejected() {
+        // F8 regression: a presigned URL dated far in the FUTURE must be rejected
+        // (not-before / future-skew check), even though the 7-day Expires cap is
+        // satisfied. We sign at a far-future time but verify with `now` ~today.
+        let store = CredentialStore::from_json(
+            br#"{"credentials":[{"accessKeyId":"AKID","secretAccessKey":"SECRET"}]}"#,
+        )
+        .unwrap();
+        let now = 1_700_000_000;
+        // Sign for a time 10 days in the future (well beyond the 15-min skew).
+        let future = now + 10 * 86_400;
+        let amz_date = t::iso8601_from_unix(future);
+        let yyyymmdd = &amz_date[..8];
+        let region = "us-east-1";
+        let service = "s3";
+
+        let mut q: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        q.insert("X-Amz-Algorithm".into(), vec![SIGN_V4_ALGORITHM.into()]);
+        q.insert(
+            "X-Amz-Credential".into(),
+            vec![format!(
+                "AKID/{}/{}/{}/aws4_request",
+                yyyymmdd, region, service
+            )],
+        );
+        q.insert("X-Amz-Date".into(), vec![amz_date.clone()]);
+        q.insert("X-Amz-Expires".into(), vec!["3600".into()]);
+        q.insert("X-Amz-SignedHeaders".into(), vec!["host".into()]);
+
+        let mut h = BTreeMap::new();
+        h.insert("host".into(), vec!["localhost:8333".into()]);
+
+        // Compute a VALID signature so the rejection is due to the date, not a
+        // signature mismatch (proves the future-date guard runs first).
+        let req_for_sign = SignableRequest {
+            method: "GET",
+            escaped_path: "/bucket/key",
+            query: &q,
+            headers: &h,
+            host: "localhost:8333",
+        };
+        let extracted = extract_signed_headers(&["host".to_string()], &req_for_sign);
+        let canonical = get_canonical_request(
+            "GET",
+            "/bucket/key",
+            &encode_query(&q, true),
+            &extracted,
+            UNSIGNED_PAYLOAD,
+        );
+        let scope = get_scope(yyyymmdd, region, service);
+        let sts = get_string_to_sign(&canonical, &amz_date, &scope);
+        let key = get_signing_key("SECRET", yyyymmdd, region, service);
+        let sig = get_signature(&key, &sts);
+        q.insert("X-Amz-Signature".into(), vec![sig]);
+
+        let req = SignableRequest {
+            method: "GET",
+            escaped_path: "/bucket/key",
+            query: &q,
+            headers: &h,
+            host: "localhost:8333",
+        };
+        let err = verify_request(&req, &store, region, now).unwrap_err();
+        assert_eq!(err, SigV4Error::Skewed);
     }
 }

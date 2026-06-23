@@ -6,7 +6,7 @@
 //! guaranteed 4096-aligned, and is meant to be reused across reads/writes to
 //! avoid per-IO allocation on the hot path.
 
-use std::alloc::{alloc, dealloc, Layout};
+use std::alloc::{alloc_zeroed, dealloc, Layout};
 use std::ops::{Deref, DerefMut};
 
 /// Direct-IO alignment (page size). NVMe logical blocks are 512/4096; 4096 is a
@@ -32,8 +32,13 @@ impl AlignedBuf {
         let cap = size.div_ceil(ALIGN) * ALIGN;
         let cap = cap.max(ALIGN);
         let layout = Layout::from_size_align(cap, ALIGN).expect("valid aligned layout");
-        // SAFETY: layout has non-zero size and valid alignment.
-        let ptr = unsafe { alloc(layout) };
+        // SAFETY: layout has non-zero size (cap >= ALIGN) and valid alignment.
+        // We use `alloc_zeroed` so the backing memory is ZERO-INITIALIZED: the
+        // Deref/DerefMut impls below expose the full `cap` as a `&[u8]`/`&mut [u8]`,
+        // so every byte must be initialized to avoid UB (reading uninitialized
+        // memory). The buffer is reused across reads/writes on the hot path, so
+        // this one-time zeroing is amortized — we do NOT re-zero per IO.
+        let ptr = unsafe { alloc_zeroed(layout) };
         if ptr.is_null() {
             std::alloc::handle_alloc_error(layout);
         }
@@ -54,22 +59,24 @@ impl AlignedBuf {
 impl Deref for AlignedBuf {
     type Target = [u8];
     fn deref(&self) -> &[u8] {
-        // SAFETY: ptr points to `cap` initialized-or-not bytes we own; callers
-        // treat this as a scratch buffer (write-then-read within the same op).
+        // SAFETY: ptr points to `cap` bytes we exclusively own, ZERO-INITIALIZED
+        // by `alloc_zeroed` in `new`, so the whole range is valid `u8` data
+        // (no uninitialized memory is ever exposed).
         unsafe { std::slice::from_raw_parts(self.ptr, self.cap) }
     }
 }
 
 impl DerefMut for AlignedBuf {
     fn deref_mut(&mut self) -> &mut [u8] {
-        // SAFETY: see Deref; we have exclusive &mut access.
+        // SAFETY: see Deref; the memory is zero-initialized and we have exclusive
+        // &mut access, so handing out an initialized `&mut [u8]` is sound.
         unsafe { std::slice::from_raw_parts_mut(self.ptr, self.cap) }
     }
 }
 
 impl Drop for AlignedBuf {
     fn drop(&mut self) {
-        // SAFETY: ptr/layout pair came from the matching alloc() above.
+        // SAFETY: ptr/layout pair came from the matching alloc_zeroed() above.
         unsafe { dealloc(self.ptr, self.layout) }
     }
 }

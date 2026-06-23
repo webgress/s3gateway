@@ -135,10 +135,7 @@ pub fn iso8601_from_unix(secs: i64) -> String {
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = if m <= 2 { y + 1 } else { y };
-    format!(
-        "{:04}{:02}{:02}T{:02}{:02}{:02}Z",
-        year, m, d, hh, mm, ss
-    )
+    format!("{:04}{:02}{:02}T{:02}{:02}{:02}Z", year, m, d, hh, mm, ss)
 }
 
 /// Current wall-clock time as Unix seconds (UTC).

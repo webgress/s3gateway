@@ -19,8 +19,10 @@ use md5::{Digest, Md5};
 use uuid::Uuid;
 
 use super::aligned::{AlignedBuf, DEFAULT_BUF_SIZE};
-use super::directio::{self, DioFile};
-use super::metadata::{read_metadata, write_metadata, ObjectMetadata, PartRef};
+use super::directio::{self, fsync_dir, DioFile};
+use super::metadata::{
+    read_metadata, write_metadata, write_metadata_durable, ObjectMetadata, PartRef,
+};
 use super::reader::{ByteRange, MultipartReader, PlainFileReader};
 
 pub const META_SUFFIX: &str = ".s3meta";
@@ -40,6 +42,8 @@ pub enum StorageError {
     InvalidBucket,
     #[error("path traversal detected")]
     PathTraversal,
+    #[error("key collides with a reserved internal name")]
+    ReservedKey,
     #[error("no such upload")]
     NoSuchUpload,
     #[error("invalid part order")]
@@ -56,6 +60,11 @@ pub type Result<T> = std::result::Result<T, StorageError>;
 #[derive(Debug, Clone)]
 pub struct Filesystem {
     root: PathBuf,
+    /// When true (default), object publication is made durable: the data file,
+    /// the `.s3meta` sidecar, and the parent directory are all fsync'd before
+    /// success is reported. When false, the sidecar/dir fsyncs are skipped for
+    /// throughput (the data file is still fsync'd). See `--fsync`.
+    fsync: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -79,7 +88,11 @@ pub struct ListObjectsInput {
     pub bucket: String,
     pub prefix: String,
     pub delimiter: String,
-    pub max_keys: i32,
+    /// `None` = the `max-keys` param was ABSENT (defaults to 1000). `Some(0)` is
+    /// an EXPLICIT request for an empty page (returns 0 keys, `is_truncated=true`
+    /// when more exist). `Some(n)` caps the page at `n`. Distinguishing absent
+    /// from 0 matters for S3 conformance (F14).
+    pub max_keys: Option<i32>,
     pub start_after: String,
     pub continuation_token: String,
 }
@@ -135,8 +148,21 @@ fn now_unix() -> i64 {
 }
 
 impl Filesystem {
+    /// Create a store rooted at `root` with durable publication enabled (fsync).
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Filesystem { root: root.into() }
+        Filesystem {
+            root: root.into(),
+            fsync: true,
+        }
+    }
+
+    /// Create a store with an explicit durability mode. `fsync = false` skips the
+    /// sidecar/dir fsyncs for max throughput (data file is still fsync'd).
+    pub fn with_fsync(root: impl Into<PathBuf>, fsync: bool) -> Self {
+        Filesystem {
+            root: root.into(),
+            fsync,
+        }
     }
 
     pub fn root(&self) -> &Path {
@@ -220,8 +246,13 @@ impl Filesystem {
 
     // ---- Object operations ----
 
-    /// PutObject: stream `body` to a temp file with a ONE-PASS MD5, fsync,
-    /// atomic rename, write `.s3meta`. Returns the quoted ETag.
+    /// PutObject: stream `body` to a temp file with a ONE-PASS MD5, then publish
+    /// the object DURABLY (when `--fsync`, default): the data temp file is
+    /// fsync'd before its atomic rename, the `.s3meta` sidecar is written to a
+    /// temp file + fsync'd + renamed, and the object's parent directory is
+    /// fsync'd so both renames (the data file and the sidecar) survive a crash.
+    /// With `--fsync=false` the data file is still fsync'd but the sidecar/dir
+    /// fsyncs are skipped for throughput. Returns the quoted single-part ETag.
     pub fn put_object<R: Read>(
         &self,
         bucket: &str,
@@ -282,7 +313,9 @@ impl Filesystem {
             cache_control: String::new(),
             multipart: None,
         };
-        write_metadata(&meta_path(&obj_path), &meta)?;
+        // Durable publication: when fsync is on, the sidecar is fsync'd and the
+        // parent dir is fsync'd (covering both the data-file and sidecar renames).
+        self.publish_sidecar(&obj_path, &meta)?;
         // A single-part PUT over a prior multipart object must drop the old
         // `{key}.parts` store (the new `.s3meta` already has `multipart: None`,
         // so GetObject reads the single file; the stale parts would just leak).
@@ -387,7 +420,13 @@ impl Filesystem {
     pub fn list_objects(&self, input: &ListObjectsInput) -> Result<ListObjectsOutput> {
         self.head_bucket(&input.bucket)?;
         let bucket_path = self.root.join(&input.bucket);
-        let max_keys = if input.max_keys <= 0 { 1000 } else { input.max_keys };
+        // F14: absent max-keys defaults to 1000; an EXPLICIT 0 means an empty page
+        // (and IsTruncated=true if anything exists). Negative values are clamped
+        // to 0 defensively.
+        let max_keys = match input.max_keys {
+            None => 1000,
+            Some(n) => n.max(0),
+        };
 
         let mut all_keys: Vec<ObjectInfo> = Vec::new();
         let mut prefix_set: BTreeMap<String, ()> = BTreeMap::new();
@@ -399,7 +438,9 @@ impl Filesystem {
                 return Ok(());
             }
             let rel = path.strip_prefix(&bucket_path).unwrap();
-            let key = rel.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/");
+            let key = rel
+                .to_string_lossy()
+                .replace(std::path::MAIN_SEPARATOR, "/");
 
             if !input.prefix.is_empty() && !key.starts_with(&input.prefix) {
                 return Ok(());
@@ -491,7 +532,7 @@ impl Filesystem {
         self.head_bucket(bucket)?;
 
         let upload_id = Uuid::new_v4().to_string();
-        let upload_dir = self.upload_dir(&upload_id);
+        let upload_dir = self.upload_dir(&upload_id)?;
         std::fs::create_dir_all(upload_dir.join("parts"))?;
 
         let meta = MultipartUpload {
@@ -502,8 +543,7 @@ impl Filesystem {
             content_type: content_type.to_string(),
             user_metadata: user_meta,
         };
-        let data =
-            serde_json::to_vec_pretty(&meta).map_err(io::Error::other)?;
+        let data = serde_json::to_vec_pretty(&meta).map_err(io::Error::other)?;
         std::fs::write(upload_dir.join("meta.json"), data)?;
         Ok(upload_id)
     }
@@ -516,7 +556,7 @@ impl Filesystem {
         part_number: i32,
         mut body: R,
     ) -> Result<String> {
-        let upload_dir = self.upload_dir(upload_id);
+        let upload_dir = self.upload_dir(upload_id)?;
         if !upload_dir.join("meta.json").exists() {
             return Err(StorageError::NoSuchUpload);
         }
@@ -556,7 +596,7 @@ impl Filesystem {
         upload_id: &str,
         parts: &[CompletePart],
     ) -> Result<String> {
-        let upload_dir = self.upload_dir(upload_id);
+        let upload_dir = self.upload_dir(upload_id)?;
         let meta_raw = match std::fs::read(upload_dir.join("meta.json")) {
             Ok(d) => d,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -586,7 +626,9 @@ impl Filesystem {
         let mut md5_concat: Vec<u8> = Vec::with_capacity(parts.len() * 16);
         let mut total: u64 = 0;
         for p in parts {
-            let part_path = upload_dir.join("parts").join(format!("{:05}", p.part_number));
+            let part_path = upload_dir
+                .join("parts")
+                .join(format!("{:05}", p.part_number));
             let md = match std::fs::metadata(&part_path) {
                 Ok(m) => m,
                 Err(_) => return Err(StorageError::InvalidPart),
@@ -594,11 +636,14 @@ impl Filesystem {
             // Compute the part MD5 by streaming (avoids loading into memory).
             let (digest, _size) = md5_file(&part_path)?;
             let hex_md5 = hex::encode(digest);
-            if !p.etag.is_empty() {
-                let provided = p.etag.trim_matches('"');
-                if provided != hex_md5 {
-                    return Err(StorageError::InvalidPart);
-                }
+            // F15: an empty client-supplied ETag is NOT a free pass — reject it,
+            // then ALWAYS compare. (S3 requires the ETag for each completed part.)
+            let provided = p.etag.trim_matches('"');
+            if provided.is_empty() {
+                return Err(StorageError::InvalidPart);
+            }
+            if provided != hex_md5 {
+                return Err(StorageError::InvalidPart);
             }
             md5_concat.extend_from_slice(&digest);
             total += md.len();
@@ -615,31 +660,43 @@ impl Filesystem {
         let etag = format!("\"{}-{}\"", hex::encode(composite), parts.len());
 
         // Persist the part files to a stable location keyed by the object so the
-        // upload dir can be cleaned. We MOVE parts into a per-object store dir
-        // and rewrite the manifest paths. This keeps "store parts, reassemble on
-        // read" while making the object durable independent of .multipart/{id}.
+        // upload dir can be cleaned. We keep "store parts, reassemble on read"
+        // while making the object durable independent of .multipart/{id}.
+        //
+        // F7: STAGE-THEN-SWAP. We must NOT destroy the previously-published
+        // object's parts before the new ones are fully in place — a mid-complete
+        // crash (or an error building the new manifest) must leave the prior
+        // object intact. So we move the new parts into a fresh staging dir
+        // `{key}.parts.new.<uuid>`, write the new sidecar to a temp file, and only
+        // then atomically swap: old store aside -> staging into place -> remove old.
         let obj_path = self.root.join(&upload.bucket).join(&upload.key);
         if let Some(parent) = obj_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let parts_store = parts_store_dir(&obj_path);
-        // Clear any pre-existing part store (e.g. overwriting a 3-part object
-        // with a 2-part one) so stale parts like `00003` don't orphan.
-        match std::fs::remove_dir_all(&parts_store) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e.into()),
-        }
-        std::fs::create_dir_all(&parts_store)?;
+        let staging = staging_parts_dir(&obj_path);
+        // Best-effort guard: remove the staging dir on any early return so a
+        // failed complete does not leak a `{key}.parts.new.<uuid>` tree.
+        let mut staging_guard = TmpDirGuard::new(staging.clone());
+        std::fs::create_dir_all(&staging)?;
         for pr in manifest.iter_mut() {
-            let dest = parts_store.join(format!("{:05}", pr.part_number));
-            directio::rename(Path::new(&pr.path), &dest)?;
-            pr.path = dest.to_string_lossy().into_owned();
+            let staged = staging.join(format!("{:05}", pr.part_number));
+            directio::rename(Path::new(&pr.path), &staged)?;
+            if self.fsync {
+                // Make the staged part durable before we publish it.
+                let f = DioFile::open_read(&staged)?;
+                f.fsync()?;
+            }
+            // The manifest records the FINAL path (post-swap), not the staging path.
+            pr.path = parts_store
+                .join(format!("{:05}", pr.part_number))
+                .to_string_lossy()
+                .into_owned();
         }
-        // The reassembled-on-read object has no single data file; we write a
-        // zero-byte placeholder at obj_path so existence checks behave, then the
-        // sidecar carries the manifest. (GetObject keys off the sidecar.)
-        let _ = std::fs::write(&obj_path, b"");
+        if self.fsync {
+            // Ensure the staging dir's entries are durable before the swap.
+            let _ = fsync_dir(&staging);
+        }
 
         let ct = if upload.content_type.is_empty() {
             "application/octet-stream"
@@ -657,7 +714,47 @@ impl Filesystem {
             cache_control: String::new(),
             multipart: Some(manifest),
         };
-        write_metadata(&meta_path(&obj_path), &meta)?;
+
+        // --- Atomic-ish swap, ordered so a crash never destroys the prior object
+        // before the new one is published. ---
+        // 1. Move any existing published store ASIDE (don't delete yet).
+        let old_aside = aside_parts_dir(&obj_path);
+        let had_old = match directio::rename(&parts_store, &old_aside) {
+            Ok(()) => true,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+            Err(e) => return Err(e.into()),
+        };
+        // 2. Move the staged store INTO place. If this fails, restore the old one.
+        if let Err(e) = directio::rename(&staging, &parts_store) {
+            if had_old {
+                let _ = directio::rename(&old_aside, &parts_store);
+            }
+            return Err(e.into());
+        }
+        staging_guard.disarm();
+        // 3. The reassembled-on-read object has no single data file; write a
+        // zero-byte placeholder at obj_path so existence checks behave. Propagate
+        // any error (do NOT swallow it) — but first try to restore the prior
+        // object's parts so we don't leave it half-destroyed.
+        if let Err(e) = std::fs::write(&obj_path, b"") {
+            // Roll back: move the new store aside and the old one back.
+            let _ = directio::rename(&parts_store, &staging);
+            if had_old {
+                let _ = directio::rename(&old_aside, &parts_store);
+            }
+            return Err(e.into());
+        }
+        // 4. Publish the sidecar (durably when --fsync). After this the new object
+        // is live; only now is it safe to delete the old parts. If the manifest
+        // write fails, the placeholder + new parts are in place but the prior
+        // object's parts are still preserved in `old_aside` (we do NOT delete
+        // them on the error path), so the caller sees an error without us having
+        // destroyed the previously-published object.
+        self.publish_sidecar(&obj_path, &meta)?;
+        // 5. New object fully published — now remove the old parts store.
+        if had_old {
+            let _ = std::fs::remove_dir_all(&old_aside);
+        }
 
         // Cleanup the upload working dir.
         let _ = std::fs::remove_dir_all(&upload_dir);
@@ -665,7 +762,7 @@ impl Filesystem {
     }
 
     pub fn abort_multipart_upload(&self, upload_id: &str) -> Result<()> {
-        let upload_dir = self.upload_dir(upload_id);
+        let upload_dir = self.upload_dir(upload_id)?;
         if !upload_dir.join("meta.json").exists() {
             return Err(StorageError::NoSuchUpload);
         }
@@ -702,7 +799,7 @@ impl Filesystem {
     }
 
     pub fn list_parts(&self, upload_id: &str) -> Result<Vec<PartInfo>> {
-        let upload_dir = self.upload_dir(upload_id);
+        let upload_dir = self.upload_dir(upload_id)?;
         if !upload_dir.join("meta.json").exists() {
             return Err(StorageError::NoSuchUpload);
         }
@@ -737,8 +834,14 @@ impl Filesystem {
 
     // ---- helpers ----
 
-    fn upload_dir(&self, upload_id: &str) -> PathBuf {
-        self.root.join(MULTIPART_DIR).join(upload_id)
+    /// Resolve the working dir for an upload, validating the client-supplied
+    /// `upload_id` is a well-formed UUID FIRST. Without this, a crafted id like
+    /// `../../etc` would join outside `root/.multipart/` and let upload_part /
+    /// complete / abort / list_parts read or `remove_dir_all` arbitrary paths.
+    /// The check is a cheap parse, no IO.
+    fn upload_dir(&self, upload_id: &str) -> Result<PathBuf> {
+        Uuid::parse_str(upload_id).map_err(|_| StorageError::NoSuchUpload)?;
+        Ok(self.root.join(MULTIPART_DIR).join(upload_id))
     }
 
     /// Validate the bucket NAME as a path component: reject `..`, `.`, empty,
@@ -773,6 +876,14 @@ impl Filesystem {
         if Path::new(key).is_absolute() {
             return Err(StorageError::PathTraversal);
         }
+        // F6: reject keys whose FINAL component collides with our internal files,
+        // so a client object can never shadow / clobber a sidecar, a part store,
+        // or a temp file. (e.g. `foo.s3meta` would be hidden from ListObjects, and
+        // a `remove_dir_all("{key}.parts")` could wipe a legit `foo.parts/` tree.)
+        let last = key.rsplit('/').next().unwrap_or(key);
+        if last.ends_with(META_SUFFIX) || last.ends_with(".parts") || last.contains(".tmp.") {
+            return Err(StorageError::ReservedKey);
+        }
         let bucket_path = self.root.join(bucket);
         let full = bucket_path.join(key);
         let base = normalize(&bucket_path);
@@ -782,6 +893,41 @@ impl Filesystem {
         }
         // Containment: the resolved path must be strictly inside the data root.
         self.assert_within_root(&cleaned)?;
+        // F5 defense-in-depth: lexical checks above can't see SYMLINKS. Resolve
+        // the deepest existing ancestor of the target with the OS (following any
+        // symlinks) and assert it is still inside the canonical data root. This
+        // catches a symlinked intermediate directory inside the bucket that
+        // points outside root. (The symlinked-LEAF case is additionally handled
+        // by O_NOFOLLOW at the storage opens.)
+        self.assert_real_parent_within_root(&full)?;
+        Ok(())
+    }
+
+    /// Canonicalize the deepest EXISTING ancestor of `target` (following symlinks)
+    /// and assert it remains inside the canonical data root. For reads the parent
+    /// exists; for writes of a new nested key only some ancestors exist yet — we
+    /// resolve the deepest one that does, which is sufficient to catch a symlink
+    /// escape anywhere along the existing path.
+    fn assert_real_parent_within_root(&self, target: &Path) -> Result<()> {
+        let real_root = match std::fs::canonicalize(&self.root) {
+            Ok(r) => r,
+            // If the root itself isn't canonicalizable, fall back to the lexical
+            // check already performed (don't hard-fail legitimate ops).
+            Err(_) => return Ok(()),
+        };
+        let mut probe = target.parent();
+        while let Some(dir) = probe {
+            match std::fs::canonicalize(dir) {
+                Ok(real) => {
+                    if real != real_root && !real.starts_with(&real_root) {
+                        return Err(StorageError::PathTraversal);
+                    }
+                    return Ok(());
+                }
+                // This ancestor doesn't exist yet (new nested key); go shallower.
+                Err(_) => probe = dir.parent(),
+            }
+        }
         Ok(())
     }
 
@@ -791,6 +937,22 @@ impl Filesystem {
         let root = normalize(&self.root);
         if path == root || !path.starts_with(&root) {
             return Err(StorageError::PathTraversal);
+        }
+        Ok(())
+    }
+
+    /// Write the object's `.s3meta` sidecar and, when durability is enabled,
+    /// fsync it and the object's parent directory so the just-published object
+    /// (data file + sidecar, both already renamed into place) survives a crash.
+    /// When `--fsync=false`, fall back to the non-durable atomic write.
+    fn publish_sidecar(&self, obj_path: &Path, meta: &ObjectMetadata) -> Result<()> {
+        if self.fsync {
+            write_metadata_durable(&meta_path(obj_path), meta)?;
+            // The data file's rename shares the same parent dir; the sidecar's
+            // durable write already fsync'd that dir, so the data-file rename is
+            // covered too. No second dir fsync is needed.
+        } else {
+            write_metadata(&meta_path(obj_path), meta)?;
         }
         Ok(())
     }
@@ -818,6 +980,28 @@ impl Drop for TmpGuard {
     }
 }
 
+/// RAII cleanup for a temporary DIRECTORY (e.g. the multipart staging store):
+/// `remove_dir_all` on drop unless disarmed after a successful publish.
+struct TmpDirGuard {
+    path: PathBuf,
+    armed: bool,
+}
+impl TmpDirGuard {
+    fn new(path: PathBuf) -> Self {
+        TmpDirGuard { path, armed: true }
+    }
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+impl Drop for TmpDirGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
 fn meta_path(obj_path: &Path) -> PathBuf {
     let mut s = obj_path.as_os_str().to_owned();
     s.push(META_SUFFIX);
@@ -827,6 +1011,23 @@ fn meta_path(obj_path: &Path) -> PathBuf {
 fn parts_store_dir(obj_path: &Path) -> PathBuf {
     let mut s = obj_path.as_os_str().to_owned();
     s.push(".parts");
+    PathBuf::from(s)
+}
+
+/// A fresh per-object staging dir for new multipart parts during Complete. Named
+/// with a UUID so concurrent completes of the same key never collide, and so the
+/// `walk_dir` list scan (which skips `.parts` suffixes) does not surface it.
+fn staging_parts_dir(obj_path: &Path) -> PathBuf {
+    let mut s = obj_path.as_os_str().to_owned();
+    s.push(format!(".parts.new.{}", Uuid::new_v4()));
+    PathBuf::from(s)
+}
+
+/// A temporary holding name for the PREVIOUSLY-published parts store, used during
+/// the Complete swap so the old object survives until the new one is published.
+fn aside_parts_dir(obj_path: &Path) -> PathBuf {
+    let mut s = obj_path.as_os_str().to_owned();
+    s.push(format!(".parts.old.{}", Uuid::new_v4()));
     PathBuf::from(s)
 }
 
@@ -897,7 +1098,13 @@ fn walk_dir(dir: &Path, cb: &mut dyn FnMut(&Path) -> io::Result<()>) -> io::Resu
         let name_str = name.to_string_lossy();
         let ft = entry.file_type()?;
         if ft.is_dir() {
-            if name_str == MULTIPART_DIR || name_str.ends_with(".parts") {
+            // Skip the per-bucket multipart working dir, published part stores
+            // (`{key}.parts`), and transient swap dirs (`{key}.parts.new.<uuid>`,
+            // `{key}.parts.old.<uuid>`) created during CompleteMultipartUpload.
+            if name_str == MULTIPART_DIR
+                || name_str.ends_with(".parts")
+                || name_str.contains(".parts.")
+            {
                 continue;
             }
             walk_dir(&entry.path(), cb)?;
@@ -1139,7 +1346,10 @@ mod tests {
         f.create_bucket("buck").unwrap();
         let data: Vec<u8> = (0..5000).map(|i| (i % 256) as u8).collect();
         f.put_object("buck", "k", &data[..], "", um()).unwrap();
-        let r = ByteRange { start: 1000, end: 1999 };
+        let r = ByteRange {
+            start: 1000,
+            end: 1999,
+        };
         let mut res = f.get_object("buck", "k", Some(r)).unwrap();
         let mut got = Vec::new();
         res.body.read_to_end(&mut got).unwrap();
@@ -1257,7 +1467,9 @@ mod tests {
         // A deep legit nested key still works end-to-end.
         f.put_object("valid-bucket", "a/b/c/d/e/deep.txt", &b"deep"[..], "", um())
             .unwrap();
-        let mut r = f.get_object("valid-bucket", "a/b/c/d/e/deep.txt", None).unwrap();
+        let mut r = f
+            .get_object("valid-bucket", "a/b/c/d/e/deep.txt", None)
+            .unwrap();
         let mut got = Vec::new();
         r.body.read_to_end(&mut got).unwrap();
         assert_eq!(got, b"deep");
@@ -1328,7 +1540,7 @@ mod tests {
             .list_objects(&ListObjectsInput {
                 bucket: "buck".into(),
                 prefix: "file".into(),
-                max_keys: 3,
+                max_keys: Some(3),
                 ..Default::default()
             })
             .unwrap();
@@ -1341,7 +1553,7 @@ mod tests {
             .list_objects(&ListObjectsInput {
                 bucket: "buck".into(),
                 prefix: "file".into(),
-                max_keys: 100,
+                max_keys: Some(100),
                 continuation_token: out.next_continuation_token.clone(),
                 ..Default::default()
             })
@@ -1416,9 +1628,18 @@ mod tests {
             .complete_multipart_upload(
                 &uid,
                 &[
-                    CompletePart { part_number: 1, etag: e1.clone() },
-                    CompletePart { part_number: 2, etag: e2.clone() },
-                    CompletePart { part_number: 3, etag: e3.clone() },
+                    CompletePart {
+                        part_number: 1,
+                        etag: e1.clone(),
+                    },
+                    CompletePart {
+                        part_number: 2,
+                        etag: e2.clone(),
+                    },
+                    CompletePart {
+                        part_number: 3,
+                        etag: e3.clone(),
+                    },
                 ],
             )
             .unwrap();
@@ -1443,7 +1664,10 @@ mod tests {
         assert_eq!(got, full);
 
         // range read across reassembled object
-        let r = ByteRange { start: 5 * 1024 * 1024 - 2, end: 5 * 1024 * 1024 + 2 };
+        let r = ByteRange {
+            start: 5 * 1024 * 1024 - 2,
+            end: 5 * 1024 * 1024 + 2,
+        };
         let mut res = f.get_object("buck", "big.bin", Some(r)).unwrap();
         let mut got = Vec::new();
         res.body.read_to_end(&mut got).unwrap();
@@ -1474,8 +1698,14 @@ mod tests {
             .complete_multipart_upload(
                 &uid,
                 &[
-                    CompletePart { part_number: 1, etag: e1 },
-                    CompletePart { part_number: 2, etag: e2 },
+                    CompletePart {
+                        part_number: 1,
+                        etag: e1,
+                    },
+                    CompletePart {
+                        part_number: 2,
+                        etag: e2,
+                    },
                 ],
             )
             .unwrap();
@@ -1490,9 +1720,15 @@ mod tests {
         assert_eq!(out.objects.len(), 1);
         let obj = &out.objects[0];
         assert_eq!(obj.key, "mp.bin");
-        assert_eq!(obj.size, real_size, "listed size must be the real object size");
+        assert_eq!(
+            obj.size, real_size,
+            "listed size must be the real object size"
+        );
         assert_eq!(obj.etag, composite, "listed etag must be the composite -N");
-        assert!(obj.etag.ends_with("-2\""), "composite etag should end with -2");
+        assert!(
+            obj.etag.ends_with("-2\""),
+            "composite etag should end with -2"
+        );
     }
 
     #[test]
@@ -1503,7 +1739,10 @@ mod tests {
         f.upload_part(&uid, 1, &b"hello"[..]).unwrap();
         let err = f.complete_multipart_upload(
             &uid,
-            &[CompletePart { part_number: 1, etag: "\"deadbeef\"".into() }],
+            &[CompletePart {
+                part_number: 1,
+                etag: "\"deadbeef\"".into(),
+            }],
         );
         assert!(matches!(err, Err(StorageError::InvalidPart)));
     }
@@ -1515,11 +1754,20 @@ mod tests {
         let uid = f.create_multipart_upload("buck", "k", "", um()).unwrap();
         f.upload_part(&uid, 1, &b"a"[..]).unwrap();
         f.upload_part(&uid, 2, &b"b"[..]).unwrap();
+        // Non-empty (but irrelevant) ETags: order is checked before ETag, and an
+        // empty ETag would now be rejected as InvalidPart (F15), so use dummies
+        // to keep this test exercising the ORDER path specifically.
         let err = f.complete_multipart_upload(
             &uid,
             &[
-                CompletePart { part_number: 2, etag: String::new() },
-                CompletePart { part_number: 1, etag: String::new() },
+                CompletePart {
+                    part_number: 2,
+                    etag: "\"deadbeefdeadbeefdeadbeefdeadbeef\"".into(),
+                },
+                CompletePart {
+                    part_number: 1,
+                    etag: "\"cafecafecafecafecafecafecafecafe\"".into(),
+                },
             ],
         );
         assert!(matches!(err, Err(StorageError::InvalidPartOrder)));
@@ -1549,7 +1797,10 @@ mod tests {
         let uid = f.create_multipart_upload("buck", "k", "", um()).unwrap();
         f.upload_part(&uid, 1, &b"first"[..]).unwrap();
         let e = f.upload_part(&uid, 1, &b"second-version"[..]).unwrap();
-        assert_eq!(e, format!("\"{}\"", hex::encode(Md5::digest(b"second-version"))));
+        assert_eq!(
+            e,
+            format!("\"{}\"", hex::encode(Md5::digest(b"second-version")))
+        );
         let parts = f.list_parts(&uid).unwrap();
         assert_eq!(parts.len(), 1);
         assert_eq!(parts[0].size, "second-version".len() as i64);
@@ -1569,8 +1820,14 @@ mod tests {
         f.complete_multipart_upload(
             &uid,
             &[
-                CompletePart { part_number: 1, etag: e1 },
-                CompletePart { part_number: 2, etag: e2 },
+                CompletePart {
+                    part_number: 1,
+                    etag: e1,
+                },
+                CompletePart {
+                    part_number: 2,
+                    etag: e2,
+                },
             ],
         )
         .unwrap();
@@ -1607,9 +1864,18 @@ mod tests {
         f.complete_multipart_upload(
             &uid3,
             &[
-                CompletePart { part_number: 1, etag: e1 },
-                CompletePart { part_number: 2, etag: e2 },
-                CompletePart { part_number: 3, etag: e3 },
+                CompletePart {
+                    part_number: 1,
+                    etag: e1,
+                },
+                CompletePart {
+                    part_number: 2,
+                    etag: e2,
+                },
+                CompletePart {
+                    part_number: 3,
+                    etag: e3,
+                },
             ],
         )
         .unwrap();
@@ -1625,14 +1891,23 @@ mod tests {
         f.complete_multipart_upload(
             &uid2,
             &[
-                CompletePart { part_number: 1, etag: f1 },
-                CompletePart { part_number: 2, etag: f2 },
+                CompletePart {
+                    part_number: 1,
+                    etag: f1,
+                },
+                CompletePart {
+                    part_number: 2,
+                    etag: f2,
+                },
             ],
         )
         .unwrap();
 
         // No stale 00003 remains.
-        assert!(!parts_dir.join("00003").exists(), "stale 00003 must be gone");
+        assert!(
+            !parts_dir.join("00003").exists(),
+            "stale 00003 must be gone"
+        );
         assert!(parts_dir.join("00001").exists());
         assert!(parts_dir.join("00002").exists());
 
@@ -1662,8 +1937,14 @@ mod tests {
         f.complete_multipart_upload(
             &uid,
             &[
-                CompletePart { part_number: 1, etag: e1 },
-                CompletePart { part_number: 2, etag: e2 },
+                CompletePart {
+                    part_number: 1,
+                    etag: e1,
+                },
+                CompletePart {
+                    part_number: 2,
+                    etag: e2,
+                },
             ],
         )
         .unwrap();
@@ -1675,9 +1956,15 @@ mod tests {
         f.put_object("buck", key, &new_bytes[..], "", um()).unwrap();
 
         // .parts dir is gone and the sidecar no longer references a manifest.
-        assert!(!parts_dir.exists(), ".parts must be removed after single PUT");
+        assert!(
+            !parts_dir.exists(),
+            ".parts must be removed after single PUT"
+        );
         let meta = f.head_object("buck", key).unwrap();
-        assert!(!meta.is_multipart(), "sidecar must not be multipart anymore");
+        assert!(
+            !meta.is_multipart(),
+            "sidecar must not be multipart anymore"
+        );
 
         // GET returns the single-part bytes.
         let mut res = f.get_object("buck", key, None).unwrap();
@@ -1694,5 +1981,303 @@ mod tests {
             f.upload_part("does-not-exist", 1, &b"x"[..]),
             Err(StorageError::NoSuchUpload)
         ));
+    }
+
+    #[test]
+    fn upload_id_path_traversal_rejected() {
+        // F1 regression: a crafted uploadId containing `../` (or `..`) must be
+        // rejected as NoSuchUpload on EVERY upload entry point, before it is ever
+        // joined onto root/.multipart/ (which would allow reading meta.json or
+        // remove_dir_all outside the data dir). A real server-issued UUID works.
+        let (_d, f) = fs();
+        f.create_bucket("buck").unwrap();
+        for bad in ["../../etc", "..", "../escape", "not-a-uuid", "", "a/b"] {
+            assert!(
+                matches!(
+                    f.upload_part(bad, 1, &b"x"[..]),
+                    Err(StorageError::NoSuchUpload)
+                ),
+                "upload_part should reject uploadId {bad:?}"
+            );
+            assert!(
+                matches!(f.list_parts(bad), Err(StorageError::NoSuchUpload)),
+                "list_parts should reject uploadId {bad:?}"
+            );
+            assert!(
+                matches!(
+                    f.abort_multipart_upload(bad),
+                    Err(StorageError::NoSuchUpload)
+                ),
+                "abort should reject uploadId {bad:?}"
+            );
+            assert!(
+                matches!(
+                    f.complete_multipart_upload(bad, &[]),
+                    Err(StorageError::NoSuchUpload)
+                ),
+                "complete should reject uploadId {bad:?}"
+            );
+        }
+        // A real server-issued UUID still drives the upload end to end.
+        let uid = f.create_multipart_upload("buck", "k", "", um()).unwrap();
+        assert!(Uuid::parse_str(&uid).is_ok());
+        let e1 = f.upload_part(&uid, 1, &b"hello-part"[..]).unwrap();
+        let parts = f.list_parts(&uid).unwrap();
+        assert_eq!(parts.len(), 1);
+        f.complete_multipart_upload(
+            &uid,
+            &[CompletePart {
+                part_number: 1,
+                etag: e1,
+            }],
+        )
+        .unwrap();
+        let mut r = f.get_object("buck", "k", None).unwrap();
+        let mut got = Vec::new();
+        r.body.read_to_end(&mut got).unwrap();
+        assert_eq!(got, b"hello-part");
+    }
+
+    #[test]
+    fn reserved_name_keys_rejected() {
+        // F6 regression: keys whose final component collides with internal files
+        // must be rejected so they can't shadow sidecars / clobber part stores.
+        let (_d, f) = fs();
+        f.create_bucket("buck").unwrap();
+        for bad in [
+            "x.s3meta",
+            "x.parts",
+            "a.tmp.b",
+            "dir/inner.s3meta",
+            "deep/a/b.parts",
+        ] {
+            assert!(
+                matches!(
+                    f.put_object("buck", bad, &b"x"[..], "", um()),
+                    Err(StorageError::ReservedKey)
+                ),
+                "put_object should reject reserved key {bad:?}"
+            );
+        }
+        // Normal keys (including ones that merely CONTAIN the tokens mid-name)
+        // still work.
+        for good in [
+            "x.s3meta.txt",
+            "parts",
+            "report.tmp",
+            "notes.parts.txt",
+            "a/b/c.txt",
+        ] {
+            f.put_object("buck", good, &b"ok"[..], "", um())
+                .unwrap_or_else(|e| panic!("good key {good:?} should be accepted, got {e:?}"));
+        }
+    }
+
+    #[test]
+    fn symlink_leaf_not_followed_for_get_and_put() {
+        // F5 regression: a symlink planted inside a bucket pointing OUTSIDE the
+        // data root must not be followed for GET/PUT — the op errors instead of
+        // escaping. (O_NOFOLLOW on the leaf + parent canonicalization.)
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let f = Filesystem::new(&root);
+        f.create_bucket("buck").unwrap();
+
+        // A secret file OUTSIDE the data root.
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().join("secret.txt");
+        std::fs::write(&secret, b"TOP SECRET").unwrap();
+
+        // Plant a symlink `buck/link` -> outside secret, plus a sidecar so a
+        // naive GET would read metadata then open the symlinked data file.
+        let link = root.join("buck").join("link");
+        symlink(&secret, &link).unwrap();
+
+        // GET must NOT return the secret: either ObjectNotFound (no sidecar) or
+        // an IO error (O_NOFOLLOW ELOOP) — never the secret bytes.
+        match f.get_object("buck", "link", None) {
+            Err(_) => {}
+            Ok(mut res) => {
+                let mut got = Vec::new();
+                let _ = res.body.read_to_end(&mut got);
+                assert_ne!(
+                    got, b"TOP SECRET",
+                    "GET followed the symlink and leaked the secret"
+                );
+            }
+        }
+
+        // PUT over the symlinked leaf must NOT write through to the outside target.
+        let _ = f.put_object("buck", "link", &b"pwn"[..], "", um());
+        let after = std::fs::read(&secret).unwrap();
+        assert_eq!(
+            after, b"TOP SECRET",
+            "PUT wrote through the symlink to outside root"
+        );
+    }
+
+    #[test]
+    fn put_object_writes_data_and_sidecar_durably() {
+        // F11/F12 regression: with fsync on (default), put_object must publish
+        // both the data file and the .s3meta sidecar via the durability path
+        // WITHOUT error, and GET-after-PUT must still return the exact bytes.
+        let dir = tempfile::tempdir().unwrap();
+        let f = Filesystem::with_fsync(dir.path(), true);
+        f.create_bucket("buck").unwrap();
+        let data = b"durable-bytes-1234567890";
+        let etag = f
+            .put_object("buck", "d/obj.bin", &data[..], "application/x-test", um())
+            .unwrap();
+        assert_eq!(etag, format!("\"{}\"", hex::encode(Md5::digest(data))));
+
+        // The data file and its sidecar both exist on disk.
+        let obj = dir.path().join("buck").join("d").join("obj.bin");
+        assert!(obj.exists(), "data file must exist");
+        assert!(meta_path(&obj).exists(), "sidecar must exist");
+        // No stray sidecar temp file leaked.
+        let mut s = obj.as_os_str().to_owned();
+        s.push(".s3meta.tmp");
+        assert!(
+            !PathBuf::from(s).exists(),
+            "sidecar temp must be renamed away"
+        );
+
+        // GET round-trips exactly.
+        let mut res = f.get_object("buck", "d/obj.bin", None).unwrap();
+        let mut got = Vec::new();
+        res.body.read_to_end(&mut got).unwrap();
+        assert_eq!(got, data);
+
+        // The non-durable mode also works correctly (just skips fsyncs).
+        let f2 = Filesystem::with_fsync(dir.path(), false);
+        f2.put_object("buck", "nofsync.bin", &b"abc"[..], "", um())
+            .unwrap();
+        let mut res2 = f2.get_object("buck", "nofsync.bin", None).unwrap();
+        let mut got2 = Vec::new();
+        res2.body.read_to_end(&mut got2).unwrap();
+        assert_eq!(got2, b"abc");
+    }
+
+    #[test]
+    fn complete_stages_new_parts_before_destroying_old() {
+        // F7 regression: completing a 2-part upload over a prior 3-part object
+        // must NOT destroy the old parts before the new ones are published. We
+        // assert the ordering by checking the new parts are present in the store
+        // (and the old stale `00003` is gone), and GET returns the new bytes.
+        let (_d, f) = fs();
+        f.create_bucket("buck").unwrap();
+        let key = "obj.bin";
+
+        // Prior 3-part object.
+        let uid3 = f.create_multipart_upload("buck", key, "", um()).unwrap();
+        let a1 = vec![1u8; 5 * 1024 * 1024];
+        let a2 = vec![2u8; 5 * 1024 * 1024];
+        let a3 = vec![3u8; 1000];
+        let e1 = f.upload_part(&uid3, 1, &a1[..]).unwrap();
+        let e2 = f.upload_part(&uid3, 2, &a2[..]).unwrap();
+        let e3 = f.upload_part(&uid3, 3, &a3[..]).unwrap();
+        f.complete_multipart_upload(
+            &uid3,
+            &[
+                CompletePart {
+                    part_number: 1,
+                    etag: e1,
+                },
+                CompletePart {
+                    part_number: 2,
+                    etag: e2,
+                },
+                CompletePart {
+                    part_number: 3,
+                    etag: e3,
+                },
+            ],
+        )
+        .unwrap();
+        let store = parts_store_dir(&f.root().join("buck").join(key));
+        assert!(store.join("00003").exists());
+
+        // Overwrite with a 2-part object.
+        let uid2 = f.create_multipart_upload("buck", key, "", um()).unwrap();
+        let b1 = vec![4u8; 5 * 1024 * 1024];
+        let b2 = vec![5u8; 2000];
+        let g1 = f.upload_part(&uid2, 1, &b1[..]).unwrap();
+        let g2 = f.upload_part(&uid2, 2, &b2[..]).unwrap();
+        f.complete_multipart_upload(
+            &uid2,
+            &[
+                CompletePart {
+                    part_number: 1,
+                    etag: g1,
+                },
+                CompletePart {
+                    part_number: 2,
+                    etag: g2,
+                },
+            ],
+        )
+        .unwrap();
+
+        // New parts present; stale 00003 gone; no leftover swap dirs.
+        assert!(store.join("00001").exists());
+        assert!(store.join("00002").exists());
+        assert!(
+            !store.join("00003").exists(),
+            "stale part must be removed after publish"
+        );
+        // No `.parts.new.*` / `.parts.old.*` swap dirs leaked in the bucket.
+        let bucket_dir = f.root().join("buck");
+        for entry in std::fs::read_dir(&bucket_dir).unwrap() {
+            let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+            assert!(
+                !name.contains(".parts.new.") && !name.contains(".parts.old."),
+                "swap dir leaked: {name}"
+            );
+        }
+
+        // GET returns the new 2-part bytes.
+        let mut res = f.get_object("buck", key, None).unwrap();
+        let mut got = Vec::new();
+        res.body.read_to_end(&mut got).unwrap();
+        let mut expected = b1.clone();
+        expected.extend_from_slice(&b2);
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn max_keys_zero_vs_absent() {
+        // F14 regression: explicit max-keys=0 returns 0 keys with IsTruncated
+        // true (non-empty bucket); absent max-keys defaults to 1000.
+        let (_d, f) = fs();
+        f.create_bucket("buck").unwrap();
+        for i in 0..5 {
+            f.put_object("buck", &format!("k{i}"), &b"x"[..], "", um())
+                .unwrap();
+        }
+        // Explicit 0 -> empty page, truncated.
+        let out = f
+            .list_objects(&ListObjectsInput {
+                bucket: "buck".into(),
+                max_keys: Some(0),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(out.objects.len(), 0, "max-keys=0 must return 0 keys");
+        assert!(
+            out.is_truncated,
+            "max-keys=0 over a non-empty bucket is truncated"
+        );
+
+        // Absent (None) -> defaults to 1000, returns all 5.
+        let out2 = f
+            .list_objects(&ListObjectsInput {
+                bucket: "buck".into(),
+                max_keys: None,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(out2.objects.len(), 5);
+        assert!(!out2.is_truncated);
     }
 }

@@ -17,7 +17,7 @@ use hyper::header::HeaderValue;
 use hyper::{Method, Request, Response};
 use uuid::Uuid;
 
-use crate::auth::{verify_request, SignableRequest, SigV4Error};
+use crate::auth::{verify_request, SigV4Error, SignableRequest};
 use crate::s3response::S3ErrorCode;
 
 use crate::handler::{

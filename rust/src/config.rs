@@ -42,6 +42,14 @@ pub struct Config {
     /// Use kTLS offload (when false, stay in userspace rustls).
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     pub ktls: bool,
+
+    /// Durable object publication: fsync the data file, sidecar, and parent
+    /// directory before reporting success. Default true (crash-safe). Set to
+    /// false to skip the sidecar/dir fsyncs for maximum throughput, at the cost
+    /// of durability — a power loss may leave a just-PUT object's metadata or
+    /// directory entry unflushed (the data file is still fsync'd either way).
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub fsync: bool,
 }
 
 fn default_workers() -> usize {
@@ -70,6 +78,7 @@ mod tests {
         assert_eq!(cfg.log_level, "info");
         assert!(cfg.workers >= 1);
         assert!(cfg.ktls);
+        assert!(cfg.fsync);
         assert!(!cfg.tls_enabled());
     }
 
@@ -85,6 +94,8 @@ mod tests {
             "4",
             "--ktls",
             "false",
+            "--fsync",
+            "false",
             "--tls-cert",
             "/c.pem",
             "--tls-key",
@@ -93,6 +104,7 @@ mod tests {
         assert_eq!(cfg.port, 9000);
         assert_eq!(cfg.workers, 4);
         assert!(!cfg.ktls);
+        assert!(!cfg.fsync);
         assert!(cfg.tls_enabled());
     }
 }

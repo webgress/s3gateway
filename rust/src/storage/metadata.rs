@@ -52,9 +52,14 @@ impl ObjectMetadata {
 }
 
 /// Write metadata atomically (temp file + rename), matching the Go impl.
+///
+/// This is the non-durable variant (no fsync). For crash-safe publication use
+/// [`write_metadata_durable`], which fsyncs the sidecar before rename. The
+/// `.tmp` suffix here would collide with the list-scan's `.tmp.` skip filter, so
+/// it is deliberately a plain `.tmp` (no trailing dot) and the sidecar itself is
+/// never returned by listings (it ends in `.s3meta`).
 pub fn write_metadata(path: &Path, meta: &ObjectMetadata) -> io::Result<()> {
-    let data =
-        serde_json::to_vec_pretty(meta).map_err(io::Error::other)?;
+    let data = serde_json::to_vec_pretty(meta).map_err(io::Error::other)?;
     let tmp = with_suffix(path, ".tmp");
     std::fs::write(&tmp, &data)?;
     match std::fs::rename(&tmp, path) {
@@ -64,6 +69,42 @@ pub fn write_metadata(path: &Path, meta: &ObjectMetadata) -> io::Result<()> {
             Err(e)
         }
     }
+}
+
+/// Write metadata atomically AND durably: write the temp sidecar, fsync its
+/// bytes to stable storage, rename it into place, then fsync the parent
+/// directory so the rename (the new directory entry) survives a crash. Use this
+/// on the object-publication path when `--fsync` is enabled.
+pub fn write_metadata_durable(path: &Path, meta: &ObjectMetadata) -> io::Result<()> {
+    use super::directio::{fsync_dir, DioFile};
+    let data = serde_json::to_vec_pretty(meta).map_err(io::Error::other)?;
+    let tmp = with_suffix(path, ".tmp");
+    {
+        let f = DioFile::create_write(&tmp)?;
+        let mut off = 0u64;
+        let mut buf: &[u8] = &data;
+        while !buf.is_empty() {
+            let n = f.pwrite_at(buf, off)?;
+            if n == 0 {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(io::Error::new(io::ErrorKind::WriteZero, "pwrite wrote 0"));
+            }
+            off += n as u64;
+            buf = &buf[n..];
+        }
+        f.fsync()?;
+    }
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => {}
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+    }
+    if let Some(parent) = path.parent() {
+        fsync_dir(parent)?;
+    }
+    Ok(())
 }
 
 /// Read+parse a metadata sidecar.

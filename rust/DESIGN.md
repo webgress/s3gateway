@@ -96,6 +96,53 @@ extra `open`/`close` calls at part boundaries, negligible against the bytes move
 The only real downside is more inodes per object and slightly more complex GET
 code — both acceptable for the throughput gained.
 
+## Integrity model: signature binds the declared hash, TLS protects the bytes
+
+SigV4 binds the request signature to the client-supplied `x-amz-content-sha256`
+header value — that is the contract. We deliberately do **not** re-hash the body
+on the server to confirm it matches the declared digest: doing so would add a
+**second full CPU pass over every payload byte**, directly defeating the
+one-pass-MD5 design that is the whole point of the storage hot path. Body
+integrity in transit is therefore provided by **TLS**, which is the centerpiece of
+this gateway anyway (kTLS on the NIC). `UNSIGNED-PAYLOAD` and the streaming
+chunked formats are supported under the same model.
+
+The consequence to state plainly: the cryptographic guarantee is that the bytes
+arrived intact over the TLS channel and the request was signed by a holder of the
+secret key — **not** that the body matches a server-recomputed hash. In
+**plaintext mode** (no TLS), or if a mutable component sits between TLS
+termination and this process, there is **no cryptographic body-integrity
+guarantee**. Plaintext is for trusted networks / local testing only; any
+untrusted path must use TLS.
+
+For `STREAMING-AWS4-HMAC-SHA256-PAYLOAD` (and the `-TRAILER` variants), only the
+SigV4 **seed** signature is verified, at request-auth time. The per-chunk
+`chunk-signature` values are intentionally not re-verified — that would impose a
+per-byte HMAC on the hot path for no benefit beyond what TLS already provides.
+
+## Durability: crash-safe publication (the `--fsync` knob)
+
+Object publication is made durable by default. PUT writes the data to a temp file
+and fsyncs it before the atomic rename; the `.s3meta` sidecar is written to a temp
+file, fsynced, renamed into place, and finally the object's **parent directory is
+fsynced** so the rename (the new directory entry) itself survives a crash.
+`CompleteMultipartUpload` follows a **stage-then-swap** discipline: the new parts
+are moved into a fresh `{key}.parts.new.<uuid>` staging dir and the new manifest
+is written before the previously-published store is swapped aside and removed — so
+a crash or error mid-complete can never destroy the prior object before the new
+one is live. `--fsync false` skips the sidecar/directory fsyncs (data is still
+fsynced) for maximum throughput where the workload tolerates it.
+
+## Listing: walk-and-buffer (memory scales with bucket size)
+
+ListObjectsV2 recursively walks the entire bucket directory and buffers all
+matching entries in memory, then sorts and applies `prefix`/`delimiter`/`max-keys`
+pagination. This keeps the implementation simple and is fine for typical buckets,
+but listing memory and latency scale with the number of objects in the bucket.
+Supporting very large buckets efficiently would require a persistent key index
+(e.g. an embedded ordered store) rather than a live filesystem walk — a deliberate
+non-goal for the current single-machine, throughput-on-large-objects target.
+
 ## Summary
 
 The research conclusion drove everything: on encrypted ZFS RaidZ3 the per-byte

@@ -37,10 +37,8 @@ fn start_server() -> u16 {
     std::mem::forget(dir);
 
     let creds = CredentialStore::from_json(
-        format!(
-            r#"{{"credentials":[{{"accessKeyId":"{ACCESS}","secretAccessKey":"{SECRET}"}}]}}"#
-        )
-        .as_bytes(),
+        format!(r#"{{"credentials":[{{"accessKeyId":"{ACCESS}","secretAccessKey":"{SECRET}"}}]}}"#)
+            .as_bytes(),
     )
     .unwrap();
 
@@ -54,6 +52,7 @@ fn start_server() -> u16 {
         log_level: "error".into(),
         workers: 1,
         ktls: false,
+        fsync: true,
     };
     let fs = Filesystem::new(&data_dir);
     std::fs::create_dir_all(fs.root()).unwrap();
@@ -161,7 +160,10 @@ fn e2e_put_get_list_delete() {
 
     // --- CreateBucket: PUT /testbucket ---
     let (auth, extra) = sign("PUT", "/testbucket", "", &host, EMPTY_SHA256, &amz_date);
-    let mut headers = vec![("Host".into(), host.clone()), ("Authorization".into(), auth)];
+    let mut headers = vec![
+        ("Host".into(), host.clone()),
+        ("Authorization".into(), auth),
+    ];
     headers.extend(extra);
     let (status, _h, _b) = http_request(port, "PUT", "/testbucket", &headers, b"");
     assert!(status.contains("200"), "create-bucket status: {status}");
@@ -177,7 +179,10 @@ fn e2e_put_get_list_delete() {
         &payload_hash,
         &amz_date,
     );
-    let mut headers = vec![("Host".into(), host.clone()), ("Authorization".into(), auth)];
+    let mut headers = vec![
+        ("Host".into(), host.clone()),
+        ("Authorization".into(), auth),
+    ];
     headers.extend(extra);
     headers.push(("Content-Type".into(), "text/plain".into()));
     let (status, hblob, _b) = http_request(port, "PUT", "/testbucket/hello.txt", &headers, payload);
@@ -196,7 +201,10 @@ fn e2e_put_get_list_delete() {
         EMPTY_SHA256,
         &amz_date,
     );
-    let mut headers = vec![("Host".into(), host.clone()), ("Authorization".into(), auth)];
+    let mut headers = vec![
+        ("Host".into(), host.clone()),
+        ("Authorization".into(), auth),
+    ];
     headers.extend(extra);
     let (status, hblob, body) = http_request(port, "GET", "/testbucket/hello.txt", &headers, b"");
     assert!(status.contains("200"), "get-object status: {status}");
@@ -215,7 +223,10 @@ fn e2e_put_get_list_delete() {
         EMPTY_SHA256,
         &amz_date,
     );
-    let mut headers = vec![("Host".into(), host.clone()), ("Authorization".into(), auth)];
+    let mut headers = vec![
+        ("Host".into(), host.clone()),
+        ("Authorization".into(), auth),
+    ];
     headers.extend(extra);
     headers.push(("Range".into(), "bytes=0-4".into()));
     let (status, hblob, body) = http_request(port, "GET", "/testbucket/hello.txt", &headers, b"");
@@ -235,12 +246,18 @@ fn e2e_put_get_list_delete() {
         EMPTY_SHA256,
         &amz_date,
     );
-    let mut headers = vec![("Host".into(), host.clone()), ("Authorization".into(), auth)];
+    let mut headers = vec![
+        ("Host".into(), host.clone()),
+        ("Authorization".into(), auth),
+    ];
     headers.extend(extra);
     let (status, _h, body) = http_request(port, "GET", "/testbucket?list-type=2", &headers, b"");
     assert!(status.contains("200"), "list status: {status}");
     let body_str = String::from_utf8_lossy(&body);
-    assert!(body_str.contains("<Key>hello.txt</Key>"), "list body: {body_str}");
+    assert!(
+        body_str.contains("<Key>hello.txt</Key>"),
+        "list body: {body_str}"
+    );
     assert!(body_str.contains("<KeyCount>1</KeyCount>"));
 
     // --- Unauthenticated request -> AccessDenied ---
@@ -255,8 +272,18 @@ fn e2e_put_get_list_delete() {
     assert!(String::from_utf8_lossy(&body).contains("AccessDenied"));
 
     // --- NoSuchKey -> 404 ---
-    let (auth, extra) = sign("GET", "/testbucket/missing", "", &host, EMPTY_SHA256, &amz_date);
-    let mut headers = vec![("Host".into(), host.clone()), ("Authorization".into(), auth)];
+    let (auth, extra) = sign(
+        "GET",
+        "/testbucket/missing",
+        "",
+        &host,
+        EMPTY_SHA256,
+        &amz_date,
+    );
+    let mut headers = vec![
+        ("Host".into(), host.clone()),
+        ("Authorization".into(), auth),
+    ];
     headers.extend(extra);
     let (status, _h, body) = http_request(port, "GET", "/testbucket/missing", &headers, b"");
     assert!(status.contains("404"), "nosuchkey status: {status}");
@@ -271,7 +298,10 @@ fn e2e_put_get_list_delete() {
         EMPTY_SHA256,
         &amz_date,
     );
-    let mut headers = vec![("Host".into(), host.clone()), ("Authorization".into(), auth)];
+    let mut headers = vec![
+        ("Host".into(), host.clone()),
+        ("Authorization".into(), auth),
+    ];
     headers.extend(extra);
     let (status, _h, _b) = http_request(port, "DELETE", "/testbucket/hello.txt", &headers, b"");
     assert!(status.contains("204"), "delete status: {status}");
@@ -280,4 +310,52 @@ fn e2e_put_get_list_delete() {
     let (status, _h, body) = http_request(port, "GET", "/healthz", &[("Host".into(), host)], b"");
     assert!(status.contains("200"));
     assert_eq!(String::from_utf8_lossy(&body), "{\"status\":\"ok\"}");
+}
+
+#[test]
+fn e2e_complete_multipart_oversized_body_rejected() {
+    // F9 regression: an over-cap CompleteMultipartUpload body must be rejected
+    // (EntityTooLarge, 400) rather than buffered into memory (OOM). We POST a
+    // >8 MiB body to the Complete route; the server bounds the read and errors.
+    let port = start_server();
+    let host = format!("127.0.0.1:{port}");
+    let amz_date = atime::iso8601_from_unix(atime::now_unix());
+
+    // Bucket so routing reaches the multipart handler.
+    let (auth, extra) = sign("PUT", "/mpbucket", "", &host, EMPTY_SHA256, &amz_date);
+    let mut headers = vec![
+        ("Host".into(), host.clone()),
+        ("Authorization".into(), auth),
+    ];
+    headers.extend(extra);
+    let (status, _h, _b) = http_request(port, "PUT", "/mpbucket", &headers, b"");
+    assert!(status.contains("200"), "create-bucket status: {status}");
+
+    // A 9 MiB body (over the 8 MiB cap). Use UNSIGNED-PAYLOAD so we don't have to
+    // hash the whole thing for the signature; the body is rejected by size before
+    // the manifest is ever parsed.
+    let big = vec![b'a'; 9 * 1024 * 1024];
+    let uuid = "11111111-1111-1111-1111-111111111111";
+    let path = format!("/mpbucket/k?uploadId={uuid}");
+    let (auth, _extra) = sign(
+        "POST",
+        "/mpbucket/k",
+        &format!("uploadId={uuid}"),
+        &host,
+        "UNSIGNED-PAYLOAD",
+        &amz_date,
+    );
+    let headers = vec![
+        ("Host".into(), host.clone()),
+        ("Authorization".into(), auth),
+        ("x-amz-content-sha256".into(), "UNSIGNED-PAYLOAD".into()),
+        ("x-amz-date".into(), amz_date.clone()),
+    ];
+    let (status, _h, body) = http_request(port, "POST", &path, &headers, &big);
+    // Must NOT be a 200 success and must NOT crash the server; expect 400.
+    assert!(
+        status.contains("400"),
+        "oversized complete body should be rejected (got status: {status}, body: {})",
+        String::from_utf8_lossy(&body)
+    );
 }

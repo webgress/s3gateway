@@ -3,9 +3,7 @@
 use bytes::Bytes;
 use hyper::{Response, StatusCode};
 
-use crate::s3response::{
-    format_time, BucketEntry, ListAllMyBucketsResult, Owner, S3ErrorCode,
-};
+use crate::s3response::{format_time, BucketEntry, ListAllMyBucketsResult, Owner, S3ErrorCode};
 use crate::storage::{validate_bucket_name, StorageError};
 
 use super::{empty_body, map_storage_error, xml_ok, Ctx, HandlerRequest, RespBody};
@@ -28,15 +26,19 @@ pub async fn create_bucket(
         Ok(()) => {
             let mut resp = Response::new(empty_body());
             // S3 returns the bucket location header on create.
-            resp.headers_mut()
-                .insert(hyper::header::LOCATION, format!("/{}", req.bucket).parse().unwrap());
+            resp.headers_mut().insert(
+                hyper::header::LOCATION,
+                format!("/{}", req.bucket).parse().unwrap(),
+            );
             Ok(resp)
         }
         // Idempotent create for the same owner: S3 returns 200 here.
         Err(StorageError::BucketExists) => {
             let mut resp = Response::new(empty_body());
-            resp.headers_mut()
-                .insert(hyper::header::LOCATION, format!("/{}", req.bucket).parse().unwrap());
+            resp.headers_mut().insert(
+                hyper::header::LOCATION,
+                format!("/{}", req.bucket).parse().unwrap(),
+            );
             Ok(resp)
         }
         Err(StorageError::InvalidBucket) => Err(S3ErrorCode::InvalidBucketName),

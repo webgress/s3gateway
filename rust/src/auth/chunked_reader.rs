@@ -122,9 +122,17 @@ impl<R: Read> Read for ChunkedReader<R> {
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
             if size == 0 {
-                // Final chunk; consume trailing CRLF then signal EOF.
+                // Final chunk; signal EOF. The terminating `0`-chunk may be
+                // followed by EITHER a bare `\r\n` OR one-or-more trailer header
+                // lines (the STREAMING-*-TRAILER variants this reader is fed, see
+                // `handler::is_chunked_upload`). We therefore DELIBERATELY do not
+                // require a specific terminator here: we've already de-framed every
+                // payload byte, and the seed signature was verified upstream.
+                // Consuming the trailer is best-effort and any error is benign
+                // (the connection/body is about to be dropped), so it is ignored
+                // on purpose rather than propagated — propagating it would reject
+                // legitimate trailer-bearing uploads.
                 self.done = true;
-                // Best-effort: a trailing \r\n closes the stream.
                 let _ = self.read_crlf();
                 return Ok(0);
             }
@@ -148,9 +156,7 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || needle.len() > haystack.len() {
         return None;
     }
-    haystack
-        .windows(needle.len())
-        .position(|w| w == needle)
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 /// Parse a hex chunk size (Go `parseHexUint`). Rejects >16 hex digits.
@@ -184,7 +190,9 @@ pub fn get_chunk_signature(
     secret_key: &str,
     hashed_chunk: &str,
 ) -> String {
-    use super::sigv4::{get_signature, get_signing_key, get_scope, EMPTY_SHA256, SIGN_V4_ALGORITHM};
+    use super::sigv4::{
+        get_scope, get_signature, get_signing_key, EMPTY_SHA256, SIGN_V4_ALGORITHM,
+    };
     let yyyymmdd = &seed_date_iso[..8.min(seed_date_iso.len())];
     let scope = get_scope(yyyymmdd, region, service);
     let string_to_sign = format!(

@@ -135,9 +135,7 @@ pub fn is_chunked_upload(headers: &BTreeMap<String, Vec<String>>) -> bool {
 }
 
 /// Collect `x-amz-meta-*` headers (lowercased keys) into a user-metadata map.
-pub fn extract_user_metadata(
-    headers: &BTreeMap<String, Vec<String>>,
-) -> BTreeMap<String, String> {
+pub fn extract_user_metadata(headers: &BTreeMap<String, Vec<String>>) -> BTreeMap<String, String> {
     let mut m = BTreeMap::new();
     for (k, vals) in headers {
         if k.starts_with("x-amz-meta-") {
@@ -182,11 +180,14 @@ pub fn empty_body() -> RespBody {
 /// Build an S3 error XML response.
 pub fn error_response(code: S3ErrorCode, resource: &str, request_id: &str) -> Response<RespBody> {
     let xml = render_error_xml(code, resource, request_id);
-    let status = StatusCode::from_u16(code.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let status =
+        StatusCode::from_u16(code.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     let mut resp = Response::new(full_body(Bytes::from(xml)));
     *resp.status_mut() = status;
-    resp.headers_mut()
-        .insert(hyper::header::CONTENT_TYPE, "application/xml".parse().unwrap());
+    resp.headers_mut().insert(
+        hyper::header::CONTENT_TYPE,
+        "application/xml".parse().unwrap(),
+    );
     resp
 }
 
@@ -199,6 +200,7 @@ pub fn map_storage_error(e: &StorageError) -> S3ErrorCode {
         StorageError::ObjectNotFound => S3ErrorCode::NoSuchKey,
         StorageError::InvalidBucket => S3ErrorCode::InvalidBucketName,
         StorageError::PathTraversal => S3ErrorCode::InvalidArgument,
+        StorageError::ReservedKey => S3ErrorCode::InvalidArgument,
         StorageError::NoSuchUpload => S3ErrorCode::NoSuchUpload,
         StorageError::InvalidPartOrder => S3ErrorCode::InvalidPartOrder,
         StorageError::InvalidPart => S3ErrorCode::InvalidPart,
@@ -209,8 +211,10 @@ pub fn map_storage_error(e: &StorageError) -> S3ErrorCode {
 /// Convenience: serialize a `to_xml()` success body into a 200 XML response.
 pub fn xml_ok(xml: String) -> Response<RespBody> {
     let mut resp = Response::new(full_body(Bytes::from(xml)));
-    resp.headers_mut()
-        .insert(hyper::header::CONTENT_TYPE, "application/xml".parse().unwrap());
+    resp.headers_mut().insert(
+        hyper::header::CONTENT_TYPE,
+        "application/xml".parse().unwrap(),
+    );
     resp
 }
 
@@ -284,7 +288,10 @@ mod tests {
             "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER"
         )])));
         // aws-chunked content-encoding fallback signal.
-        assert!(is_chunked_upload(&mk(&[("content-encoding", "aws-chunked")])));
+        assert!(is_chunked_upload(&mk(&[(
+            "content-encoding",
+            "aws-chunked"
+        )])));
         // Plain upload: a real hex sha256 -> not chunked.
         assert!(!is_chunked_upload(&mk(&[(
             "x-amz-content-sha256",

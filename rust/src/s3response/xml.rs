@@ -139,7 +139,11 @@ impl ListBucketResultV2 {
         }
         tag(&mut out, "MaxKeys", &self.max_keys.to_string());
         tag(&mut out, "KeyCount", &self.key_count.to_string());
-        tag(&mut out, "IsTruncated", if self.is_truncated { "true" } else { "false" });
+        tag(
+            &mut out,
+            "IsTruncated",
+            if self.is_truncated { "true" } else { "false" },
+        );
         if !self.start_after.is_empty() {
             tag(&mut out, "StartAfter", &self.start_after);
         }
@@ -147,7 +151,11 @@ impl ListBucketResultV2 {
             tag(&mut out, "ContinuationToken", &self.continuation_token);
         }
         if !self.next_continuation_token.is_empty() {
-            tag(&mut out, "NextContinuationToken", &self.next_continuation_token);
+            tag(
+                &mut out,
+                "NextContinuationToken",
+                &self.next_continuation_token,
+            );
         }
         for o in &self.contents {
             out.push_str("<Contents>");
@@ -232,7 +240,11 @@ impl ListMultipartUploadsResult {
         tag(&mut out, "Bucket", &self.bucket);
         tag(&mut out, "KeyMarker", &self.key_marker);
         tag(&mut out, "MaxUploads", &self.max_uploads.to_string());
-        tag(&mut out, "IsTruncated", if self.is_truncated { "true" } else { "false" });
+        tag(
+            &mut out,
+            "IsTruncated",
+            if self.is_truncated { "true" } else { "false" },
+        );
         for u in &self.uploads {
             out.push_str("<Upload>");
             tag(&mut out, "Key", &u.key);

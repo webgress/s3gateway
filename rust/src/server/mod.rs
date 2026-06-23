@@ -246,10 +246,7 @@ async fn serve_conn(
         async move { router::dispatch(ctx, remote, req).await }
     });
 
-    if let Err(e) = http1::Builder::new()
-        .serve_connection(io, service)
-        .await
-    {
+    if let Err(e) = http1::Builder::new().serve_connection(io, service).await {
         return Err(io::Error::other(format!("http1 serve: {e}")));
     }
     Ok(())
@@ -379,7 +376,10 @@ fn load_private_key(path: &str) -> io::Result<rustls::pki_types::PrivateKeyDer<'
     let data = std::fs::read(path)?;
     let mut reader = std::io::BufReader::new(&data[..]);
     rustls_pemfile::private_key(&mut reader)?.ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidData, "no private key found in key file")
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "no private key found in key file",
+        )
     })
 }
 

@@ -39,15 +39,26 @@ unsafe impl Send for DioFile {}
 
 impl DioFile {
     /// Open an existing file for reading. Tries O_DIRECT, falls back to buffered.
+    ///
+    /// `O_NOFOLLOW` is set so a SYMLINK at the final path component is rejected
+    /// (ELOOP) rather than followed — defense-in-depth against a symlink planted
+    /// inside a bucket that points outside the data root (the lexical containment
+    /// check in `validate_object_path` cannot see symlinks). Intermediate
+    /// directory components are not covered by O_NOFOLLOW; the parent-dir
+    /// canonicalization in `validate_object_path` backstops those.
     pub fn open_read(path: &Path) -> io::Result<Self> {
-        Self::open_internal(path, OFlags::RDONLY, Mode::empty())
+        Self::open_internal(path, OFlags::RDONLY | OFlags::NOFOLLOW, Mode::empty())
     }
 
     /// Create/truncate a file for writing. Tries O_DIRECT, falls back.
+    ///
+    /// `O_NOFOLLOW` rejects a symlinked leaf (see [`Self::open_read`]). On
+    /// create, this means an existing symlink at `path` causes ELOOP instead of
+    /// writing through it to an arbitrary target.
     pub fn create_write(path: &Path) -> io::Result<Self> {
         Self::open_internal(
             path,
-            OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC | OFlags::NOFOLLOW,
             Mode::from_bits_truncate(0o644),
         )
     }

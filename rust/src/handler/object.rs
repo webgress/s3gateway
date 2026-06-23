@@ -25,16 +25,10 @@ use super::{empty_body, full_body, map_storage_error, ChannelBody, Ctx, HandlerR
 const GET_CHUNK: usize = 1024 * 1024;
 
 /// PUT /{bucket}/{key} — PutObject.
-pub async fn put_object(
-    ctx: &Ctx,
-    req: HandlerRequest,
-) -> Result<Response<RespBody>, S3ErrorCode> {
+pub async fn put_object(ctx: &Ctx, req: HandlerRequest) -> Result<Response<RespBody>, S3ErrorCode> {
     let bucket = req.bucket.clone();
     let key = req.key.clone();
-    let content_type = req
-        .header("content-type")
-        .unwrap_or("")
-        .to_string();
+    let content_type = req.header("content-type").unwrap_or("").to_string();
     let user_meta = req.user_metadata();
 
     let is_streaming = super::is_chunked_upload(&req.headers);
@@ -65,10 +59,7 @@ pub async fn put_object(
 }
 
 /// GET /{bucket}/{key} — GetObject (supports Range).
-pub async fn get_object(
-    ctx: &Ctx,
-    req: HandlerRequest,
-) -> Result<Response<RespBody>, S3ErrorCode> {
+pub async fn get_object(ctx: &Ctx, req: HandlerRequest) -> Result<Response<RespBody>, S3ErrorCode> {
     object_response(ctx, req, true).await
 }
 

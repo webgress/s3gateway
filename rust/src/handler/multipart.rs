@@ -1,7 +1,7 @@
 //! Multipart upload handlers: Create, UploadPart, Complete, Abort, ListParts,
 //! ListMultipartUploads.
 
-use http_body_util::BodyExt;
+use http_body_util::{BodyExt, Limited};
 use hyper::header::HeaderValue;
 use hyper::Response;
 
@@ -14,6 +14,10 @@ use crate::s3response::{
 use crate::storage::{CompletePart, StorageError};
 
 use super::{empty_body, map_storage_error, xml_ok, Ctx, HandlerRequest, RespBody};
+
+/// Max accepted CompleteMultipartUpload request-body size (F9). 8 MiB comfortably
+/// holds the manifest for the S3 maximum of 10,000 parts.
+const COMPLETE_BODY_LIMIT: usize = 8 * 1024 * 1024;
 
 /// POST /{bucket}/{key}?uploads — CreateMultipartUpload.
 pub async fn create_multipart_upload(
@@ -91,15 +95,18 @@ pub async fn complete_multipart_upload(
     let bucket = req.bucket.clone();
     let key = req.key.clone();
 
-    // Read the (small) request body fully to parse the parts manifest.
-    let body_bytes = req
-        .body
+    // F9: the Complete body is a small parts manifest. Bound it so a hostile or
+    // buggy client cannot stream an unbounded body into memory (OOM). 8 MiB is
+    // ample headroom for the max 10,000 parts (~70 bytes each). Over-cap bodies
+    // are rejected as EntityTooLarge rather than buffered.
+    let body_bytes = Limited::new(req.body, COMPLETE_BODY_LIMIT)
         .collect()
         .await
-        .map_err(|_| S3ErrorCode::InternalError)?
+        .map_err(|_| S3ErrorCode::EntityTooLarge)?
         .to_bytes();
     let body_str = std::str::from_utf8(&body_bytes).map_err(|_| S3ErrorCode::MalformedXML)?;
-    let parsed = CompleteMultipartUpload::from_xml(body_str).map_err(|_| S3ErrorCode::MalformedXML)?;
+    let parsed =
+        CompleteMultipartUpload::from_xml(body_str).map_err(|_| S3ErrorCode::MalformedXML)?;
 
     let parts: Vec<CompletePart> = parsed
         .parts
@@ -146,10 +153,7 @@ pub async fn abort_multipart_upload(
 }
 
 /// GET /{bucket}/{key}?uploadId=X — ListParts.
-pub async fn list_parts(
-    ctx: &Ctx,
-    req: HandlerRequest,
-) -> Result<Response<RespBody>, S3ErrorCode> {
+pub async fn list_parts(ctx: &Ctx, req: HandlerRequest) -> Result<Response<RespBody>, S3ErrorCode> {
     let upload_id = req
         .query1("uploadId")
         .ok_or(S3ErrorCode::InvalidArgument)?
