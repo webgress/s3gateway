@@ -223,6 +223,10 @@ pub fn map_storage_error(e: &StorageError) -> S3ErrorCode {
         StorageError::InvalidBucket => S3ErrorCode::InvalidBucketName,
         StorageError::PathTraversal => S3ErrorCode::InvalidArgument,
         StorageError::ReservedKey => S3ErrorCode::InvalidArgument,
+        // F1: PUT/Complete to a key that already exists as a directory (a nested
+        // key made it a prefix) is a 409 Conflict — never a silent overwrite that
+        // orphans the children.
+        StorageError::KeyPrefixConflict => S3ErrorCode::KeyPrefixConflict,
         StorageError::NoSuchUpload => S3ErrorCode::NoSuchUpload,
         StorageError::InvalidPartOrder => S3ErrorCode::InvalidPartOrder,
         StorageError::InvalidPart => S3ErrorCode::InvalidPart,
@@ -282,6 +286,12 @@ mod tests {
             map_storage_error(&StorageError::PathTraversal),
             S3ErrorCode::InvalidArgument
         );
+        // F1: a key/prefix (directory) conflict maps to the 409 KeyPrefixConflict.
+        assert_eq!(
+            map_storage_error(&StorageError::KeyPrefixConflict),
+            S3ErrorCode::KeyPrefixConflict
+        );
+        assert_eq!(S3ErrorCode::KeyPrefixConflict.http_status(), 409);
         assert_eq!(
             map_storage_error(&StorageError::Io(std::io::Error::other("x"))),
             S3ErrorCode::InternalError

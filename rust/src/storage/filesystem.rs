@@ -45,6 +45,13 @@ pub enum StorageError {
     PathTraversal,
     #[error("key collides with a reserved internal name")]
     ReservedKey,
+    /// F1: the target key resolves to an existing DIRECTORY because a nested key
+    /// (e.g. `a/b`) already made `a/` a directory, and the request would publish a
+    /// regular file at `a`. Publishing must NOT silently move the live subtree
+    /// aside (which orphans `a/b`), so we reject with a 409 Conflict. Raised by
+    /// both `put_object` and `complete_multipart_upload` before the data-aside.
+    #[error("key conflicts with an existing object-name prefix (directory)")]
+    KeyPrefixConflict,
     #[error("no such upload")]
     NoSuchUpload,
     #[error("invalid part order")]
@@ -105,15 +112,26 @@ pub struct Filesystem {
     /// success is reported. When false, the sidecar/dir fsyncs are skipped for
     /// throughput (the data file is still fsync'd). See `--fsync`.
     fsync: bool,
-    /// D3: sharded per-`{bucket}/{key}` publish locks. `Filesystem` is `Clone`d
+    /// D3/F2: sharded per-`{bucket}/{key}` publish locks. `Filesystem` is `Clone`d
     /// per request, so the lock TABLE is shared via `Arc` — all clones observe the
-    /// same mutexes. `std::sync::Mutex` is correct here: these ops run inside
-    /// `spawn_blocking`, so a blocking acquire is fine. The lock guards only the
+    /// same locks. `std::sync::RwLock` is correct here: these ops run inside
+    /// `spawn_blocking`, so a blocking acquire is fine.
+    ///
+    /// WRITE side (`lock_key`): PUT/Complete/Delete hold the write lock across the
     /// mutate-and-publish critical section (aside -> swap -> placeholder ->
     /// sidecar-commit), NOT the streaming upload, so concurrent uploads to
-    /// DIFFERENT keys still parallelize and even same-key uploads stream freely
-    /// and only serialize at publish.
-    key_locks: std::sync::Arc<Vec<std::sync::Mutex<()>>>,
+    /// DIFFERENT keys still parallelize and even same-key uploads stream freely and
+    /// only serialize at publish.
+    ///
+    /// READ side (`rlock_key`): F2 — GET holds the read lock across its consistency
+    /// snapshot (read the sidecar THROUGH opening the data fd / validating the
+    /// multipart manifest), so a concurrent publish (which renames new data into
+    /// place before committing the new sidecar) can never let a GET pair the OLD
+    /// sidecar's ETag/Content-Length with the NEW body. The open fd pins the inode,
+    /// so the streaming body copy proceeds AFTER the read guard is dropped (the lock
+    /// is NOT held during the body stream). Concurrent GETs share the read lock and
+    /// do not block each other.
+    key_locks: std::sync::Arc<Vec<std::sync::RwLock<()>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -489,7 +507,7 @@ impl Filesystem {
     pub fn with_fsync(root: impl Into<PathBuf>, fsync: bool) -> Self {
         let mut locks = Vec::with_capacity(KEY_LOCK_SHARDS);
         for _ in 0..KEY_LOCK_SHARDS {
-            locks.push(std::sync::Mutex::new(()));
+            locks.push(std::sync::RwLock::new(()));
         }
         Filesystem {
             root: root.into(),
@@ -498,15 +516,11 @@ impl Filesystem {
         }
     }
 
-    /// D3: acquire the publish lock for `{bucket}/{key}`. The returned guard must
-    /// be held for the whole mutate-and-publish critical section so concurrent
-    /// PUT / Complete / Delete for the SAME key cannot interleave their
-    /// aside/swap/placeholder/sidecar renames and publish a sidecar describing
-    /// another writer's data/parts. A stable FNV-1a hash of the path picks the
-    /// shard. The mutex is poison-tolerant (we hold no invariant across panics
-    /// inside the section beyond what each op's own rollback handles).
-    fn lock_key(&self, bucket: &str, key: &str) -> std::sync::MutexGuard<'_, ()> {
-        // FNV-1a over "{bucket}/{key}" — stable across processes/threads.
+    /// Shard index for `{bucket}/{key}` via a stable FNV-1a hash of the path
+    /// (stable across processes/threads). Used by both the write (`lock_key`) and
+    /// read (`rlock_key`) acquisitions so a GET and a PUT for the SAME key always
+    /// contend on the SAME `RwLock`.
+    fn key_lock_shard(bucket: &str, key: &str) -> usize {
         let mut h: u64 = 0xcbf2_9ce4_8422_2325;
         for byte in bucket
             .bytes()
@@ -516,19 +530,46 @@ impl Filesystem {
             h ^= byte as u64;
             h = h.wrapping_mul(0x0000_0100_0000_01b3);
         }
-        let idx = (h as usize) & (KEY_LOCK_SHARDS - 1);
+        (h as usize) & (KEY_LOCK_SHARDS - 1)
+    }
+
+    /// D3: acquire the publish WRITE lock for `{bucket}/{key}`. The returned guard
+    /// must be held for the whole mutate-and-publish critical section so concurrent
+    /// PUT / Complete / Delete for the SAME key cannot interleave their
+    /// aside/swap/placeholder/sidecar renames and publish a sidecar describing
+    /// another writer's data/parts; F2: it also excludes a concurrent GET's
+    /// snapshot read (held under `rlock_key`) so a GET never observes the OLD
+    /// sidecar paired with the NEW body. The lock is poison-tolerant (we hold no
+    /// invariant across panics inside the section beyond what each op's own
+    /// rollback handles).
+    fn lock_key(&self, bucket: &str, key: &str) -> std::sync::RwLockWriteGuard<'_, ()> {
+        let idx = Self::key_lock_shard(bucket, key);
         // Test-only contention probe: if the shard is already held, record that
         // this writer is about to BLOCK on the per-key lock (proof the lock is
         // serializing) before we actually block. No-op / not compiled in
         // production — the real acquire below is unchanged.
         #[cfg(test)]
         {
-            if self.key_locks[idx].try_lock().is_err() {
+            if self.key_locks[idx].try_write().is_err() {
                 note_lock_contention(bucket, key);
             }
         }
         self.key_locks[idx]
-            .lock()
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// F2: acquire the publish READ lock for `{bucket}/{key}`. GET holds this
+    /// across its consistency snapshot — from BEFORE reading the sidecar THROUGH
+    /// opening the data fd (single-part) / reading the manifest + validating part
+    /// paths (multipart). It excludes a concurrent publish's write-locked critical
+    /// section, so a GET snapshot is atomic vs. a publish (fully-old or fully-new,
+    /// never OLD-sidecar + NEW-body). Concurrent GETs share the read lock and do
+    /// not block each other. Poison-tolerant like `lock_key`.
+    fn rlock_key(&self, bucket: &str, key: &str) -> std::sync::RwLockReadGuard<'_, ()> {
+        let idx = Self::key_lock_shard(bucket, key);
+        self.key_locks[idx]
+            .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
@@ -714,9 +755,22 @@ impl Filesystem {
         }
 
         // Move any prior data file aside so an overwrite can be rolled back.
+        //
+        // F1: pre-check with `symlink_metadata` (does NOT follow a symlinked leaf)
+        // so we ONLY ever aside/overwrite a REGULAR FILE (or a symlink leaf). If
+        // `obj_path` is a DIRECTORY, a nested key (`a/b`) already made `a/` a
+        // prefix dir; renaming that live SUBTREE aside would orphan `a/b` and the
+        // children would be invisible behind the `.tmp.` listing filter. Reject
+        // with KeyPrefixConflict (409) instead — matching the pre-data-aside
+        // behavior where the rename failed cleanly with IsADirectory.
         let data_aside = tmp_sibling(&obj_path);
-        let had_old_data = match directio::rename(&obj_path, &data_aside) {
-            Ok(()) => true,
+        let had_old_data = match std::fs::symlink_metadata(&obj_path) {
+            Ok(m) if m.file_type().is_dir() => return Err(StorageError::KeyPrefixConflict),
+            // Regular file OR symlink leaf: rename it aside for rollback.
+            Ok(_) => {
+                directio::rename(&obj_path, &data_aside)?;
+                true
+            }
             Err(e) if e.kind() == io::ErrorKind::NotFound => false,
             Err(e) => return Err(e.into()),
         };
@@ -822,6 +876,17 @@ impl Filesystem {
         self.validate_object_path(bucket, key)?;
         let obj_path = self.root.join(bucket).join(key);
         let mp = meta_path(&obj_path);
+
+        // F2: hold the per-key READ lock across the SNAPSHOT region — from BEFORE
+        // reading the sidecar THROUGH opening the data fd (single-part) / reading
+        // the manifest + validating part paths (multipart). This excludes a
+        // concurrent publish's write-locked critical section, so a GET can never
+        // observe the OLD sidecar's ETag/Content-Length paired with the NEW body
+        // (the publish renames new data into place BEFORE committing the new
+        // sidecar). The open fd pins the inode, so once we return, the streaming
+        // body copy proceeds with the guard dropped — the lock is NOT held during
+        // the body stream, and concurrent GETs share this read lock.
+        let _snapshot_guard = self.rlock_key(bucket, key);
 
         let meta = match read_metadata(&mp) {
             Ok(m) => m,
@@ -1387,16 +1452,41 @@ impl Filesystem {
         // `obj_path` to a guarded temp first, restore it on any pre-commit failure,
         // and for the fresh case remove the placeholder on failure so no phantom
         // remains. On success the aside is dropped.
+        //
+        // F1: pre-check with `symlink_metadata` (does NOT follow a symlinked leaf).
+        // ONLY aside a REGULAR FILE (or symlink leaf). If `obj_path` is a DIRECTORY
+        // (a nested key `a/b` made `a/` a prefix dir), moving that live SUBTREE
+        // aside would orphan the children behind the `.tmp.` listing filter — so
+        // reject with KeyPrefixConflict (409), first restoring the parts store we
+        // moved aside in step 1 so the prior object stays fully consistent.
         let data_aside = tmp_sibling(&obj_path);
-        let had_old_data = match directio::rename(&obj_path, &data_aside) {
-            Ok(()) => true,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => false,
-            // A symlinked obj_path is a directory/non-regular surprise; do not
-            // follow it — surface the error (the prior parts are still aside).
-            Err(e) => {
+        // Helper for the pre-data-aside failure paths (dir conflict / rename error):
+        // the staged parts are still in `staging` and the prior parts store is in
+        // `old_aside`. Restore BOTH so the prior object stays consistent AND the
+        // upload remains RETRYABLE (E2: move staged parts back to the upload dir).
+        macro_rules! restore_pre_data_aside {
+            () => {{
                 if had_old {
                     let _ = directio::rename(&old_aside, &parts_store);
                 }
+                restore_staged_parts!();
+            }};
+        }
+        let had_old_data = match std::fs::symlink_metadata(&obj_path) {
+            Ok(m) if m.file_type().is_dir() => {
+                restore_pre_data_aside!();
+                return Err(StorageError::KeyPrefixConflict);
+            }
+            Ok(_) => match directio::rename(&obj_path, &data_aside) {
+                Ok(()) => true,
+                Err(e) => {
+                    restore_pre_data_aside!();
+                    return Err(e.into());
+                }
+            },
+            Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+            Err(e) => {
+                restore_pre_data_aside!();
                 return Err(e.into());
             }
         };
@@ -1660,9 +1750,43 @@ impl Filesystem {
     /// `../../etc` would join outside `root/.multipart/` and let upload_part /
     /// complete / abort / list_parts read or `remove_dir_all` arbitrary paths.
     /// The check is a cheap parse, no IO. C5: also rejects a symlinked `.multipart`.
+    ///
+    /// F3: the UUID check + C5's symlinked-`.multipart` check + `read_nofollow` on
+    /// the LEAF `meta.json` still left the INTERMEDIATE `.multipart/{uuid}` dir
+    /// itself unprotected — a planted `.multipart/{valid-uuid}` SYMLINK to an
+    /// external dir is followed by UploadPart/ListParts/Complete/Abort (which join
+    /// `parts/`, `meta.json`, or `remove_dir_all` the dir), escaping the data root.
+    /// So once the dir EXISTS, reject it if it is a symlink, and (defense in depth)
+    /// reject it if it canonicalizes OUTSIDE the canonical data root — both as
+    /// `NoSuchUpload`. A not-yet-created upload dir is fine (the caller creates it
+    /// as a real dir under `create_multipart_upload`).
     fn upload_dir(&self, upload_id: &str) -> Result<PathBuf> {
         Uuid::parse_str(upload_id).map_err(|_| StorageError::NoSuchUpload)?;
-        Ok(self.multipart_root()?.join(upload_id))
+        let dir = self.multipart_root()?.join(upload_id);
+        match std::fs::symlink_metadata(&dir) {
+            Ok(m) => {
+                // A symlinked upload dir would be FOLLOWED by the part/meta opens
+                // and the abort `remove_dir_all` — never follow it.
+                if m.file_type().is_symlink() {
+                    return Err(StorageError::NoSuchUpload);
+                }
+                // Defense in depth: even a real dir must canonicalize INSIDE the
+                // canonical data root (covers a symlinked `.multipart`/root or an
+                // intermediate symlink that slipped past the checks above).
+                if let (Ok(real_dir), Ok(real_root)) = (
+                    std::fs::canonicalize(&dir),
+                    std::fs::canonicalize(&self.root),
+                ) {
+                    if !real_dir.starts_with(&real_root) {
+                        return Err(StorageError::NoSuchUpload);
+                    }
+                }
+            }
+            // Not yet created — fine; create_multipart_upload makes it a real dir.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        Ok(dir)
     }
 
     /// B4: load the upload's `meta.json` and require its stored bucket/key match
@@ -5448,6 +5572,321 @@ mod tests {
         assert!(
             external_meta.exists(),
             "abort followed/deleted the external meta.json"
+        );
+    }
+
+    // ---- F1: PUT/Complete to key `a` over an existing `a/` dir must NOT orphan
+    //          the nested children; it must be rejected as KeyPrefixConflict. ----
+
+    #[test]
+    fn put_over_existing_prefix_dir_is_rejected_and_keeps_children() {
+        // F1 regression (load-bearing): PUT `a/b` makes `a/` a directory. A
+        // subsequent PUT of key `a` must NOT move that live subtree aside (which
+        // would orphan `a/b` behind the `.tmp.` listing filter) — it must return
+        // KeyPrefixConflict, and `a/b` must STILL return its original bytes.
+        //
+        // Mutation evidence: remove the `is_dir() => KeyPrefixConflict` arm in
+        // put_object's data-aside (revert to `directio::rename(&obj_path,
+        // &data_aside)` with a NotFound match). Then PUT `a` renames `a/` aside as
+        // a `.tmp.` dir; PUT `a` "succeeds", and `a/b` is gone (GET `a/b` ->
+        // NoSuchKey, and it is invisible in listings) — this test FAILS.
+        let (_d, f) = fs();
+        f.create_bucket("buck").unwrap();
+
+        let child = b"child-bytes-abc";
+        f.put_object("buck", "a/b", &child[..], "text/plain", um())
+            .unwrap();
+
+        // PUT key `a` (now a directory because of `a/b`) must be rejected.
+        let r = f.put_object("buck", "a", &b"new-a"[..], "text/plain", um());
+        assert!(
+            matches!(r, Err(StorageError::KeyPrefixConflict)),
+            "PUT over an existing prefix dir must be KeyPrefixConflict, got {r:?}"
+        );
+
+        // The child must be fully intact (no orphaning).
+        let mut got = Vec::new();
+        f.get_object("buck", "a/b", None)
+            .unwrap()
+            .body
+            .read_to_end(&mut got)
+            .unwrap();
+        assert_eq!(got, child, "PUT over the prefix dir orphaned the child");
+
+        // And no stray `.tmp.` aside subtree leaked into the bucket dir.
+        let bucket_dir = f.root.join("buck");
+        for entry in std::fs::read_dir(&bucket_dir).unwrap() {
+            let name = entry.unwrap().file_name();
+            let name = name.to_string_lossy();
+            assert!(
+                !name.contains(".tmp."),
+                "an aside `.tmp.` entry leaked: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn complete_over_existing_prefix_dir_is_rejected_and_keeps_children() {
+        // F1 regression (load-bearing) for the Complete path: completing a
+        // multipart upload to key `a` while `a/` already exists as a directory
+        // (because of a nested key `a/b`) must NOT move the subtree aside — it must
+        // return KeyPrefixConflict and leave `a/b` intact AND leave the upload
+        // retryable (parts still present).
+        //
+        // Mutation evidence: remove the `is_dir() => KeyPrefixConflict` arm in
+        // complete_multipart_upload's data-aside; Complete would then rename `a/`
+        // aside, orphaning `a/b` — this test FAILS.
+        let (_d, f) = fs();
+        f.create_bucket("buck").unwrap();
+
+        let child = b"child-of-prefix";
+        f.put_object("buck", "a/b", &child[..], "text/plain", um())
+            .unwrap();
+
+        // A multipart upload targeting key `a`.
+        let uid = f.create_multipart_upload("buck", "a", "", um()).unwrap();
+        let part = vec![0x5Au8; 6 * 1024 * 1024];
+        let etag1 = f.upload_part("buck", "a", &uid, 1, &part[..]).unwrap();
+
+        let r = f.complete_multipart_upload(
+            "buck",
+            "a",
+            &uid,
+            &[CompletePart {
+                part_number: 1,
+                etag: etag1.clone(),
+            }],
+        );
+        assert!(
+            matches!(r, Err(StorageError::KeyPrefixConflict)),
+            "Complete over an existing prefix dir must be KeyPrefixConflict, got {r:?}"
+        );
+
+        // Child intact.
+        let mut got = Vec::new();
+        f.get_object("buck", "a/b", None)
+            .unwrap()
+            .body
+            .read_to_end(&mut got)
+            .unwrap();
+        assert_eq!(
+            got, child,
+            "Complete over the prefix dir orphaned the child"
+        );
+
+        // The upload must still be retryable: its part file is still present, so a
+        // re-Complete (after the conflict is resolved) could proceed. We just assert
+        // the parts survived the rejected Complete.
+        let parts = f.list_parts("buck", "a", &uid).unwrap();
+        assert_eq!(
+            parts.len(),
+            1,
+            "rejected Complete destroyed the upload parts"
+        );
+        assert_eq!(parts[0].etag, etag1);
+    }
+
+    // ---- F2: GET during a same-key publish must return a CONSISTENT snapshot
+    //          (never OLD sidecar metadata + NEW body). ----
+
+    #[test]
+    fn get_takes_read_lock_for_consistent_snapshot_during_publish() {
+        // F2 regression (load-bearing & deterministic, no sleeps): publish v1, then
+        // a writer PUT v2 parks mid-publish (after the data rename, BEFORE the
+        // sidecar commit) while HOLDING the per-key WRITE lock. A concurrent GET
+        // must BLOCK on the per-key READ lock until the publish completes, and then
+        // return a CONSISTENT (ETag/Content-Length match the body version) pair —
+        // never v1-metadata + v2-body.
+        //
+        // Protocol:
+        //   1. Publish v1 (distinct length/bytes from v2).
+        //   2. Arm the publish-window pause for buck/{key}. Spawn writer (PUT v2);
+        //      it renames v2 data into place and parks in the window holding the
+        //      write lock.
+        //   3. Wait for the writer to park (wait_window_arrived). At this instant
+        //      the on-disk data is v2 but the live sidecar is still v1 — the torn-
+        //      read window. Spawn a GET for the same key.
+        //   4. Give the GET a moment to attempt acquisition; with the read lock it
+        //      BLOCKS (the write lock is held), so it cannot complete yet. Release
+        //      the writer; it commits the v2 sidecar and frees the write lock.
+        //   5. Join the GET. Its (metadata, body) MUST be internally consistent: a
+        //      single-part ETag == MD5(body) and Content-Length == body.len().
+        //      Because the writer committed first, the GET observes a clean v2.
+        //
+        // Mutation evidence: remove the `rlock_key` acquisition from get_object.
+        // Then in step 3/4 the GET reads the still-v1 sidecar but opens the already-
+        // swapped v2 data file — returning v1 ETag/Content-Length with v2 bytes. The
+        // consistency assertion below FAILS (ETag != MD5(body)).
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let f = Arc::new(Filesystem::with_fsync(dir.path(), false));
+        f.create_bucket("buck").unwrap();
+        let key = "snap.bin";
+
+        let v1 = vec![0x11u8; 4096];
+        let v2 = vec![0x22u8; 8192 + 5];
+        f.put_object("buck", key, &v1[..], "text/v1", um()).unwrap();
+
+        let hook = publish_pause::PauseHook::arm(&format!("buck/{key}"));
+
+        // Writer: PUT v2; parks in the publish window holding the write lock.
+        let fw = Arc::clone(&f);
+        let v2w = v2.clone();
+        let writer =
+            std::thread::spawn(move || fw.put_object("buck", key, &v2w[..], "text/v2", um()));
+
+        // Deterministically wait until v2's data is renamed into place but its
+        // sidecar is NOT yet committed (the torn-read window).
+        hook.wait_window_arrived();
+
+        // Concurrent GET for the same key. With the read lock it must BLOCK on the
+        // held write lock until the writer commits + releases.
+        let fg = Arc::clone(&f);
+        let getter = std::thread::spawn(move || {
+            let mut res = fg.get_object("buck", key, None).unwrap();
+            let mut body = Vec::new();
+            res.body.read_to_end(&mut body).unwrap();
+            (res.metadata.etag, res.metadata.content_length, body)
+        });
+
+        // The GET must NOT be able to finish while the writer is parked (it is
+        // blocked on the read lock). Give it a bounded grace period; if it somehow
+        // completed, the read lock was not taken (torn read possible).
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert!(
+            !getter.is_finished(),
+            "GET completed while a publish held the write lock — it did not take \
+             the read lock, so a torn read (OLD sidecar + NEW body) is possible"
+        );
+
+        // Release the writer; it commits the v2 sidecar and frees the write lock.
+        hook.release();
+        let wres = writer.join().unwrap();
+        assert!(wres.is_ok(), "writer (PUT v2) failed: {wres:?}");
+
+        let (etag, clen, body) = getter.join().unwrap();
+        publish_pause::PauseHook::disarm();
+
+        // THE LOAD-BEARING ASSERTION: the GET's metadata and body must be the SAME
+        // version — a single-part ETag must equal MD5(body) and Content-Length must
+        // equal the body length. A torn read (v1 sidecar + v2 body) trips this.
+        let want_etag = format!("\"{}\"", hex::encode(Md5::digest(&body)));
+        assert_eq!(
+            etag, want_etag,
+            "torn read: GET returned ETag {etag} that does not match its body MD5 \
+             {want_etag} (OLD sidecar paired with NEW body)"
+        );
+        assert_eq!(
+            clen as usize,
+            body.len(),
+            "torn read: GET Content-Length {clen} != body length {}",
+            body.len()
+        );
+        // Because the writer committed before the GET could read, the GET sees v2.
+        assert_eq!(body, v2, "GET should observe the committed v2 snapshot");
+    }
+
+    // ---- F3: a symlinked `.multipart/{uuid}` upload dir must NOT be followed. ----
+
+    #[test]
+    fn symlinked_upload_dir_is_rejected() {
+        // F3 regression (load-bearing): a planted `.multipart/{valid-uuid}` SYMLINK
+        // to an EXTERNAL dir containing a valid meta.json + parts must NOT be
+        // followed by upload_part / list_parts / complete / abort — each must error
+        // (NoSuchUpload) and must NOT read or write outside the data root.
+        //
+        // Mutation evidence: remove the `is_symlink() => NoSuchUpload` check (and
+        // the canonicalize-containment) in `upload_dir`. Then the ops follow the
+        // symlink into the external dir: list_parts/complete succeed against the
+        // planted upload, and abort `remove_dir_all`s the external target — this
+        // test FAILS (and the external dir would be deleted).
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let f = Filesystem::new(&root);
+        f.create_bucket("buck").unwrap();
+
+        // Make `.multipart` a real dir (the symlink lives INSIDE it).
+        std::fs::create_dir_all(root.join(MULTIPART_DIR)).unwrap();
+
+        // A fully-valid upload living OUTSIDE the data root.
+        let outside = tempfile::tempdir().unwrap();
+        let external_upload = outside.path().join("planted-upload");
+        std::fs::create_dir_all(external_upload.join("parts")).unwrap();
+        let uid = Uuid::new_v4().to_string();
+        let planted = MultipartUpload {
+            upload_id: uid.clone(),
+            bucket: "buck".into(),
+            key: "victim".into(),
+            initiated_unix: now_unix(),
+            content_type: String::new(),
+            user_metadata: um(),
+        };
+        std::fs::write(
+            external_upload.join("meta.json"),
+            serde_json::to_vec(&planted).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(external_upload.join("parts").join("00001"), b"planted").unwrap();
+        let part_etag = format!("\"{}\"", hex::encode(Md5::digest(b"planted")));
+
+        // Plant `.multipart/{uid}` as a SYMLINK to the external upload dir.
+        let link = root.join(MULTIPART_DIR).join(&uid);
+        symlink(&external_upload, &link).unwrap();
+
+        // Every entry point must reject the symlinked upload dir as NoSuchUpload.
+        assert!(
+            matches!(
+                f.list_parts("buck", "victim", &uid),
+                Err(StorageError::NoSuchUpload)
+            ),
+            "list_parts followed a symlinked upload dir"
+        );
+        assert!(
+            matches!(
+                f.upload_part("buck", "victim", &uid, 2, &b"new-part"[..]),
+                Err(StorageError::NoSuchUpload)
+            ),
+            "upload_part followed a symlinked upload dir"
+        );
+        assert!(
+            matches!(
+                f.complete_multipart_upload(
+                    "buck",
+                    "victim",
+                    &uid,
+                    &[CompletePart {
+                        part_number: 1,
+                        etag: part_etag.clone(),
+                    }],
+                ),
+                Err(StorageError::NoSuchUpload)
+            ),
+            "complete followed a symlinked upload dir"
+        );
+        assert!(
+            matches!(
+                f.abort_multipart_upload("buck", "victim", &uid),
+                Err(StorageError::NoSuchUpload)
+            ),
+            "abort followed a symlinked upload dir"
+        );
+
+        // Nothing outside the data root may have been read-through or destroyed:
+        // the external meta.json + part must be untouched (abort must NOT have
+        // remove_dir_all'd the external target), and no part was written into it.
+        assert!(
+            external_upload.join("meta.json").exists(),
+            "abort followed/deleted the external upload meta.json"
+        );
+        assert!(
+            external_upload.join("parts").join("00001").exists(),
+            "abort followed/deleted the external upload part"
+        );
+        assert!(
+            !external_upload.join("parts").join("00002").exists(),
+            "upload_part wrote a new part into the external (outside-root) dir"
         );
     }
 }
