@@ -58,8 +58,31 @@ pub enum StorageError {
     /// the GET would have served (no head/get TOCTOU).
     #[error("range not satisfiable")]
     RangeNotSatisfiable { size: u64 },
+    /// The upload BODY stream ended in a client-side framing problem — the
+    /// de-framed aws-chunked byte total did not match `x-amz-decoded-content-length`,
+    /// or the chunk framing was malformed (an `InvalidData` io error raised by
+    /// `ChunkedReader` while reading the request body). This is DEDICATED to the
+    /// body-streaming read so it maps to 400 `IncompleteBody`; server-side
+    /// `InvalidData` (e.g. a corrupt `.s3meta`/`meta.json`) stays in `Io` and maps
+    /// to 500 `InternalError`. See `map_storage_error`.
+    #[error("incomplete request body")]
+    IncompleteBody,
     #[error("io error: {0}")]
     Io(#[from] io::Error),
+}
+
+/// Classify an io error raised while reading the REQUEST BODY stream. A
+/// `InvalidData` kind here is a client framing problem (aws-chunked de-framed
+/// length mismatch vs. `x-amz-decoded-content-length`, or malformed chunk
+/// framing surfaced by `ChunkedReader`) → `IncompleteBody` (400). Any other io
+/// error (a real read failure) stays `Io` (500). This wrapper is applied ONLY to
+/// body-streaming reads, never to sidecar/metadata reads.
+fn body_read_error(e: io::Error) -> StorageError {
+    if e.kind() == io::ErrorKind::InvalidData {
+        StorageError::IncompleteBody
+    } else {
+        StorageError::Io(e)
+    }
 }
 
 pub type Result<T> = std::result::Result<T, StorageError>;
@@ -632,8 +655,12 @@ impl Filesystem {
         let cap = buf.capacity();
         loop {
             // ONE-PASS: read a block, fold it into MD5, then write the same
-            // block out. The payload is never fully materialized in memory.
-            let n = read_full(&mut body, &mut buf[..cap])?;
+            // block out. The payload is never fully materialized in memory. A
+            // framing error from the body reader (e.g. ChunkedReader's
+            // decoded-length mismatch) becomes `IncompleteBody`, NOT a generic
+            // `Io` — only the BODY read is classified this way (see
+            // `body_read_error`).
+            let n = read_full(&mut body, &mut buf[..cap]).map_err(body_read_error)?;
             if n == 0 {
                 break;
             }
@@ -1077,7 +1104,9 @@ impl Filesystem {
         let mut written: u64 = 0;
         let cap = buf.capacity();
         loop {
-            let n = read_full(&mut body, &mut buf[..cap])?;
+            // A body framing error (ChunkedReader decoded-length mismatch /
+            // malformed framing) becomes `IncompleteBody`, NOT generic `Io`.
+            let n = read_full(&mut body, &mut buf[..cap]).map_err(body_read_error)?;
             if n == 0 {
                 break;
             }
@@ -2299,6 +2328,87 @@ mod tests {
         res.body.read_to_end(&mut got).unwrap();
         assert_eq!(got.len(), data.len());
         assert_eq!(got, data);
+    }
+
+    #[test]
+    fn corrupt_sidecar_read_maps_to_internal_error_not_incomplete_body() {
+        // Bracket follow-up to ee593ba: a corrupt `.s3meta` is SERVER-SIDE
+        // corruption. `read_metadata` raises `Io(InvalidData)`, which must map to
+        // 500 InternalError — NOT 400 IncompleteBody (that 400 is reserved for the
+        // upload-body decoded-length mismatch). Covers both GET (get_object) and
+        // HEAD (head_object), each of which reaches read_metadata.
+        let (d, f) = fs();
+        f.create_bucket("buck").unwrap();
+        f.put_object("buck", "k", &b"hello"[..], "", um()).unwrap();
+
+        // Overwrite the sidecar with non-JSON garbage.
+        let meta = meta_path(&d.path().join("buck").join("k"));
+        std::fs::write(&meta, b"{ this is not valid json").unwrap();
+
+        // GET. (GetObjectResult is not Debug, so match the Err arm explicitly
+        // rather than unwrap_err().)
+        let get_err = match f.get_object("buck", "k", None) {
+            Ok(_) => panic!("expected corrupt-sidecar GET to fail"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(&get_err, StorageError::Io(e) if e.kind() == io::ErrorKind::InvalidData),
+            "expected Io(InvalidData) from corrupt sidecar, got {get_err:?}"
+        );
+        assert_eq!(
+            crate::handler::map_storage_error(&get_err),
+            crate::s3response::S3ErrorCode::InternalError
+        );
+
+        // HEAD.
+        let head_err = f.head_object("buck", "k").unwrap_err();
+        assert!(matches!(&head_err, StorageError::Io(e) if e.kind() == io::ErrorKind::InvalidData));
+        assert_eq!(
+            crate::handler::map_storage_error(&head_err),
+            crate::s3response::S3ErrorCode::InternalError
+        );
+    }
+
+    #[test]
+    fn chunked_put_decoded_length_mismatch_maps_to_incomplete_body() {
+        // Bracket follow-up to ee593ba: a chunked PUT whose DE-FRAMED byte total
+        // differs from x-amz-decoded-content-length must still surface as the
+        // dedicated `IncompleteBody` variant → 400 IncompleteBody. ChunkedReader
+        // raises Io(InvalidData) at EOF; put_object's body-read wrapper reclassifies
+        // it as IncompleteBody (NOT generic Io).
+        use crate::auth::ChunkedReader;
+
+        // Frame "hello world" (11 bytes) but claim a different decoded length so the
+        // reader rejects at EOF.
+        let payload = b"hello world";
+        let header = format!("{:x};chunk-signature=deadbeef\r\n", payload.len());
+        let mut framed = Vec::new();
+        framed.extend_from_slice(header.as_bytes());
+        framed.extend_from_slice(payload);
+        framed.extend_from_slice(b"\r\n");
+        framed.extend_from_slice(b"0;chunk-signature=deadbeef\r\n\r\n");
+
+        let (_d, f) = fs();
+        f.create_bucket("buck").unwrap();
+
+        let reader = ChunkedReader::new(&framed[..], Some(99)); // claims 99, actual 11
+        let err = f
+            .put_object("buck", "k", reader, "text/plain", um())
+            .unwrap_err();
+        assert!(
+            matches!(err, StorageError::IncompleteBody),
+            "expected IncompleteBody from decoded-length mismatch, got {err:?}"
+        );
+        assert_eq!(
+            crate::handler::map_storage_error(&err),
+            crate::s3response::S3ErrorCode::IncompleteBody
+        );
+
+        // The failed PUT must not have published the object.
+        assert!(matches!(
+            f.head_object("buck", "k"),
+            Err(StorageError::ObjectNotFound)
+        ));
     }
 
     #[test]

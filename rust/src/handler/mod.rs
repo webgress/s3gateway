@@ -229,13 +229,15 @@ pub fn map_storage_error(e: &StorageError) -> S3ErrorCode {
         // C3: the GET handler intercepts this BEFORE mapping (it needs the size to
         // build the 416 `Content-Range`); this mapping is the exhaustive fallback.
         StorageError::RangeNotSatisfiable { .. } => S3ErrorCode::InvalidRange,
-        // E4/E5: an `InvalidData` io error on the upload path is a CLIENT body
-        // problem — a de-framed aws-chunked length mismatch vs.
-        // x-amz-decoded-content-length, or malformed chunk framing — so map it to
-        // the 400 IncompleteBody, not a 500. Other io errors remain InternalError.
-        StorageError::Io(e) if e.kind() == std::io::ErrorKind::InvalidData => {
-            S3ErrorCode::IncompleteBody
-        }
+        // E4/E5 (scoped by bracket follow-up): a CLIENT body framing problem — the
+        // de-framed aws-chunked length mismatched x-amz-decoded-content-length, or
+        // the chunk framing was malformed — surfaces as the DEDICATED
+        // `IncompleteBody` variant (raised ONLY on the upload body-streaming read),
+        // mapped to 400 IncompleteBody. Generic `Io(InvalidData)` is NOT special-
+        // cased: it is also produced SERVER-SIDE by corrupt-sidecar/meta.json reads
+        // (read_metadata / assert_upload_matches, reached by GET/HEAD/LIST/complete),
+        // so it must stay a 500 InternalError — not be mis-reported as a client error.
+        StorageError::IncompleteBody => S3ErrorCode::IncompleteBody,
         StorageError::Io(_) => S3ErrorCode::InternalError,
     }
 }
@@ -282,6 +284,21 @@ mod tests {
         );
         assert_eq!(
             map_storage_error(&StorageError::Io(std::io::Error::other("x"))),
+            S3ErrorCode::InternalError
+        );
+        // Bracket follow-up to ee593ba: ONLY the dedicated IncompleteBody variant
+        // (upload-body decoded-length mismatch) maps to the 400 IncompleteBody.
+        assert_eq!(
+            map_storage_error(&StorageError::IncompleteBody),
+            S3ErrorCode::IncompleteBody
+        );
+        // A generic Io(InvalidData) — e.g. a corrupt-sidecar read server-side — is
+        // NOT a client error: it stays InternalError (500), not IncompleteBody.
+        assert_eq!(
+            map_storage_error(&StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "corrupt sidecar"
+            ))),
             S3ErrorCode::InternalError
         );
     }
