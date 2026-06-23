@@ -736,13 +736,29 @@ impl Filesystem {
         // zero-byte placeholder at obj_path so existence checks behave. Propagate
         // any error (do NOT swallow it) — but first try to restore the prior
         // object's parts so we don't leave it half-destroyed.
-        if let Err(e) = std::fs::write(&obj_path, b"") {
-            // Roll back: move the new store aside and the old one back.
-            let _ = directio::rename(&parts_store, &staging);
-            if had_old {
-                let _ = directio::rename(&old_aside, &parts_store);
+        //
+        // F5: create the placeholder via DioFile (O_NOFOLLOW), NOT std::fs::write,
+        // which would FOLLOW a symlink planted at obj_path and truncate an external
+        // target to zero bytes. Every other data-bearing write here is already
+        // O_NOFOLLOW-guarded; this is the last unguarded one. A legitimate
+        // pre-existing placeholder is a regular file (we create it here, never a
+        // symlink), so O_NOFOLLOW still succeeds on the normal overwrite path.
+        match DioFile::create_write(&obj_path) {
+            Ok(file) => {
+                // Drop closes the (empty) fd; O_CREATE|O_TRUNC already made/cleared it.
+                drop(file);
             }
-            return Err(e.into());
+            Err(e) => {
+                // Roll back: move the new store aside and the old one back, and
+                // re-arm the staging guard so the (now-moved-back) staging dir is
+                // cleaned on drop — disarm() was called above before this point.
+                let _ = directio::rename(&parts_store, &staging);
+                staging_guard.rearm();
+                if had_old {
+                    let _ = directio::rename(&old_aside, &parts_store);
+                }
+                return Err(e.into());
+            }
         }
         // 4. Publish the sidecar (durably when --fsync). After this the new object
         // is live; only now is it safe to delete the old parts. If the manifest
@@ -992,6 +1008,12 @@ impl TmpDirGuard {
     }
     fn disarm(&mut self) {
         self.armed = false;
+    }
+    /// F7: re-arm a previously-disarmed guard. Used on the Complete rollback path
+    /// when the staged store has been renamed BACK to the staging dir after a
+    /// later step failed, so the staging dir is cleaned on drop instead of leaking.
+    fn rearm(&mut self) {
+        self.armed = true;
     }
 }
 impl Drop for TmpDirGuard {
@@ -2039,6 +2061,95 @@ mod tests {
     }
 
     #[test]
+    fn upload_id_uuid_check_is_load_bearing() {
+        // F1 (strengthened): the previous regression only used traversing ids that
+        // pointed at locations with NO meta.json, so the `.exists()` guard returned
+        // NoSuchUpload even if the `Uuid::parse_str` check were removed — vacuous.
+        //
+        // This test PLANTS a fully-valid upload (meta.json + a part) at a location
+        // OUTSIDE `.multipart` but reachable via `../` from `root/.multipart/`, so
+        // WITHOUT the UUID check `upload_dir("../escape-upload")` would resolve to
+        // `root/escape-upload`, find the meta.json, and operate on it. WITH the
+        // check, every entry point rejects the id as NoSuchUpload before any join.
+        //
+        // Mutation evidence: remove the `Uuid::parse_str(...)?` line in
+        // `upload_dir` and this test fails (list_parts/complete/abort would
+        // succeed against the planted external upload).
+        let (_d, f) = fs();
+        f.create_bucket("buck").unwrap();
+        let root = &f.root;
+
+        // Ensure `root/.multipart/` exists (the traversal base must be real).
+        std::fs::create_dir_all(root.join(MULTIPART_DIR)).unwrap();
+
+        // Plant a valid upload at `root/escape-upload` (a sibling of `.multipart`),
+        // reachable from `.multipart` as `../escape-upload`.
+        let planted = root.join("escape-upload");
+        std::fs::create_dir_all(planted.join("parts")).unwrap();
+        let planted_meta = MultipartUpload {
+            upload_id: "escape-upload".into(),
+            bucket: "buck".into(),
+            key: "victim".into(),
+            initiated_unix: now_unix(),
+            content_type: String::new(),
+            user_metadata: um(),
+        };
+        std::fs::write(
+            planted.join("meta.json"),
+            serde_json::to_vec(&planted_meta).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(planted.join("parts").join("00001"), b"planted").unwrap();
+        let part_etag = format!("\"{}\"", hex::encode(Md5::digest(b"planted")));
+
+        // The traversing id resolves to the planted upload IFF the UUID check is
+        // absent. Every entry point must still reject it as NoSuchUpload.
+        let traverse = "../escape-upload";
+        assert!(
+            matches!(f.list_parts(traverse), Err(StorageError::NoSuchUpload)),
+            "list_parts must reject traversing uploadId even when a valid meta.json exists at the target"
+        );
+        assert!(
+            matches!(
+                f.upload_part(traverse, 2, &b"x"[..]),
+                Err(StorageError::NoSuchUpload)
+            ),
+            "upload_part must reject traversing uploadId"
+        );
+        assert!(
+            matches!(
+                f.complete_multipart_upload(
+                    traverse,
+                    &[CompletePart {
+                        part_number: 1,
+                        etag: part_etag,
+                    }]
+                ),
+                Err(StorageError::NoSuchUpload)
+            ),
+            "complete must reject traversing uploadId even when a valid meta.json exists at the target"
+        );
+        assert!(
+            matches!(
+                f.abort_multipart_upload(traverse),
+                Err(StorageError::NoSuchUpload)
+            ),
+            "abort must reject traversing uploadId even when a valid meta.json exists at the target"
+        );
+
+        // The planted external upload must be untouched (abort would have
+        // remove_dir_all'd it if the traversal had been honored).
+        assert!(
+            planted.join("meta.json").exists(),
+            "traversing abort must NOT have deleted the external upload dir"
+        );
+        assert!(
+            planted.join("parts").join("00001").exists(),
+            "external part must remain intact"
+        );
+    }
+
+    #[test]
     fn reserved_name_keys_rejected() {
         // F6 regression: keys whose final component collides with internal files
         // must be rejected so they can't shadow sidecars / clobber part stores.
@@ -2075,9 +2186,22 @@ mod tests {
 
     #[test]
     fn symlink_leaf_not_followed_for_get_and_put() {
-        // F5 regression: a symlink planted inside a bucket pointing OUTSIDE the
-        // data root must not be followed for GET/PUT — the op errors instead of
-        // escaping. (O_NOFOLLOW on the leaf + parent canonicalization.)
+        // F5 regression (strengthened): a symlink planted inside a bucket pointing
+        // OUTSIDE the data root must not be followed for GET/PUT — the op errors
+        // (O_NOFOLLOW ELOOP) instead of escaping.
+        //
+        // The previous version was partially vacuous: GET returned ObjectNotFound
+        // via the MISSING-SIDECAR branch (no .s3meta), and PUT was safe via the
+        // tmp+rename atomic-write path — so it passed even WITHOUT O_NOFOLLOW.
+        //
+        // This version PLANTS A VALID `.s3meta` SIDECAR for the symlinked key, so
+        // GET gets past the sidecar read and reaches `PlainFileReader::open` ->
+        // `DioFile::open_read` (the O_NOFOLLOW open). With O_NOFOLLOW the open
+        // fails (ELOOP); without it, GET would follow the link and leak the secret.
+        //
+        // Mutation evidence: remove `OFlags::NOFOLLOW` from `DioFile::open_read`
+        // (and/or `create_write`) and this test fails — GET returns the external
+        // file's bytes.
         use std::os::unix::fs::symlink;
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_path_buf();
@@ -2089,32 +2213,164 @@ mod tests {
         let secret = outside.path().join("secret.txt");
         std::fs::write(&secret, b"TOP SECRET").unwrap();
 
-        // Plant a symlink `buck/link` -> outside secret, plus a sidecar so a
-        // naive GET would read metadata then open the symlinked data file.
+        // Plant a symlink `buck/link` -> outside secret.
         let link = root.join("buck").join("link");
         symlink(&secret, &link).unwrap();
 
-        // GET must NOT return the secret: either ObjectNotFound (no sidecar) or
-        // an IO error (O_NOFOLLOW ELOOP) — never the secret bytes.
+        // Plant a VALID sidecar for `link`, so GET does NOT short-circuit on the
+        // missing-sidecar branch and instead opens the (symlinked) data file. The
+        // recorded length matches the secret so a naive read would hand it out.
+        let meta = ObjectMetadata {
+            content_type: "text/plain".into(),
+            content_length: b"TOP SECRET".len() as i64,
+            etag: "\"deadbeef\"".into(),
+            last_modified: now_unix(),
+            user_metadata: um(),
+            content_disposition: String::new(),
+            content_encoding: String::new(),
+            cache_control: String::new(),
+            multipart: None,
+        };
+        write_metadata(&meta_path(&link), &meta).unwrap();
+
+        // GET must NOT return the secret. With the sidecar present, the ONLY thing
+        // standing between the client and the external bytes is O_NOFOLLOW on the
+        // data-file open: it must error (ELOOP) rather than stream the secret.
         match f.get_object("buck", "link", None) {
-            Err(_) => {}
+            Err(_) => { /* O_NOFOLLOW rejected the symlinked leaf — correct. */ }
             Ok(mut res) => {
                 let mut got = Vec::new();
                 let _ = res.body.read_to_end(&mut got);
                 assert_ne!(
                     got, b"TOP SECRET",
-                    "GET followed the symlink and leaked the secret"
+                    "GET followed the symlink and leaked the secret (O_NOFOLLOW missing)"
                 );
             }
         }
+        // The symlink itself must still point outside (GET must not have rewritten
+        // or removed it) and the external secret must be intact.
+        assert_eq!(
+            std::fs::read(&secret).unwrap(),
+            b"TOP SECRET",
+            "external secret was modified by a GET"
+        );
 
         // PUT over the symlinked leaf must NOT write through to the outside target.
+        // (Atomic tmp+rename replaces the link with a regular file; O_NOFOLLOW on
+        // the tmp open + the placeholder open are belt-and-suspenders.)
         let _ = f.put_object("buck", "link", &b"pwn"[..], "", um());
         let after = std::fs::read(&secret).unwrap();
         assert_eq!(
             after, b"TOP SECRET",
             "PUT wrote through the symlink to outside root"
         );
+    }
+
+    #[test]
+    fn complete_multipart_placeholder_does_not_follow_symlink() {
+        // F5 (placeholder fix): CompleteMultipartUpload writes a zero-byte
+        // placeholder at the object path. If a symlink to an EXTERNAL file sits at
+        // that path, the placeholder write must NOT truncate the external target.
+        //
+        // Mutation evidence: revert the placeholder write to
+        // `std::fs::write(&obj_path, b"")` and this test fails — the external file
+        // is truncated to 0 bytes.
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let f = Filesystem::new(&root);
+        f.create_bucket("buck").unwrap();
+
+        // External file the symlink will point at; must survive Complete intact.
+        let outside = tempfile::tempdir().unwrap();
+        let external = outside.path().join("external.bin");
+        std::fs::write(&external, b"EXTERNAL-DATA-MUST-SURVIVE").unwrap();
+
+        // Plant a symlink at the object path BEFORE completing the upload.
+        let obj = root.join("buck").join("mpkey");
+        symlink(&external, &obj).unwrap();
+
+        // Drive a real multipart upload for the same key.
+        let uid = f
+            .create_multipart_upload("buck", "mpkey", "", um())
+            .unwrap();
+        let e1 = f
+            .upload_part(&uid, 1, &b"hello-multipart-body"[..])
+            .unwrap();
+
+        // Complete: the placeholder write must use O_NOFOLLOW. With the fix it
+        // fails (ELOOP) without touching the external target; the swap rollback
+        // leaves the prior state and the external file is untouched. (We don't
+        // assert Complete's Ok/Err — only that the external file is NOT truncated.)
+        let _ = f.complete_multipart_upload(
+            &uid,
+            &[CompletePart {
+                part_number: 1,
+                etag: e1,
+            }],
+        );
+
+        assert_eq!(
+            std::fs::read(&external).unwrap(),
+            b"EXTERNAL-DATA-MUST-SURVIVE",
+            "Complete's placeholder write followed the symlink and truncated the external file"
+        );
+
+        // F7: the placeholder-write-failure rollback path must NOT leak the staging
+        // store. Walk the bucket dir and assert no `mpkey.parts.new.*` staging dir
+        // remains (the staging guard is re-armed on this rollback path).
+        let bucket_dir = root.join("buck");
+        for entry in std::fs::read_dir(&bucket_dir).unwrap() {
+            let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+            assert!(
+                !name.contains(".parts.new."),
+                "staging dir leaked after placeholder-write rollback: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn complete_multipart_overwrites_existing_placeholder() {
+        // F5 (placeholder fix, normal path): a SECOND complete of the same key
+        // must still succeed. The pre-existing placeholder is a regular file (we
+        // create it via O_NOFOLLOW-create), so O_NOFOLLOW must NOT break the
+        // legitimate overwrite. Verifies the smoke multipart re-upload path.
+        let (_d, f) = fs();
+        f.create_bucket("buck").unwrap();
+
+        // First complete.
+        let uid1 = f.create_multipart_upload("buck", "k", "", um()).unwrap();
+        let a1 = f.upload_part(&uid1, 1, &b"first-version-data"[..]).unwrap();
+        f.complete_multipart_upload(
+            &uid1,
+            &[CompletePart {
+                part_number: 1,
+                etag: a1,
+            }],
+        )
+        .unwrap();
+        let mut r = f.get_object("buck", "k", None).unwrap();
+        let mut got = Vec::new();
+        r.body.read_to_end(&mut got).unwrap();
+        assert_eq!(got, b"first-version-data");
+
+        // Second complete OVERWRITES the existing (regular-file) placeholder.
+        let uid2 = f.create_multipart_upload("buck", "k", "", um()).unwrap();
+        let b1 = f
+            .upload_part(&uid2, 1, &b"second-version-data"[..])
+            .unwrap();
+        f.complete_multipart_upload(
+            &uid2,
+            &[CompletePart {
+                part_number: 1,
+                etag: b1,
+            }],
+        )
+        .unwrap();
+        let mut r2 = f.get_object("buck", "k", None).unwrap();
+        let mut got2 = Vec::new();
+        r2.body.read_to_end(&mut got2).unwrap();
+        assert_eq!(got2, b"second-version-data");
     }
 
     #[test]
