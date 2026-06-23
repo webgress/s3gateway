@@ -139,12 +139,44 @@ pub fn write_metadata_temp(tmp: &Path, meta: &ObjectMetadata) -> io::Result<()> 
     std::fs::write(tmp, &data)
 }
 
+// D2: test-only, THREAD-LOCAL injection of a forced dir-fsync failure that fires
+// AFTER the sidecar rename (the commit) has succeeded. Used to prove the
+// post-commit `fsync_dir` is a non-rollback DURABILITY warning, not a
+// commit-failure signal. Thread-local so it does not leak into parallel tests.
+#[cfg(test)]
+thread_local! {
+    static FORCE_DIR_FSYNC_FAIL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_force_dir_fsync_fail(v: bool) {
+    FORCE_DIR_FSYNC_FAIL.with(|c| c.set(v));
+}
+
+fn force_dir_fsync_fail() -> bool {
+    #[cfg(test)]
+    {
+        if FORCE_DIR_FSYNC_FAIL.with(|c| c.get()) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Commit a previously-staged temp sidecar (from [`write_metadata_temp_durable`]
-/// or [`write_metadata_temp`]) by renaming it into place at `path`. When
-/// `durable`, the parent directory is fsynced afterward so the rename survives a
-/// crash. This is the LAST durable step of the multipart-complete commit (C1).
+/// or [`write_metadata_temp`]) by RENAMING it into place at `path`. The rename is
+/// THE COMMIT POINT — its `Err` is the ONLY signal a caller should treat as a
+/// pre-commit failure and roll back data/parts on. After a SUCCESSFUL rename the
+/// new sidecar is already live, so this returns `Ok(())` even if the subsequent
+/// best-effort directory fsync (for crash durability) fails.
+///
+/// D2: the previous version fsync'd the parent dir AFTER the rename and returned
+/// that fsync's `Err`, which both callers (put_object, complete) treated as
+/// pre-commit and rolled back data/parts — leaving the (already-live) new sidecar
+/// describing rolled-back data (sidecar/data mismatch). The rename is now the sole
+/// rollback-triggering step; the dir fsync is a SEPARATE best-effort durability
+/// step ([`fsync_commit_dir`]) whose failure is logged, never rolled back.
 pub fn commit_metadata_temp(tmp: &Path, path: &Path, durable: bool) -> io::Result<()> {
-    use super::directio::fsync_dir;
     match std::fs::rename(tmp, path) {
         Ok(()) => {}
         Err(e) => {
@@ -152,12 +184,39 @@ pub fn commit_metadata_temp(tmp: &Path, path: &Path, durable: bool) -> io::Resul
             return Err(e);
         }
     }
+    // The sidecar is now live (the commit succeeded). Make the rename durable with
+    // a BEST-EFFORT parent-dir fsync — a failure here is a durability warning, NOT
+    // a commit failure, so it must not propagate as an Err that triggers rollback.
     if durable {
         if let Some(parent) = path.parent() {
-            fsync_dir(parent)?;
+            fsync_commit_dir(parent, path);
         }
     }
     Ok(())
+}
+
+/// D2: best-effort post-commit parent-dir fsync. The sidecar rename has already
+/// committed the object; this only improves crash durability of the rename. A
+/// failure is logged (tracing::warn) and SWALLOWED — the object is published and
+/// must not be rolled back. Separated from the rename so the rename's `Err`
+/// remains the sole rollback-triggering signal for callers.
+fn fsync_commit_dir(parent: &Path, committed: &Path) {
+    use super::directio::fsync_dir;
+    let res = if force_dir_fsync_fail() {
+        Err(io::Error::other(
+            "forced dir-fsync failure (test injection)",
+        ))
+    } else {
+        fsync_dir(parent)
+    };
+    if let Err(e) = res {
+        tracing::warn!(
+            path = %committed.display(),
+            error = %e,
+            "post-commit directory fsync failed; object is published but the \
+             directory entry may not be crash-durable"
+        );
+    }
 }
 
 /// Read+parse a metadata sidecar.

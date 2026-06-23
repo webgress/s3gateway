@@ -16,10 +16,11 @@ pub async fn list_objects_v2(
     let delimiter = req.query1("delimiter").unwrap_or("").to_string();
     let start_after = req.query1("start-after").unwrap_or("").to_string();
     let continuation_token = req.query1("continuation-token").unwrap_or("").to_string();
-    // F14: preserve ABSENT vs explicit value. `None` -> storage defaults to 1000;
-    // `Some(0)` -> empty page with IsTruncated. The wire `max-keys` echoed back in
-    // the response uses the effective value (1000 when absent).
-    let max_keys: Option<i32> = req.query1("max-keys").and_then(|s| s.parse().ok());
+    // F14/D6: preserve ABSENT vs explicit value. `None` -> storage defaults to
+    // 1000; `Some(0)` -> empty page with IsTruncated; `Some(n)` caps the page.
+    // D6: a PRESENT-but-invalid max-keys (non-numeric or < 0) is InvalidArgument
+    // (400), matching AWS — it must NOT silently fall back to the 1000 default.
+    let max_keys: Option<i32> = parse_max_keys(req.query1("max-keys"))?;
     let effective_max_keys = max_keys.unwrap_or(1000);
 
     let input = ListObjectsInput {
@@ -63,4 +64,66 @@ pub async fn list_objects_v2(
     };
 
     Ok(xml_ok(result.to_xml()))
+}
+
+/// D6: parse the optional `max-keys` query value into the storage layer's
+/// `Option<i32>` contract, validating per AWS:
+///   - ABSENT (`None`)        -> `Ok(None)` (storage defaults to 1000)
+///   - explicit `0`           -> `Ok(Some(0))` (empty page, IsTruncated; F14)
+///   - explicit `n > 0`       -> `Ok(Some(n))`
+///   - PRESENT but non-numeric OR `< 0` -> `Err(InvalidArgument)` (400)
+///
+/// The pre-D6 code used `.parse().ok()`, which silently mapped a non-numeric
+/// value to `None` (the 1000 default) and let storage clamp negatives to 0 — both
+/// of which AWS rejects as `InvalidArgument`.
+fn parse_max_keys(raw: Option<&str>) -> Result<Option<i32>, S3ErrorCode> {
+    match raw {
+        None => Ok(None),
+        Some(s) => match s.parse::<i64>() {
+            Ok(n) if (0..=i32::MAX as i64).contains(&n) => Ok(Some(n as i32)),
+            // Non-numeric, negative, or out of i32 range -> InvalidArgument.
+            _ => Err(S3ErrorCode::InvalidArgument),
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_max_keys;
+    use crate::s3response::S3ErrorCode;
+
+    #[test]
+    fn max_keys_validation() {
+        // D6: absent -> None (storage defaults to 1000).
+        assert_eq!(parse_max_keys(None), Ok(None));
+        // Explicit 0 -> Some(0) (empty page, F14 behavior preserved).
+        assert_eq!(parse_max_keys(Some("0")), Ok(Some(0)));
+        // Positive -> Some(n).
+        assert_eq!(parse_max_keys(Some("1000")), Ok(Some(1000)));
+        assert_eq!(parse_max_keys(Some("7")), Ok(Some(7)));
+        // Non-numeric -> InvalidArgument (was silently None/1000 before D6).
+        assert_eq!(
+            parse_max_keys(Some("abc")),
+            Err(S3ErrorCode::InvalidArgument)
+        );
+        assert_eq!(parse_max_keys(Some("")), Err(S3ErrorCode::InvalidArgument));
+        assert_eq!(
+            parse_max_keys(Some("1.5")),
+            Err(S3ErrorCode::InvalidArgument)
+        );
+        // Negative -> InvalidArgument (was silently clamped to 0 before D6).
+        assert_eq!(
+            parse_max_keys(Some("-1")),
+            Err(S3ErrorCode::InvalidArgument)
+        );
+        assert_eq!(
+            parse_max_keys(Some("-1000")),
+            Err(S3ErrorCode::InvalidArgument)
+        );
+        // Out of i32 range -> InvalidArgument.
+        assert_eq!(
+            parse_max_keys(Some("99999999999")),
+            Err(S3ErrorCode::InvalidArgument)
+        );
+    }
 }

@@ -64,6 +64,10 @@ pub enum StorageError {
 
 pub type Result<T> = std::result::Result<T, StorageError>;
 
+/// Number of shards in the per-key publish lock table (D3). A power of two so the
+/// hash maps cheaply; large enough that unrelated keys almost never collide.
+const KEY_LOCK_SHARDS: usize = 256;
+
 /// Root-anchored filesystem store.
 #[derive(Debug, Clone)]
 pub struct Filesystem {
@@ -73,6 +77,15 @@ pub struct Filesystem {
     /// success is reported. When false, the sidecar/dir fsyncs are skipped for
     /// throughput (the data file is still fsync'd). See `--fsync`.
     fsync: bool,
+    /// D3: sharded per-`{bucket}/{key}` publish locks. `Filesystem` is `Clone`d
+    /// per request, so the lock TABLE is shared via `Arc` — all clones observe the
+    /// same mutexes. `std::sync::Mutex` is correct here: these ops run inside
+    /// `spawn_blocking`, so a blocking acquire is fine. The lock guards only the
+    /// mutate-and-publish critical section (aside -> swap -> placeholder ->
+    /// sidecar-commit), NOT the streaming upload, so concurrent uploads to
+    /// DIFFERENT keys still parallelize and even same-key uploads stream freely
+    /// and only serialize at publish.
+    key_locks: std::sync::Arc<Vec<std::sync::Mutex<()>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -189,19 +202,45 @@ fn force_sidecar_fail() -> bool {
 impl Filesystem {
     /// Create a store rooted at `root` with durable publication enabled (fsync).
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Filesystem {
-            root: root.into(),
-            fsync: true,
-        }
+        Self::with_fsync(root, true)
     }
 
     /// Create a store with an explicit durability mode. `fsync = false` skips the
     /// sidecar/dir fsyncs for max throughput (data file is still fsync'd).
     pub fn with_fsync(root: impl Into<PathBuf>, fsync: bool) -> Self {
+        let mut locks = Vec::with_capacity(KEY_LOCK_SHARDS);
+        for _ in 0..KEY_LOCK_SHARDS {
+            locks.push(std::sync::Mutex::new(()));
+        }
         Filesystem {
             root: root.into(),
             fsync,
+            key_locks: std::sync::Arc::new(locks),
         }
+    }
+
+    /// D3: acquire the publish lock for `{bucket}/{key}`. The returned guard must
+    /// be held for the whole mutate-and-publish critical section so concurrent
+    /// PUT / Complete / Delete for the SAME key cannot interleave their
+    /// aside/swap/placeholder/sidecar renames and publish a sidecar describing
+    /// another writer's data/parts. A stable FNV-1a hash of the path picks the
+    /// shard. The mutex is poison-tolerant (we hold no invariant across panics
+    /// inside the section beyond what each op's own rollback handles).
+    fn lock_key(&self, bucket: &str, key: &str) -> std::sync::MutexGuard<'_, ()> {
+        // FNV-1a over "{bucket}/{key}" — stable across processes/threads.
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for byte in bucket
+            .bytes()
+            .chain(std::iter::once(b'/'))
+            .chain(key.bytes())
+        {
+            h ^= byte as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        let idx = (h as usize) & (KEY_LOCK_SHARDS - 1);
+        self.key_locks[idx]
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     pub fn root(&self) -> &Path {
@@ -242,14 +281,14 @@ impl Filesystem {
     pub fn delete_bucket(&self, name: &str) -> Result<()> {
         self.validate_bucket_component(name)?;
         let path = self.root.join(name);
-        match std::fs::metadata(&path) {
-            Ok(m) if m.is_dir() => {}
-            Ok(_) => return Err(StorageError::BucketNotFound),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                return Err(StorageError::BucketNotFound)
-            }
-            Err(e) => return Err(e.into()),
-        }
+        // D4: gate on the symlink-aware existence check (mirrors the C4-hardened
+        // head_bucket). `std::fs::metadata` FOLLOWS symlinks, so a planted
+        // `data-dir/bucket -> /external` symlink would otherwise be accepted and its
+        // emptiness scan / `remove_dir_all(MULTIPART_DIR)` would operate OUTSIDE the
+        // data root. head_bucket uses `symlink_metadata` and rejects a symlinked or
+        // non-directory bucket as NoSuchBucket; a real bucket (a directory we created
+        // via `create_dir`) still passes.
+        self.head_bucket(name)?;
         // Empty iff it contains nothing but a (per-bucket) .multipart dir.
         for entry in std::fs::read_dir(&path)? {
             let entry = entry?;
@@ -357,6 +396,13 @@ impl Filesystem {
             cache_control: String::new(),
             multipart: None,
         };
+
+        // D3: acquire the per-key publish lock for the mutate-and-publish critical
+        // section below. The streaming upload above ran lock-free; only the
+        // aside -> swap -> sidecar-commit sequence is serialized against concurrent
+        // PUT/Complete/Delete for the SAME key, so a concurrent writer can never
+        // interleave its renames between ours and publish a mismatched sidecar.
+        let _publish_guard = self.lock_key(bucket, key);
 
         // C2: the `.s3meta` sidecar is the commit point. Stage the sidecar to a
         // temp (durable when --fsync) BEFORE renaming the data into place, then
@@ -547,9 +593,14 @@ impl Filesystem {
         // (Deleting a missing KEY in an EXISTING bucket remains idempotent/Ok.)
         self.head_bucket(bucket)?;
         let obj_path = self.root.join(bucket).join(key);
-        let _ = std::fs::remove_file(&obj_path);
+        // D3: serialize the removal against concurrent PUT/Complete for the SAME
+        // key so a delete can't interleave with a publish (e.g. remove the new
+        // sidecar a Complete just committed while leaving its parts, or vice versa).
+        let _publish_guard = self.lock_key(bucket, key);
+        // Remove the `.s3meta` sidecar FIRST so the object's metadata vanishes
+        // atomically; then drop the data file and any multipart `{key}.parts` store.
         let _ = std::fs::remove_file(meta_path(&obj_path));
-        // Multipart objects store their parts in a sibling `{key}.parts` dir.
+        let _ = std::fs::remove_file(&obj_path);
         let _ = std::fs::remove_dir_all(parts_store_dir(&obj_path));
 
         let bucket_path = self.root.join(bucket);
@@ -909,6 +960,14 @@ impl Filesystem {
         // On ANY failure before the sidecar commit, restore `parts_store` from
         // `old_aside` so the old sidecar + parts remain mutually consistent.
 
+        // D3: acquire the per-key publish lock before the mutate-and-publish
+        // critical section (stage sidecar -> aside parts/data -> swap -> placeholder
+        // -> sidecar-commit). Part validation/MD5 above only read the (uuid-keyed)
+        // upload dir, so they ran lock-free; this serializes only the publish of
+        // `{key}` against concurrent PUT/Complete/Delete for the SAME key. Keyed by
+        // the upload's STORED bucket/key (same as `obj_path`).
+        let _publish_guard = self.lock_key(&upload.bucket, &upload.key);
+
         // 0. Stage the new sidecar to a temp (durable when --fsync) FIRST. Nothing
         // the old sidecar references has changed yet.
         let meta_final = meta_path(&obj_path);
@@ -927,8 +986,44 @@ impl Filesystem {
             Err(e) if e.kind() == io::ErrorKind::NotFound => false,
             Err(e) => return Err(e.into()),
         };
-        // Helper: restore the prior object's parts on any failure before commit so
-        // the (still-live) old sidecar + parts stay consistent.
+
+        // D1: the prior `{key}` DATA FILE must be part of the atomic rollback set,
+        // exactly like the parts store. Step 3 below writes a zero-byte placeholder
+        // via `DioFile::create_write(&obj_path)` (O_CREATE|O_TRUNC) — this TRUNCATES
+        // whatever regular file is at `{key}`, INCLUDING a prior SINGLE-PART
+        // object's real data, BEFORE the sidecar is committed. Without rescuing it:
+        //   (a) completing over a prior single-part object, if the commit fails,
+        //       leaves the OLD single-part sidecar pointing at a now 0-byte file
+        //       (silent corruption); and
+        //   (b) a FRESH complete that fails leaves a LIST-visible 0-byte phantom.
+        // Mirror the put_object C2 data-aside pattern: rename any REGULAR file at
+        // `obj_path` to a guarded temp first, restore it on any pre-commit failure,
+        // and for the fresh case remove the placeholder on failure so no phantom
+        // remains. On success the aside is dropped.
+        let data_aside = tmp_sibling(&obj_path);
+        let had_old_data = match directio::rename(&obj_path, &data_aside) {
+            Ok(()) => true,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+            // A symlinked obj_path is a directory/non-regular surprise; do not
+            // follow it — surface the error (the prior parts are still aside).
+            Err(e) => {
+                if had_old {
+                    let _ = directio::rename(&old_aside, &parts_store);
+                }
+                return Err(e.into());
+            }
+        };
+        let mut data_aside_guard = if had_old_data {
+            Some(TmpGuard::new(data_aside.clone()))
+        } else {
+            None
+        };
+
+        // Helper: restore the prior object on any failure before commit so the
+        // (still-live) old sidecar + parts + data file stay mutually consistent.
+        // Restores the parts store AND the `{key}` data file; for a FRESH complete
+        // (no prior data) it removes the just-written placeholder so no LIST-visible
+        // phantom object is left behind.
         macro_rules! restore_old {
             () => {{
                 if std::fs::metadata(&parts_store).is_ok() {
@@ -938,6 +1033,17 @@ impl Filesystem {
                 }
                 if had_old {
                     let _ = directio::rename(&old_aside, &parts_store);
+                }
+                // D1: restore (or, when fresh, remove) the `{key}` data file.
+                if had_old_data {
+                    let _ = std::fs::remove_file(&obj_path);
+                    let _ = directio::rename(&data_aside, &obj_path);
+                    if let Some(g) = data_aside_guard.as_mut() {
+                        g.disarm();
+                    }
+                } else {
+                    // Fresh complete: drop the placeholder so nothing is published.
+                    let _ = std::fs::remove_file(&obj_path);
                 }
             }};
         }
@@ -952,9 +1058,8 @@ impl Filesystem {
         //
         // F5: create the placeholder via DioFile (O_NOFOLLOW), NOT std::fs::write,
         // which would FOLLOW a symlink planted at obj_path and truncate an external
-        // target to zero bytes. A legitimate pre-existing placeholder is a regular
-        // file (we create it here, never a symlink), so O_NOFOLLOW still succeeds
-        // on the normal overwrite path.
+        // target to zero bytes. The prior regular file (if any) was moved aside in
+        // step 1, so this always creates a fresh empty placeholder.
         match DioFile::create_write(&obj_path) {
             Ok(file) => {
                 // Drop closes the (empty) fd; O_CREATE|O_TRUNC already made/cleared it.
@@ -967,9 +1072,9 @@ impl Filesystem {
         }
         // C1 verification hook: forced failure injected AFTER the parts swap but
         // BEFORE the sidecar commit. The restore_old! path must leave the prior
-        // object fully intact (old sidecar + old parts), proving the sidecar is
-        // the commit point. Gated by `S3GW_FORCE_SIDECAR_FAIL` (env, for manual
-        // verification) or the per-thread test flag.
+        // object fully intact (old sidecar + old parts + old data file), proving the
+        // sidecar is the commit point. Gated by `S3GW_FORCE_SIDECAR_FAIL` (env, for
+        // manual verification) or the per-thread test flag.
         if force_sidecar_fail() {
             restore_old!();
             return Err(StorageError::Io(io::Error::other(
@@ -984,9 +1089,14 @@ impl Filesystem {
             return Err(e.into());
         }
         meta_tmp_guard.disarm();
-        // 5. New object fully published — now remove the old parts store.
+        // 5. New object fully published — now remove the old parts store and the
+        // superseded `{key}` data file aside.
         if had_old {
             let _ = std::fs::remove_dir_all(&old_aside);
+        }
+        if let Some(mut g) = data_aside_guard.take() {
+            let _ = std::fs::remove_file(&data_aside);
+            g.disarm();
         }
 
         // Cleanup the upload working dir.
@@ -1024,7 +1134,10 @@ impl Filesystem {
                 continue;
             }
             let meta_path = entry.path().join("meta.json");
-            let data = match std::fs::read(&meta_path) {
+            // D5: read with O_NOFOLLOW so a SYMLINKED meta.json (pointing outside
+            // the data root) is not followed — `std::fs::read` follows symlinks. A
+            // symlinked (or otherwise unreadable) meta.json is skipped.
+            let data = match read_nofollow(&meta_path) {
                 Ok(d) => d,
                 Err(_) => continue,
             };
@@ -1132,7 +1245,9 @@ impl Filesystem {
         bucket: &str,
         key: &str,
     ) -> Result<MultipartUpload> {
-        let raw = match std::fs::read(upload_dir.join("meta.json")) {
+        // D5: read with O_NOFOLLOW so a SYMLINKED meta.json is rejected (ELOOP)
+        // rather than followed outside the data root (`std::fs::read` follows links).
+        let raw = match read_nofollow(&upload_dir.join("meta.json")) {
             Ok(d) => d,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 return Err(StorageError::NoSuchUpload)
@@ -1448,6 +1563,23 @@ fn write_all_at(file: &DioFile, mut buf: &[u8], mut offset: u64) -> io::Result<(
         buf = &buf[n..];
     }
     Ok(())
+}
+
+/// D5: read a small file in full WITHOUT following a final-component symlink.
+/// Used for multipart `meta.json` reads so a planted symlink (pointing at an
+/// outside-root JSON) is rejected (ELOOP) instead of read through. Like
+/// `read_metadata`, this uses a plain buffered fd (NOT DioFile/O_DIRECT) since the
+/// file is tiny metadata, but adds `O_NOFOLLOW`.
+fn read_nofollow(path: &Path) -> io::Result<Vec<u8>> {
+    use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let mut f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    let mut data = Vec::new();
+    f.read_to_end(&mut data)?;
+    Ok(data)
 }
 
 /// Stream a file through MD5; returns (16-byte digest, size).
@@ -3360,6 +3492,200 @@ mod tests {
     }
 
     #[test]
+    fn complete_over_single_part_sidecar_failure_preserves_object() {
+        // D1 regression (load-bearing): completing a multipart upload OVER a prior
+        // SINGLE-PART object. Step 3 of complete truncates whatever regular file is
+        // at `{key}` to write the zero-byte placeholder — which is the prior
+        // single-part object's REAL DATA. If the sidecar commit then fails, the
+        // prior single-part object must still GET its ORIGINAL bytes/len/etag.
+        //
+        // Mutation evidence: remove the `{key}` data-aside/restore added in D1 (the
+        // `data_aside`/`had_old_data` handling and the data-file branch of
+        // `restore_old!`) and this test FAILS — after the forced failure the prior
+        // single-part object's data file is a 0-byte truncated placeholder, so GET
+        // returns empty bytes / a length mismatch.
+        let (_d, f) = fs();
+        f.create_bucket("buck").unwrap();
+        let key = "obj.bin";
+
+        // Prior SINGLE-PART object (a real regular data file at `{key}`).
+        let original = b"SINGLE-PART-ORIGINAL-CONTENT-must-survive-a-failed-complete";
+        let prior_etag = f
+            .put_object("buck", key, &original[..], "text/plain", um())
+            .unwrap();
+        let prior_head = f.head_object("buck", key).unwrap();
+
+        // Begin a 2-part overwrite, then force the sidecar-commit step to fail.
+        let uid = f.create_multipart_upload("buck", key, "", um()).unwrap();
+        let b1 = vec![4u8; 5 * 1024 * 1024];
+        let b2 = vec![5u8; 2000];
+        let g1 = f.upload_part("buck", key, &uid, 1, &b1[..]).unwrap();
+        let g2 = f.upload_part("buck", key, &uid, 2, &b2[..]).unwrap();
+
+        FORCE_SIDECAR_FAIL.with(|c| c.set(true));
+        let res = f.complete_multipart_upload(
+            "buck",
+            key,
+            &uid,
+            &[
+                CompletePart {
+                    part_number: 1,
+                    etag: g1,
+                },
+                CompletePart {
+                    part_number: 2,
+                    etag: g2,
+                },
+            ],
+        );
+        FORCE_SIDECAR_FAIL.with(|c| c.set(false));
+        assert!(
+            res.is_err(),
+            "forced sidecar-commit failure must make complete error"
+        );
+
+        // The PRIOR single-part object must be fully intact: bytes, length, ETag.
+        let head = f.head_object("buck", key).unwrap();
+        assert!(!head.is_multipart(), "prior object must stay single-part");
+        assert_eq!(head.etag, prior_etag, "prior single-part ETag changed");
+        assert_eq!(
+            head.content_length, prior_head.content_length,
+            "prior single-part Content-Length changed"
+        );
+        let mut got = Vec::new();
+        f.get_object("buck", key, None)
+            .unwrap()
+            .body
+            .read_to_end(&mut got)
+            .unwrap();
+        assert_eq!(
+            got, original,
+            "prior single-part bytes were destroyed by a failed complete"
+        );
+
+        // No stray temp/aside files leaked next to the object.
+        let bucket_dir = f.root().join("buck");
+        for entry in std::fs::read_dir(&bucket_dir).unwrap() {
+            let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+            assert!(
+                !name.contains(".tmp.")
+                    && !name.contains(".parts.new.")
+                    && !name.contains(".parts.old."),
+                "temp/aside/swap leaked after failed complete: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn post_commit_dir_fsync_failure_does_not_roll_back() {
+        // D2 regression (load-bearing): the sidecar RENAME is the commit point. A
+        // failure of the BEST-EFFORT parent-dir fsync that runs AFTER the rename
+        // must NOT roll back the object — the new sidecar is already live, so a
+        // rollback of data/parts would leave a sidecar/data mismatch.
+        //
+        // We drive a real durable PUT (overwrite) with FORCE_DIR_FSYNC_FAIL set, so
+        // the post-rename `fsync_dir` errors. The PUT must SUCCEED and publish the
+        // NEW object (new bytes + new sidecar length/etag), not roll back to the old.
+        //
+        // Mutation evidence: make `commit_metadata_temp` propagate the post-rename
+        // fsync error as Err (the pre-D2 behavior) and this test FAILS — put_object
+        // rolls back to the prior object, so GET returns the OLD bytes.
+        use super::super::metadata::set_force_dir_fsync_fail;
+        let dir = tempfile::tempdir().unwrap();
+        let f = Filesystem::with_fsync(dir.path(), true);
+        f.create_bucket("buck").unwrap();
+
+        // Prior object.
+        let old = b"OLD-BYTES";
+        f.put_object("buck", "k", &old[..], "text/plain", um())
+            .unwrap();
+
+        // Overwrite with a forced post-commit dir-fsync failure.
+        let new = b"NEW-BYTES-THAT-MUST-BE-PUBLISHED-not-rolled-back";
+        set_force_dir_fsync_fail(true);
+        let res = f.put_object("buck", "k", &new[..], "application/x-new", um());
+        set_force_dir_fsync_fail(false);
+        assert!(
+            res.is_ok(),
+            "a post-commit dir-fsync failure must not fail the PUT (commit already done): {res:?}"
+        );
+        let new_etag = res.unwrap();
+        assert_eq!(new_etag, format!("\"{}\"", hex::encode(Md5::digest(new))));
+
+        // The NEW object is published — sidecar and data are consistent.
+        let head = f.head_object("buck", "k").unwrap();
+        assert_eq!(head.etag, new_etag, "sidecar must describe the NEW object");
+        assert_eq!(head.content_length, new.len() as i64);
+        assert_eq!(head.content_type, "application/x-new");
+        let mut got = Vec::new();
+        f.get_object("buck", "k", None)
+            .unwrap()
+            .body
+            .read_to_end(&mut got)
+            .unwrap();
+        assert_eq!(
+            got, new,
+            "object was rolled back to OLD bytes after a post-commit dir-fsync failure (sidecar/data mismatch)"
+        );
+    }
+
+    #[test]
+    fn fresh_complete_sidecar_failure_leaves_no_phantom() {
+        // D1 regression (load-bearing): a FRESH complete (no prior object at the
+        // key) that fails at the sidecar-commit step must leave NOTHING visible —
+        // the zero-byte placeholder written in step 3 must be removed on rollback,
+        // so LIST does not surface a 0-byte phantom object.
+        //
+        // Mutation evidence: remove the fresh-case placeholder removal in D1 (the
+        // `else { remove_file(&obj_path) }` branch of `restore_old!`) and this test
+        // FAILS — LIST returns a phantom `mp.bin` 0-byte object.
+        let (_d, f) = fs();
+        f.create_bucket("buck").unwrap();
+        let key = "mp.bin";
+
+        let uid = f.create_multipart_upload("buck", key, "", um()).unwrap();
+        let p1 = vec![7u8; 5 * 1024 * 1024];
+        let e1 = f.upload_part("buck", key, &uid, 1, &p1[..]).unwrap();
+
+        FORCE_SIDECAR_FAIL.with(|c| c.set(true));
+        let res = f.complete_multipart_upload(
+            "buck",
+            key,
+            &uid,
+            &[CompletePart {
+                part_number: 1,
+                etag: e1,
+            }],
+        );
+        FORCE_SIDECAR_FAIL.with(|c| c.set(false));
+        assert!(
+            res.is_err(),
+            "forced sidecar failure must make complete error"
+        );
+
+        // Nothing is published: no placeholder data file, no sidecar, no LIST entry.
+        assert!(
+            !f.root().join("buck").join(key).exists(),
+            "fresh failed complete left a 0-byte phantom data file at {key}"
+        );
+        assert!(matches!(
+            f.head_object("buck", key),
+            Err(StorageError::ObjectNotFound)
+        ));
+        let out = f
+            .list_objects(&ListObjectsInput {
+                bucket: "buck".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(
+            out.objects.is_empty(),
+            "fresh failed complete left a phantom object visible in LIST: {:?}",
+            out.objects.iter().map(|o| &o.key).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn max_keys_zero_vs_absent() {
         // F14 regression: explicit max-keys=0 returns 0 keys with IsTruncated
         // true (non-empty bucket); absent max-keys defaults to 1000.
@@ -3814,5 +4140,274 @@ mod tests {
         // Empty-bucket arg still scans all (server passes the real bucket though).
         let all = f.list_multipart_uploads("").unwrap();
         assert_eq!(all.len(), 1);
+    }
+
+    // ---- D3: per-key publish lock ----
+
+    /// D3 helper: assert that whatever is currently published at `{bucket}/{key}`
+    /// is INTERNALLY CONSISTENT — the sidecar's recorded length/etag match the
+    /// bytes a GET actually streams, and (for multipart) every manifest part exists
+    /// with the recorded size. Returns Ok(()) for a consistent object OR for a
+    /// cleanly-absent object; returns Err describing any cross-paired mismatch.
+    fn assert_object_consistent(
+        f: &Filesystem,
+        bucket: &str,
+        key: &str,
+    ) -> std::result::Result<(), String> {
+        let head = match f.head_object(bucket, key) {
+            Ok(h) => h,
+            Err(StorageError::ObjectNotFound) => return Ok(()), // cleanly deleted
+            Err(e) => return Err(format!("head_object errored unexpectedly: {e:?}")),
+        };
+        // For multipart, each manifest part must exist with the recorded size.
+        if let Some(parts) = &head.multipart {
+            let mut sum = 0u64;
+            for p in parts {
+                let md = std::fs::metadata(&p.path)
+                    .map_err(|e| format!("manifest part {} missing: {e}", p.path))?;
+                if md.len() != p.size {
+                    return Err(format!(
+                        "manifest part {} size {} != recorded {}",
+                        p.path,
+                        md.len(),
+                        p.size
+                    ));
+                }
+                sum += p.size;
+            }
+            if sum as i64 != head.content_length {
+                return Err(format!(
+                    "multipart sidecar content_length {} != sum of parts {}",
+                    head.content_length, sum
+                ));
+            }
+        }
+        // GET must succeed and stream exactly content_length bytes whose MD5 (for
+        // single-part) matches the sidecar ETag — i.e. the sidecar describes THIS
+        // data, never another writer's.
+        let mut res = match f.get_object(bucket, key, None) {
+            Ok(r) => r,
+            Err(StorageError::ObjectNotFound) => {
+                // head saw a sidecar but the body is gone: that is exactly the
+                // cross-paired inconsistency we are guarding against (unless a
+                // concurrent delete removed the data between head and get — but
+                // delete removes the sidecar FIRST, so head would have failed).
+                return Err("head saw a sidecar but get_object found no body".into());
+            }
+            Err(e) => return Err(format!("get_object errored: {e:?}")),
+        };
+        let mut body = Vec::new();
+        res.body
+            .read_to_end(&mut body)
+            .map_err(|e| format!("reading body failed: {e}"))?;
+        if body.len() as i64 != head.content_length {
+            return Err(format!(
+                "body len {} != sidecar content_length {}",
+                body.len(),
+                head.content_length
+            ));
+        }
+        if !head.is_multipart() {
+            let want = format!("\"{}\"", hex::encode(Md5::digest(&body)));
+            if want != head.etag {
+                return Err(format!(
+                    "single-part body MD5 {want} != sidecar etag {} (cross-paired data!)",
+                    head.etag
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_same_key_publish_stays_consistent() {
+        // D3 stress test: many threads concurrently PUT (single-part), Complete
+        // (multipart), and Delete the SAME key. After each round, whatever is
+        // published must be internally consistent — a sidecar must never describe
+        // another writer's data/parts. The per-key publish lock serializes the
+        // mutate-and-publish critical sections so no cross-paired state is observed.
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        // Use non-durable mode so the stress test runs fast; the lock is the same.
+        let f = Arc::new(Filesystem::with_fsync(dir.path(), false));
+        f.create_bucket("buck").unwrap();
+        let key = "hot.key";
+
+        let rounds = 40;
+        let workers = 8;
+        for _ in 0..rounds {
+            let mut handles = Vec::new();
+            for w in 0..workers {
+                let f = Arc::clone(&f);
+                handles.push(std::thread::spawn(move || {
+                    match w % 3 {
+                        // Single-part PUT with a distinctive payload per worker.
+                        0 => {
+                            let data = vec![(0x40 + w) as u8; 4096 + w as usize * 13];
+                            let _ = f.put_object("buck", key, &data[..], "text/plain", um());
+                        }
+                        // Multipart complete (2 parts) per worker.
+                        1 => {
+                            if let Ok(uid) = f.create_multipart_upload("buck", key, "", um()) {
+                                let p1 = vec![(0x10 + w) as u8; 5 * 1024 * 1024];
+                                let p2 = vec![(0x20 + w) as u8; 1000 + w as usize];
+                                if let (Ok(e1), Ok(e2)) = (
+                                    f.upload_part("buck", key, &uid, 1, &p1[..]),
+                                    f.upload_part("buck", key, &uid, 2, &p2[..]),
+                                ) {
+                                    let _ = f.complete_multipart_upload(
+                                        "buck",
+                                        key,
+                                        &uid,
+                                        &[
+                                            CompletePart {
+                                                part_number: 1,
+                                                etag: e1,
+                                            },
+                                            CompletePart {
+                                                part_number: 2,
+                                                etag: e2,
+                                            },
+                                        ],
+                                    );
+                                    // Best-effort cleanup of any orphaned upload dir.
+                                    let _ = f.abort_multipart_upload("buck", key, &uid);
+                                }
+                            }
+                        }
+                        // Delete.
+                        _ => {
+                            let _ = f.delete_object("buck", key);
+                        }
+                    }
+                }));
+            }
+            for h in handles {
+                h.join().unwrap();
+            }
+            // The published state must be internally consistent after each round.
+            assert_object_consistent(&f, "buck", key).unwrap_or_else(|e| {
+                panic!("inconsistent published object after concurrent round: {e}")
+            });
+        }
+        // Final state is also consistent, and the suite stays green.
+        assert_object_consistent(&f, "buck", key)
+            .unwrap_or_else(|e| panic!("final inconsistent state: {e}"));
+    }
+
+    // ---- D4: DeleteBucket must not follow symlinks ----
+
+    #[test]
+    fn delete_bucket_rejects_symlinked_dir() {
+        // D4 regression (load-bearing): a bucket path that is actually a SYMLINK to
+        // an external directory must be rejected by delete_bucket (NoSuchBucket),
+        // NOT followed — otherwise its emptiness scan / remove_dir_all(.multipart)
+        // would operate outside the data root. A real empty bucket still deletes.
+        //
+        // Mutation evidence: route delete_bucket's existence check back through
+        // `std::fs::metadata` (follows symlinks) and this test FAILS — the symlinked
+        // bucket is accepted and (being empty) deleted, removing the external link.
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let f = Filesystem::new(&root);
+
+        // External empty directory the symlink points at.
+        let outside = tempfile::tempdir().unwrap();
+        let linked = root.join("linkbucket");
+        symlink(outside.path(), &linked).unwrap();
+
+        assert!(
+            matches!(
+                f.delete_bucket("linkbucket"),
+                Err(StorageError::BucketNotFound)
+            ),
+            "symlinked bucket dir must be rejected by delete_bucket"
+        );
+        // The symlink must still exist (delete must not have removed/followed it).
+        assert!(
+            std::fs::symlink_metadata(&linked).is_ok(),
+            "delete_bucket removed/followed the symlinked bucket"
+        );
+        // The external dir must be untouched.
+        assert!(outside.path().exists());
+
+        // A REAL empty bucket still deletes cleanly.
+        f.create_bucket("realbucket").unwrap();
+        f.delete_bucket("realbucket").unwrap();
+        assert!(matches!(
+            f.head_bucket("realbucket"),
+            Err(StorageError::BucketNotFound)
+        ));
+    }
+
+    // ---- D5: multipart meta.json read must not follow symlinks ----
+
+    #[test]
+    fn multipart_meta_json_not_followed_via_symlink() {
+        // D5 regression (load-bearing): a SYMLINKED `.multipart/{uuid}/meta.json`
+        // (pointing at an outside-root JSON) must NOT be followed when reading the
+        // upload metadata — both list_multipart_uploads and assert_upload_matches
+        // (used by upload_part/complete/abort/list_parts) read it with O_NOFOLLOW,
+        // so the op errors/skips instead of reading outside the data root.
+        //
+        // Mutation evidence: revert the meta.json reads to `std::fs::read` and this
+        // test FAILS — the external meta.json is read and the planted upload is
+        // operated on (list_parts/abort succeed against it).
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let f = Filesystem::new(&root);
+        f.create_bucket("buck").unwrap();
+
+        // A valid upload meta.json living OUTSIDE the data root.
+        let outside = tempfile::tempdir().unwrap();
+        let external_meta = outside.path().join("external-meta.json");
+        let planted = MultipartUpload {
+            upload_id: Uuid::new_v4().to_string(),
+            bucket: "buck".into(),
+            key: "victim".into(),
+            initiated_unix: now_unix(),
+            content_type: String::new(),
+            user_metadata: um(),
+        };
+        std::fs::write(&external_meta, serde_json::to_vec(&planted).unwrap()).unwrap();
+
+        // Create a real upload dir, then replace its meta.json with a symlink to
+        // the external file.
+        let uid = planted.upload_id.clone();
+        let upload_dir = root.join(MULTIPART_DIR).join(&uid);
+        std::fs::create_dir_all(upload_dir.join("parts")).unwrap();
+        let meta_link = upload_dir.join("meta.json");
+        symlink(&external_meta, &meta_link).unwrap();
+
+        // assert_upload_matches (via list_parts) must NOT read through the symlink.
+        assert!(
+            matches!(
+                f.list_parts("buck", "victim", &uid),
+                Err(StorageError::NoSuchUpload) | Err(StorageError::Io(_))
+            ),
+            "list_parts must not follow a symlinked meta.json"
+        );
+        assert!(
+            matches!(
+                f.abort_multipart_upload("buck", "victim", &uid),
+                Err(StorageError::NoSuchUpload) | Err(StorageError::Io(_))
+            ),
+            "abort must not follow a symlinked meta.json"
+        );
+        // list_multipart_uploads must SKIP (not read through) the symlinked meta.json
+        // — the symlinked upload must not appear in the listing.
+        let ups = f.list_multipart_uploads("buck").unwrap();
+        assert!(
+            !ups.iter().any(|u| u.key == "victim"),
+            "list_multipart_uploads read a symlinked meta.json and surfaced the external upload"
+        );
+
+        // The external meta.json must be untouched (abort must not have deleted it).
+        assert!(
+            external_meta.exists(),
+            "abort followed/deleted the external meta.json"
+        );
     }
 }
