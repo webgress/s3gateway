@@ -1,0 +1,69 @@
+[package]
+name = "s3gateway-rs"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Max-throughput, S3-compatible object storage gateway (Rust library + binary)"
+
+[[bin]]
+name = "s3gateway-rs"
+path = "src/main.rs"
+
+[lib]
+name = "s3gateway_rs"
+path = "src/lib.rs"
+
+[dependencies]
+# Async runtime + HTTP (coder-2 builds the server/handlers on these)
+tokio = { version = "1", features = ["full"] }
+hyper = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+http-body-util = "0.1"
+
+# TLS / kTLS (coder-2's offload path). Use the `ring` crypto provider (no C/NASM
+# toolchain needed); ktls re-exports the matching provider features.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+ktls = { version = "6", default-features = false, features = ["ring"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+quick-xml = { version = "0.36", features = ["serialize"] }
+
+# Crypto / hashing
+md-5 = "0.10"
+sha2 = "0.10"
+hmac = "0.12"
+hex = "0.4"
+
+# Low-level filesystem syscalls (O_DIRECT, pread/pwrite, openat, rename, fsync)
+rustix = { version = "0.38", features = ["fs", "mm"] }
+
+# Thread-per-core + socket tuning (coder-2)
+core_affinity = "0.8"
+socket2 = { version = "0.5", features = ["all"] }
+
+# Raw setsockopt for the kTLS-availability pre-check (TCP_ULP "tls"). Already in
+# the dependency tree transitively (via ktls-sys); pinned here so the probe can
+# detect whether the kernel `tls` ULP is loadable before we commit a connection.
+libc = "0.2"
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+
+# Misc
+uuid = { version = "1", features = ["v4"] }
+thiserror = "1"
+bytes = "1"
+num_cpus = "1"
+tokio-util = { version = "0.7.18", features = ["io", "io-util"] }
+futures-util = { version = "0.3.32", default-features = false, features = ["std"] }
+rustls-pemfile = "2"
+
+[dev-dependencies]
+tempfile = "3"

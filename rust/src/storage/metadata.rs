@@ -1,0 +1,163 @@
+//! `.s3meta` JSON sidecar files.
+//!
+//! Ported from the Go `internal/storage/metadata.go`, extended to record
+//! multipart manifests so multipart objects can be reassembled on read without
+//! ever concatenating parts on disk.
+
+use std::collections::BTreeMap;
+use std::io;
+use std::path::Path;
+
+use serde::{Deserialize, Serialize};
+
+/// One stored part of a multipart object (kept on disk under `.multipart`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PartRef {
+    pub part_number: i32,
+    /// Absolute or root-relative path to the part data file.
+    pub path: String,
+    pub size: u64,
+    /// Hex MD5 of this part's bytes (no quotes).
+    pub md5_hex: String,
+}
+
+/// Object metadata sidecar. `multipart` is `Some` for objects stored as parts.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ObjectMetadata {
+    pub content_type: String,
+    pub content_length: i64,
+    /// ETag including surrounding quotes (S3 wire format).
+    pub etag: String,
+    /// Last-modified as Unix seconds (UTC).
+    pub last_modified: i64,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub user_metadata: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub content_disposition: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub content_encoding: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub cache_control: String,
+    /// Present for multipart objects: ordered parts to stream on read.
+    /// NOTE: this is the key design point — multipart objects are NOT
+    /// concatenated into a single file; they are reassembled on read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub multipart: Option<Vec<PartRef>>,
+}
+
+impl ObjectMetadata {
+    pub fn is_multipart(&self) -> bool {
+        self.multipart.is_some()
+    }
+}
+
+/// Write metadata atomically (temp file + rename), matching the Go impl.
+pub fn write_metadata(path: &Path, meta: &ObjectMetadata) -> io::Result<()> {
+    let data =
+        serde_json::to_vec_pretty(meta).map_err(io::Error::other)?;
+    let tmp = with_suffix(path, ".tmp");
+    std::fs::write(&tmp, &data)?;
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
+/// Read+parse a metadata sidecar.
+pub fn read_metadata(path: &Path) -> io::Result<ObjectMetadata> {
+    let data = std::fs::read(path)?;
+    serde_json::from_slice(&data).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+fn with_suffix(path: &Path, suffix: &str) -> std::path::PathBuf {
+    let mut s = path.as_os_str().to_owned();
+    s.push(suffix);
+    std::path::PathBuf::from(s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample() -> ObjectMetadata {
+        let mut um = BTreeMap::new();
+        um.insert("x-amz-meta-foo".to_string(), "bar".to_string());
+        ObjectMetadata {
+            content_type: "text/plain".into(),
+            content_length: 11,
+            etag: "\"abc\"".into(),
+            last_modified: 1_700_000_000,
+            user_metadata: um,
+            content_disposition: String::new(),
+            content_encoding: String::new(),
+            cache_control: String::new(),
+            multipart: None,
+        }
+    }
+
+    #[test]
+    fn round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("o.s3meta");
+        let m = sample();
+        write_metadata(&p, &m).unwrap();
+        let read = read_metadata(&p).unwrap();
+        assert_eq!(read, m);
+    }
+
+    #[test]
+    fn empty_optionals_omitted_in_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("o.s3meta");
+        let mut m = sample();
+        m.user_metadata.clear();
+        write_metadata(&p, &m).unwrap();
+        let raw = std::fs::read_to_string(&p).unwrap();
+        assert!(!raw.contains("user_metadata"));
+        assert!(!raw.contains("multipart"));
+    }
+
+    #[test]
+    fn multipart_manifest_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("o.s3meta");
+        let mut m = sample();
+        m.multipart = Some(vec![
+            PartRef {
+                part_number: 1,
+                path: "/data/.multipart/u/parts/00001".into(),
+                size: 5,
+                md5_hex: "aaaa".into(),
+            },
+            PartRef {
+                part_number: 2,
+                path: "/data/.multipart/u/parts/00002".into(),
+                size: 6,
+                md5_hex: "bbbb".into(),
+            },
+        ]);
+        write_metadata(&p, &m).unwrap();
+        let read = read_metadata(&p).unwrap();
+        assert!(read.is_multipart());
+        assert_eq!(read.multipart.as_ref().unwrap().len(), 2);
+        assert_eq!(read, m);
+    }
+
+    #[test]
+    fn corrupt_json_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("bad.s3meta");
+        std::fs::write(&p, b"{not json").unwrap();
+        assert!(read_metadata(&p).is_err());
+    }
+
+    #[test]
+    fn missing_file_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("nope.s3meta");
+        assert!(read_metadata(&p).is_err());
+    }
+}
