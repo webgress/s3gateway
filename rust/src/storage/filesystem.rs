@@ -199,6 +199,160 @@ fn force_sidecar_fail() -> bool {
     std::env::var_os("S3GW_FORCE_SIDECAR_FAIL").is_some()
 }
 
+/// Test-only, DETERMINISTIC injection points that let a test reproduce the exact
+/// two-writer interleaving the per-key publish lock (`lock_key`) exists to
+/// prevent — without any sleeps or timing races.
+///
+/// Two cooperating hooks, both armed for one specific `{bucket}/{key}`:
+///  * [`PauseHook::pause`] — called at the publish CRITICAL WINDOW (after the
+///    data file is renamed into place, before the `.s3meta` sidecar is
+///    committed). The FIRST matching writer to arrive (writer A) parks here and
+///    blocks until the test releases it.
+///  * [`PauseHook::note_lock_contention`] — called from `lock_key` when a thread
+///    is about to BLOCK on an already-held per-key mutex. With the real lock,
+///    writer B hits this before ever reaching the window. With the lock
+///    removed/neutered, B feels no contention and instead reaches the window
+///    itself (a SECOND `pause` arrival, which passes straight through).
+///
+/// The test waits for EXACTLY ONE of {B-blocked-on-lock, B-reached-window} to
+/// fire — that single event is the deterministic distinguisher between a real
+/// and a neutered lock, and it tells the test how to drive the rest without
+/// deadlocking (see the test for the full protocol).
+///
+/// The whole mechanism is `#[cfg(test)]` only: in non-test builds both call
+/// sites (`publish_window_pause`, `note_lock_contention`) compile to empty
+/// inline fns, so there is ZERO effect on, and ZERO cost in, the production hot
+/// path.
+#[cfg(test)]
+mod publish_pause {
+    use std::sync::{Condvar, Mutex, OnceLock};
+
+    pub(super) struct PauseHook {
+        pub key: String,
+        state: Mutex<State>,
+        cv: Condvar,
+    }
+
+    #[derive(Default)]
+    struct State {
+        /// A matching writer has reached the critical window (writer A).
+        window_arrived: bool,
+        /// The test has released the parked writer.
+        released: bool,
+        /// A SECOND writer reached the window (only possible without the lock).
+        second_window: bool,
+        /// A writer is about to block on the (real) per-key lock — i.e. the lock
+        /// is doing its job and serializing.
+        lock_contended: bool,
+    }
+
+    static HOOK: OnceLock<Mutex<Option<&'static PauseHook>>> = OnceLock::new();
+
+    fn slot() -> &'static Mutex<Option<&'static PauseHook>> {
+        HOOK.get_or_init(|| Mutex::new(None))
+    }
+
+    impl PauseHook {
+        /// Arm a fresh hook for `key`. Returns a leaked `'static` reference so the
+        /// publishing/locking threads can read it without lifetime gymnastics —
+        /// test-only, so the small one-shot leak is harmless.
+        pub(super) fn arm(key: &str) -> &'static PauseHook {
+            let hook: &'static PauseHook = Box::leak(Box::new(PauseHook {
+                key: key.to_string(),
+                state: Mutex::new(State::default()),
+                cv: Condvar::new(),
+            }));
+            *slot().lock().unwrap() = Some(hook);
+            hook
+        }
+
+        /// Disarm the global hook (called by the test once it is done).
+        pub(super) fn disarm() {
+            *slot().lock().unwrap() = None;
+        }
+
+        /// Block until writer A has parked at the critical window.
+        pub(super) fn wait_window_arrived(&self) {
+            let mut st = self.state.lock().unwrap();
+            while !st.window_arrived {
+                st = self.cv.wait(st).unwrap();
+            }
+        }
+
+        /// Block until EITHER writer B blocked on the real lock OR writer B
+        /// reached the window itself (no lock). Returns `true` iff B blocked on
+        /// the lock (real lock present), `false` iff B reached the window
+        /// (lock absent/neutered).
+        pub(super) fn wait_b_disposition(&self) -> bool {
+            let mut st = self.state.lock().unwrap();
+            while !st.lock_contended && !st.second_window {
+                st = self.cv.wait(st).unwrap();
+            }
+            st.lock_contended
+        }
+
+        /// Release the parked writer (writer A).
+        pub(super) fn release(&self) {
+            let mut st = self.state.lock().unwrap();
+            st.released = true;
+            self.cv.notify_all();
+        }
+    }
+
+    /// Publish critical-window hook. The first matching writer parks and blocks
+    /// until released; a second matching writer (only reachable without the
+    /// lock) records `second_window` and passes straight through.
+    pub(super) fn pause(bucket: &str, key: &str) {
+        let hook = { *slot().lock().unwrap() };
+        let Some(hook) = hook else { return };
+        if hook.key != format!("{bucket}/{key}") {
+            return;
+        }
+        let mut st = hook.state.lock().unwrap();
+        if st.window_arrived {
+            // A SECOND writer reached the window — impossible with the lock held.
+            st.second_window = true;
+            hook.cv.notify_all();
+            return;
+        }
+        st.window_arrived = true;
+        hook.cv.notify_all();
+        while !st.released {
+            st = hook.cv.wait(st).unwrap();
+        }
+    }
+
+    /// Lock-contention hook: record that a writer is about to block on the
+    /// already-held per-key lock for this key (proof the lock is serializing).
+    pub(super) fn note_lock_contention(bucket: &str, key: &str) {
+        let hook = { *slot().lock().unwrap() };
+        let Some(hook) = hook else { return };
+        if hook.key != format!("{bucket}/{key}") {
+            return;
+        }
+        let mut st = hook.state.lock().unwrap();
+        st.lock_contended = true;
+        hook.cv.notify_all();
+    }
+}
+
+/// Publish-window pause point (post data rename, pre sidecar commit). No-op
+/// outside tests; see [`publish_pause`] for the deterministic test hook.
+#[inline(always)]
+fn publish_window_pause(_bucket: &str, _key: &str) {
+    #[cfg(test)]
+    publish_pause::pause(_bucket, _key);
+}
+
+/// Per-key-lock contention observation point — test-only; the sole caller is
+/// the `#[cfg(test)]` probe in `lock_key`, so the whole fn is gated out of
+/// production builds. See [`publish_pause`] for the deterministic test hook.
+#[cfg(test)]
+#[inline(always)]
+fn note_lock_contention(bucket: &str, key: &str) {
+    publish_pause::note_lock_contention(bucket, key);
+}
+
 impl Filesystem {
     /// Create a store rooted at `root` with durable publication enabled (fsync).
     pub fn new(root: impl Into<PathBuf>) -> Self {
@@ -238,6 +392,16 @@ impl Filesystem {
             h = h.wrapping_mul(0x0000_0100_0000_01b3);
         }
         let idx = (h as usize) & (KEY_LOCK_SHARDS - 1);
+        // Test-only contention probe: if the shard is already held, record that
+        // this writer is about to BLOCK on the per-key lock (proof the lock is
+        // serializing) before we actually block. No-op / not compiled in
+        // production — the real acquire below is unchanged.
+        #[cfg(test)]
+        {
+            if self.key_locks[idx].try_lock().is_err() {
+                note_lock_contention(bucket, key);
+            }
+        }
         self.key_locks[idx]
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -446,6 +610,14 @@ impl Filesystem {
             return Err(e.into());
         }
         guard.disarm();
+
+        // D3 verification hook: the per-key publish lock must hold across THIS
+        // window — data is now renamed into place but the sidecar describing it
+        // has NOT been committed yet. A deterministic test pauses writer A here
+        // and lets writer B publish the same key; with the lock present B blocks
+        // on `lock_key` until A commits, so no cross-pair is possible. No-op in
+        // production builds.
+        publish_window_pause(bucket, key);
 
         // C2 verification hook: force the sidecar-commit step to fail so the
         // rollback (restore prior data + prior sidecar) can be exercised.
@@ -4293,6 +4465,132 @@ mod tests {
         // Final state is also consistent, and the suite stays green.
         assert_object_consistent(&f, "buck", key)
             .unwrap_or_else(|e| panic!("final inconsistent state: {e}"));
+    }
+
+    #[test]
+    fn publish_lock_prevents_cross_pair_deterministic() {
+        // D3 LOAD-BEARING regression. Unlike the quiescent stress test above
+        // (which inspects only the settled post-join state and therefore passes
+        // even with the lock neutered), this test forces the exact interleaving
+        // the lock exists to prevent, and is DETERMINISTIC (Condvar handshakes,
+        // no sleeps/timing races):
+        //
+        //   writer A: rename data-A into place ──┐ (parked HERE, pre-sidecar)
+        //                                        │   window the lock holds across
+        //   writer B: publish data-B + sidecar-B ┘   (same key)
+        //   writer A: commit sidecar-A           => CROSS-PAIR if not serialized
+        //
+        // Protocol:
+        //  1. Arm the pause hook for buck/{key}. Spawn A; it acquires the lock,
+        //     renames data-A, parks at the window (still holding the lock).
+        //  2. Wait until A has parked (wait_window_arrived).
+        //  3. Spawn B (same key). Then wait for B's DISPOSITION:
+        //       - real lock  => B blocks on `lock_key` (note_lock_contention),
+        //         wait_b_disposition() == true. We release A; A commits sidecar-A,
+        //         frees the lock; B then runs its whole section cleanly. Join both.
+        //         Final state is a CLEAN winner (A's body+sidecar or B's), never
+        //         a cross-pair.
+        //       - lock neutered => B feels no contention, reaches the window
+        //         itself (second_window), wait_b_disposition() == false. B passes
+        //         straight through and FULLY publishes data-B+sidecar-B; we join B
+        //         FIRST (it is not blocked), THEN release A so A commits sidecar-A
+        //         ON TOP of sidecar-B => sidecar-A paired with body-B == CROSS-PAIR.
+        //  4. assert_object_consistent + an exact A-or-B match catch any cross-pair
+        //     (body-MD5 != sidecar-ETag), so the test FAILS iff the lock is gone.
+        //
+        // Fail-without-fix evidence: neuter `lock_key` so every call hands out a
+        // guard on its OWN throwaway leaked mutex (no mutual exclusion), e.g.
+        //     fn lock_key(&self, _b: &str, _k: &str) -> std::sync::MutexGuard<'_, ()> {
+        //         Box::leak(Box::new(std::sync::Mutex::new(()))).lock().unwrap()
+        //     }
+        // and this test FAILS ("cross-paired data!"); the real lock makes it PASS.
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        // Non-durable for speed; the per-key lock behaves identically.
+        let f = Arc::new(Filesystem::with_fsync(dir.path(), false));
+        f.create_bucket("buck").unwrap();
+        let key = "hot.key";
+
+        // Distinctive, different-length payloads so any cross-pair (A's sidecar
+        // length/etag vs B's bytes, or vice versa) is unambiguous.
+        let data_a = vec![0xAAu8; 8192];
+        let data_b = vec![0xBBu8; 4096 + 7];
+
+        // Arm the deterministic hooks for this exact key BEFORE spawning writers.
+        let hook = publish_pause::PauseHook::arm(&format!("buck/{key}"));
+
+        // Writer A: acquires the lock, renames data-A, parks at the window.
+        let fa = Arc::clone(&f);
+        let da = data_a.clone();
+        let a = std::thread::spawn(move || fa.put_object("buck", key, &da[..], "text/a", um()));
+
+        // Deterministically wait until A is parked inside the critical window
+        // (data-A renamed into place, sidecar-A not yet committed).
+        hook.wait_window_arrived();
+
+        // Writer B: publishes the SAME key while A is parked.
+        let fb = Arc::clone(&f);
+        let db = data_b.clone();
+        let b = std::thread::spawn(move || fb.put_object("buck", key, &db[..], "text/b", um()));
+
+        // Deterministically classify B: blocked on the lock (real lock) vs.
+        // reached the window itself (lock absent). No sleeps.
+        let b_blocked_on_lock = hook.wait_b_disposition();
+
+        let (ra, rb) = if b_blocked_on_lock {
+            // Real lock: B is parked on `lock_key`. Release A; it commits and
+            // frees the lock, then B proceeds. Safe to join both afterwards.
+            hook.release();
+            let ra = a.join().unwrap();
+            let rb = b.join().unwrap();
+            (ra, rb)
+        } else {
+            // Lock neutered: B raced into the window with no exclusion and will
+            // fully publish data-B+sidecar-B. Join B FIRST (it is not blocked),
+            // THEN release A so A's sidecar-A lands ON TOP of sidecar-B — the
+            // exact cross-pair the lock would have prevented.
+            let rb = b.join().unwrap();
+            hook.release();
+            let ra = a.join().unwrap();
+            (ra, rb)
+        };
+        publish_pause::PauseHook::disarm();
+        assert!(ra.is_ok(), "writer A failed: {ra:?}");
+        assert!(rb.is_ok(), "writer B failed: {rb:?}");
+
+        // THE LOAD-BEARING ASSERTION: the published object must be internally
+        // consistent — the sidecar's ETag/content_length must match the on-disk
+        // body bytes. A cross-pair (A's sidecar + B's body, or B's sidecar + A's
+        // body) trips this.
+        assert_object_consistent(&f, "buck", key).unwrap_or_else(|e| {
+            panic!(
+                "cross-paired published object — the per-key publish lock did not \
+                 serialize the two writers' critical sections: {e}"
+            )
+        });
+
+        // Stronger: the surviving object must be EXACTLY one of the two writers'
+        // (bytes + matching ETag + content-type), never a Frankenstein mix.
+        let head = f.head_object("buck", key).unwrap();
+        let mut body = Vec::new();
+        f.get_object("buck", key, None)
+            .unwrap()
+            .body
+            .read_to_end(&mut body)
+            .unwrap();
+        let etag_a = format!("\"{}\"", hex::encode(Md5::digest(&data_a)));
+        let etag_b = format!("\"{}\"", hex::encode(Md5::digest(&data_b)));
+        let is_a = body == data_a && head.etag == etag_a && head.content_type == "text/a";
+        let is_b = body == data_b && head.etag == etag_b && head.content_type == "text/b";
+        assert!(
+            is_a || is_b,
+            "published object is neither a clean A nor a clean B (cross-pair): \
+             body_len={}, etag={}, content_type={}",
+            body.len(),
+            head.etag,
+            head.content_type
+        );
     }
 
     // ---- D4: DeleteBucket must not follow symlinks ----
