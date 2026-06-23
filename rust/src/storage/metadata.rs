@@ -107,6 +107,59 @@ pub fn write_metadata_durable(path: &Path, meta: &ObjectMetadata) -> io::Result<
     Ok(())
 }
 
+/// Write a metadata sidecar to an explicit temp path and fsync its bytes to
+/// stable storage, WITHOUT renaming it into place. Used by the multipart-complete
+/// commit sequence (C1), where the sidecar rename is deferred to be the LAST
+/// durable step so nothing the prior object's live sidecar references changes
+/// until the new sidecar is committed. Pair with [`commit_metadata_temp`].
+pub fn write_metadata_temp_durable(tmp: &Path, meta: &ObjectMetadata) -> io::Result<()> {
+    use super::directio::DioFile;
+    let data = serde_json::to_vec_pretty(meta).map_err(io::Error::other)?;
+    let f = DioFile::create_write(tmp)?;
+    let mut off = 0u64;
+    let mut buf: &[u8] = &data;
+    while !buf.is_empty() {
+        let n = f.pwrite_at(buf, off)?;
+        if n == 0 {
+            let _ = std::fs::remove_file(tmp);
+            return Err(io::Error::new(io::ErrorKind::WriteZero, "pwrite wrote 0"));
+        }
+        off += n as u64;
+        buf = &buf[n..];
+    }
+    f.fsync()?;
+    Ok(())
+}
+
+/// Write a metadata sidecar to an explicit temp path (non-durable: no fsync),
+/// WITHOUT renaming it into place. Non-durable companion to
+/// [`write_metadata_temp_durable`] for the `--fsync false` path.
+pub fn write_metadata_temp(tmp: &Path, meta: &ObjectMetadata) -> io::Result<()> {
+    let data = serde_json::to_vec_pretty(meta).map_err(io::Error::other)?;
+    std::fs::write(tmp, &data)
+}
+
+/// Commit a previously-staged temp sidecar (from [`write_metadata_temp_durable`]
+/// or [`write_metadata_temp`]) by renaming it into place at `path`. When
+/// `durable`, the parent directory is fsynced afterward so the rename survives a
+/// crash. This is the LAST durable step of the multipart-complete commit (C1).
+pub fn commit_metadata_temp(tmp: &Path, path: &Path, durable: bool) -> io::Result<()> {
+    use super::directio::fsync_dir;
+    match std::fs::rename(tmp, path) {
+        Ok(()) => {}
+        Err(e) => {
+            let _ = std::fs::remove_file(tmp);
+            return Err(e);
+        }
+    }
+    if durable {
+        if let Some(parent) = path.parent() {
+            fsync_dir(parent)?;
+        }
+    }
+    Ok(())
+}
+
 /// Read+parse a metadata sidecar.
 ///
 /// B1: open the sidecar with `O_NOFOLLOW` so a SYMLINK planted at the `.s3meta`

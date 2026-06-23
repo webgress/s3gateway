@@ -204,6 +204,9 @@ pub fn map_storage_error(e: &StorageError) -> S3ErrorCode {
         StorageError::NoSuchUpload => S3ErrorCode::NoSuchUpload,
         StorageError::InvalidPartOrder => S3ErrorCode::InvalidPartOrder,
         StorageError::InvalidPart => S3ErrorCode::InvalidPart,
+        // C3: the GET handler intercepts this BEFORE mapping (it needs the size to
+        // build the 416 `Content-Range`); this mapping is the exhaustive fallback.
+        StorageError::RangeNotSatisfiable { .. } => S3ErrorCode::InvalidRange,
         StorageError::Io(_) => S3ErrorCode::InternalError,
     }
 }

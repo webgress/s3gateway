@@ -15,6 +15,7 @@ pub use filesystem::{
     MULTIPART_DIR,
 };
 pub use metadata::{
-    read_metadata, write_metadata, write_metadata_durable, ObjectMetadata, PartRef,
+    commit_metadata_temp, read_metadata, write_metadata, write_metadata_durable,
+    write_metadata_temp, write_metadata_temp_durable, ObjectMetadata, PartRef,
 };
 pub use reader::{parse_range, ByteRange, MultipartReader, PlainFileReader};

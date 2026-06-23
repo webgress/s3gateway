@@ -21,9 +21,10 @@ use uuid::Uuid;
 use super::aligned::{AlignedBuf, DEFAULT_BUF_SIZE};
 use super::directio::{self, fsync_dir, DioFile};
 use super::metadata::{
-    read_metadata, write_metadata, write_metadata_durable, ObjectMetadata, PartRef,
+    commit_metadata_temp, read_metadata, write_metadata_temp, write_metadata_temp_durable,
+    ObjectMetadata, PartRef,
 };
-use super::reader::{ByteRange, MultipartReader, PlainFileReader};
+use super::reader::{parse_range, ByteRange, MultipartReader, PlainFileReader};
 
 pub const META_SUFFIX: &str = ".s3meta";
 pub const MULTIPART_DIR: &str = ".multipart";
@@ -50,6 +51,13 @@ pub enum StorageError {
     InvalidPartOrder,
     #[error("invalid part")]
     InvalidPart,
+    /// C3: the requested byte range is unsatisfiable for the object's actual size.
+    /// Carries the object's total size so the handler can emit the required
+    /// `Content-Range: bytes */{size}` on the 416 response. Resolved under the
+    /// SAME sidecar snapshot as the object, so the 416's size matches the object
+    /// the GET would have served (no head/get TOCTOU).
+    #[error("range not satisfiable")]
+    RangeNotSatisfiable { size: u64 },
     #[error("io error: {0}")]
     Io(#[from] io::Error),
 }
@@ -106,11 +114,18 @@ pub struct ListObjectsOutput {
 }
 
 /// Streaming result of GetObject: metadata + a boxed blocking reader.
+///
+/// C3: every field here is taken from ONE consistent snapshot — the same sidecar
+/// read + body open. The handler builds ALL response headers from this single
+/// result and never does a separate `head_object` for the GET path, so a
+/// concurrent overwrite can no longer pair headers from one version with a body
+/// from another.
 pub struct GetObjectResult {
     pub metadata: ObjectMetadata,
     pub body: Box<dyn Read + Send>,
-    /// The range actually served (None = full object).
-    pub range: Option<ByteRange>,
+    /// The range actually served, resolved against THIS object's size (None =
+    /// full object).
+    pub resolved_range: Option<ByteRange>,
     /// Full object size (regardless of range).
     pub total_size: u64,
 }
@@ -145,6 +160,30 @@ pub struct CompletePart {
 
 fn now_unix() -> i64 {
     crate::auth::time::now_unix()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only, THREAD-LOCAL injection of a forced sidecar-commit failure.
+    /// Unlike a process-global env var, a thread-local does NOT leak into other
+    /// tests running concurrently on the test runner's thread pool — so the C1/C2
+    /// regression tests can exercise the failure path without breaking unrelated
+    /// parallel tests that publish objects.
+    static FORCE_SIDECAR_FAIL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// True when a forced sidecar-commit failure should be injected. The documented
+/// gate is the `S3GW_FORCE_SIDECAR_FAIL` env var (for manual/external
+/// verification, mirroring `S3GW_FORCE_KTLS_FAIL`); in unit tests the per-thread
+/// flag above is preferred so the injection is scoped to the calling test only.
+fn force_sidecar_fail() -> bool {
+    #[cfg(test)]
+    {
+        if FORCE_SIDECAR_FAIL.with(|c| c.get()) {
+            return true;
+        }
+    }
+    std::env::var_os("S3GW_FORCE_SIDECAR_FAIL").is_some()
 }
 
 impl Filesystem {
@@ -184,8 +223,16 @@ impl Filesystem {
     pub fn head_bucket(&self, name: &str) -> Result<()> {
         self.validate_bucket_component(name)?;
         let path = self.root.join(name);
-        match std::fs::metadata(&path) {
-            Ok(m) if m.is_dir() => Ok(()),
+        // C4: use `symlink_metadata` (does NOT follow the final component) so a
+        // SYMLINKED bucket — e.g. `data-dir/bucket -> /external` — is rejected as
+        // NoSuchBucket rather than followed. `std::fs::metadata` follows symlinks,
+        // which would let head_bucket pass and ListObjectsV2 (which calls this)
+        // walk outside the data root. A real bucket is always a regular directory
+        // we created via `create_dir`, so this never rejects a legitimate bucket.
+        match std::fs::symlink_metadata(&path) {
+            Ok(m) if m.file_type().is_dir() => Ok(()),
+            // A symlink (even one pointing at a real dir inside root) is not a
+            // valid bucket — buckets are real directories.
             Ok(_) => Err(StorageError::BucketNotFound),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Err(StorageError::BucketNotFound),
             Err(e) => Err(e.into()),
@@ -294,9 +341,6 @@ impl Filesystem {
 
         let etag = format!("\"{}\"", hex::encode(hasher.finalize()));
 
-        directio::rename(&tmp_path, &obj_path)?;
-        guard.disarm();
-
         let ct = if content_type.is_empty() {
             "application/octet-stream"
         } else {
@@ -313,9 +357,84 @@ impl Filesystem {
             cache_control: String::new(),
             multipart: None,
         };
-        // Durable publication: when fsync is on, the sidecar is fsync'd and the
-        // parent dir is fsync'd (covering both the data-file and sidecar renames).
-        self.publish_sidecar(&obj_path, &meta)?;
+
+        // C2: the `.s3meta` sidecar is the commit point. Stage the sidecar to a
+        // temp (durable when --fsync) BEFORE renaming the data into place, then
+        // rename the data, then rename the sidecar LAST. On an OVERWRITE, a sidecar
+        // failure after the data rename would otherwise leave NEW data paired with
+        // the OLD sidecar's stale Content-Length/ETag — so we move the prior data
+        // aside first and roll it back if the sidecar commit fails. On a FRESH put,
+        // a sidecar failure removes the just-renamed data so no orphan remains.
+        let meta_final = meta_path(&obj_path);
+        let meta_tmp = tmp_sibling(&meta_final);
+        let mut meta_tmp_guard = TmpGuard::new(meta_tmp.clone());
+        if self.fsync {
+            write_metadata_temp_durable(&meta_tmp, &meta)?;
+        } else {
+            write_metadata_temp(&meta_tmp, &meta)?;
+        }
+
+        // Move any prior data file aside so an overwrite can be rolled back.
+        let data_aside = tmp_sibling(&obj_path);
+        let had_old_data = match directio::rename(&obj_path, &data_aside) {
+            Ok(()) => true,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+            Err(e) => return Err(e.into()),
+        };
+        let mut data_aside_guard = if had_old_data {
+            Some(TmpGuard::new(data_aside.clone()))
+        } else {
+            None
+        };
+
+        // Rename the new data into place.
+        if let Err(e) = directio::rename(&tmp_path, &obj_path) {
+            // Restore the prior data file (the aside guard would also clean it, but
+            // we want the prior object intact, not removed).
+            if had_old_data {
+                let _ = directio::rename(&data_aside, &obj_path);
+                if let Some(g) = data_aside_guard.as_mut() {
+                    g.disarm();
+                }
+            }
+            return Err(e.into());
+        }
+        guard.disarm();
+
+        // C2 verification hook: force the sidecar-commit step to fail so the
+        // rollback (restore prior data + prior sidecar) can be exercised.
+        let forced_fail = force_sidecar_fail();
+
+        // COMMIT: rename the sidecar into place LAST.
+        let commit = if forced_fail {
+            Err(io::Error::other(
+                "forced sidecar-commit failure (S3GW_FORCE_SIDECAR_FAIL)",
+            ))
+        } else {
+            commit_metadata_temp(&meta_tmp, &meta_final, self.fsync)
+        };
+        if let Err(e) = commit {
+            // Roll back the data rename so a failed PUT does not change the object.
+            if had_old_data {
+                // Overwrite: restore the prior data file (and leave the prior
+                // sidecar untouched — we never renamed it).
+                let _ = directio::rename(&data_aside, &obj_path);
+                if let Some(g) = data_aside_guard.as_mut() {
+                    g.disarm();
+                }
+            } else {
+                // Fresh PUT: remove the just-renamed data so no orphan remains.
+                let _ = std::fs::remove_file(&obj_path);
+            }
+            return Err(e.into());
+        }
+        meta_tmp_guard.disarm();
+        // Prior data file (if any) is now superseded — drop it.
+        if let Some(mut g) = data_aside_guard.take() {
+            let _ = std::fs::remove_file(&data_aside);
+            g.disarm();
+        }
+
         // A single-part PUT over a prior multipart object must drop the old
         // `{key}.parts` store (the new `.s3meta` already has `multipart: None`,
         // so GetObject reads the single file; the stale parts would just leak).
@@ -325,12 +444,22 @@ impl Filesystem {
 
     /// GetObject: returns metadata + a streaming body reader. Transparently uses
     /// the plain file reader for single-part objects and the reassemble-on-read
-    /// [`MultipartReader`] for multipart objects. Supports a byte range.
+    /// [`MultipartReader`] for multipart objects.
+    ///
+    /// C3: takes the RAW `Range` header (`Option<&str>`) and resolves it against
+    /// THIS object's own size under the SAME sidecar read/open — so metadata,
+    /// total size, the resolved range, and the body all come from ONE consistent
+    /// snapshot. The handler builds every response header from the returned
+    /// [`GetObjectResult`] and does NOT call `head_object` on the GET path, which
+    /// closes the head/get TOCTOU (a concurrent overwrite can no longer pair
+    /// headers from one version with a body from another). An unsatisfiable range
+    /// yields [`StorageError::RangeNotSatisfiable`] carrying this object's size
+    /// for the 416 `Content-Range: bytes */{size}`.
     pub fn get_object(
         &self,
         bucket: &str,
         key: &str,
-        range: Option<ByteRange>,
+        range_header: Option<&str>,
     ) -> Result<GetObjectResult> {
         self.validate_object_path(bucket, key)?;
         let obj_path = self.root.join(bucket).join(key);
@@ -346,6 +475,19 @@ impl Filesystem {
             Err(e) => return Err(e.into()),
         };
 
+        // Resolve the range against the object's own size from THIS snapshot.
+        // `parse_range` returns Ok(None) when there is no range header, Ok(Some)
+        // for a satisfiable range, or Err for an unsatisfiable one (-> 416).
+        let resolve = |total: u64| -> Result<Option<ByteRange>> {
+            match range_header {
+                Some(h) => match parse_range(h, total) {
+                    Ok(r) => Ok(r),
+                    Err(()) => Err(StorageError::RangeNotSatisfiable { size: total }),
+                },
+                None => Ok(None),
+            }
+        };
+
         if let Some(parts) = &meta.multipart {
             // B1: the manifest is trusted but defense-in-depth — a crafted sidecar
             // could list an absolute/outside-root part path (which DioFile would
@@ -353,26 +495,27 @@ impl Filesystem {
             // regular file contained in the canonical data root before streaming.
             self.validate_part_paths(parts)?;
             let total: u64 = parts.iter().map(|p| p.size).sum();
-            let body = MultipartReader::new(parts.clone(), range);
+            let resolved_range = resolve(total)?;
+            let body = MultipartReader::new(parts.clone(), resolved_range);
             return Ok(GetObjectResult {
                 metadata: meta,
                 body: Box::new(body),
-                range,
+                resolved_range,
                 total_size: total,
             });
         }
 
-        // Single-part object.
-        match PlainFileReader::open(&obj_path, range) {
-            Ok(reader) => {
-                let total = meta.content_length as u64;
-                Ok(GetObjectResult {
-                    metadata: meta,
-                    body: Box::new(reader),
-                    range,
-                    total_size: total,
-                })
-            }
+        // Single-part object. Resolve the range against the sidecar's recorded
+        // content_length (the same value the served headers report).
+        let total = meta.content_length as u64;
+        let resolved_range = resolve(total)?;
+        match PlainFileReader::open(&obj_path, resolved_range) {
+            Ok(reader) => Ok(GetObjectResult {
+                metadata: meta,
+                body: Box::new(reader),
+                resolved_range,
+                total_size: total,
+            }),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 self.head_bucket(bucket)?;
                 Err(StorageError::ObjectNotFound)
@@ -400,6 +543,9 @@ impl Filesystem {
     /// bucket deletion).
     pub fn delete_object(&self, bucket: &str, key: &str) -> Result<()> {
         self.validate_object_path(bucket, key)?;
+        // C7: a DELETE in a missing bucket is NoSuchBucket, not a silent 204.
+        // (Deleting a missing KEY in an EXISTING bucket remains idempotent/Ok.)
+        self.head_bucket(bucket)?;
         let obj_path = self.root.join(bucket).join(key);
         let _ = std::fs::remove_file(&obj_path);
         let _ = std::fs::remove_file(meta_path(&obj_path));
@@ -497,6 +643,13 @@ impl Filesystem {
         let mut count = 0i32;
         let mut oi = 0;
         let mut pi = 0;
+        // C6: the continuation token must be the LAST item actually EMITTED in
+        // sorted order — an object KEY or a common-prefix STRING, whichever was
+        // pushed last — so the next page resumes strictly after it. Taking it from
+        // `out.objects.last()` is wrong when the final emitted item was a
+        // CommonPrefix (the next page would re-emit that prefix and/or skip
+        // objects sorting between it and the last object).
+        let mut last_emitted: Option<String> = None;
         while count < max_keys && (oi < all_keys.len() || pi < common_prefixes.len()) {
             let use_obj = if oi < all_keys.len() && pi < common_prefixes.len() {
                 all_keys[oi].key <= common_prefixes[pi]
@@ -504,9 +657,11 @@ impl Filesystem {
                 oi < all_keys.len()
             };
             if use_obj {
+                last_emitted = Some(all_keys[oi].key.clone());
                 out.objects.push(all_keys[oi].clone());
                 oi += 1;
             } else {
+                last_emitted = Some(common_prefixes[pi].clone());
                 out.common_prefixes.push(common_prefixes[pi].clone());
                 pi += 1;
             }
@@ -515,10 +670,8 @@ impl Filesystem {
 
         if oi < all_keys.len() || pi < common_prefixes.len() {
             out.is_truncated = true;
-            if let Some(o) = out.objects.last() {
-                out.next_continuation_token = o.key.clone();
-            } else if let Some(p) = out.common_prefixes.last() {
-                out.next_continuation_token = p.clone();
+            if let Some(tok) = last_emitted {
+                out.next_continuation_token = tok;
             }
         }
         Ok(out)
@@ -738,8 +891,35 @@ impl Filesystem {
             multipart: Some(manifest),
         };
 
-        // --- Atomic-ish swap, ordered so a crash never destroys the prior object
-        // before the new one is published. ---
+        // --- Commit, ordered so the SIDECAR is the atomic commit point. ---
+        //
+        // C1: the prior object stays fully consistent (its live `.s3meta` and the
+        // `parts_store` bytes it references) until the NEW sidecar is durably
+        // committed by rename as the LAST step. The hazard the old ordering had:
+        // both the old and new sidecars' manifests reference `parts_store/NNNNN`,
+        // so once the new parts are swapped into `parts_store` while the OLD
+        // sidecar is still live, the old sidecar reads NEW bytes with OLD sizes —
+        // a publish failure then leaves the prior object corrupted. The fix:
+        //   0. stage the new sidecar to a TEMP (fsync'd) before touching anything
+        //      the old sidecar references;
+        //   1. move the old store aside; swap the staged store into `parts_store`;
+        //      write the placeholder;
+        //   2. COMMIT by renaming the temp sidecar into place (last durable step);
+        //   3. only AFTER the commit, remove the old store.
+        // On ANY failure before the sidecar commit, restore `parts_store` from
+        // `old_aside` so the old sidecar + parts remain mutually consistent.
+
+        // 0. Stage the new sidecar to a temp (durable when --fsync) FIRST. Nothing
+        // the old sidecar references has changed yet.
+        let meta_final = meta_path(&obj_path);
+        let meta_tmp = tmp_sibling(&meta_final);
+        let mut meta_tmp_guard = TmpGuard::new(meta_tmp.clone());
+        if self.fsync {
+            write_metadata_temp_durable(&meta_tmp, &meta)?;
+        } else {
+            write_metadata_temp(&meta_tmp, &meta)?;
+        }
+
         // 1. Move any existing published store ASIDE (don't delete yet).
         let old_aside = aside_parts_dir(&obj_path);
         let had_old = match directio::rename(&parts_store, &old_aside) {
@@ -747,49 +927,63 @@ impl Filesystem {
             Err(e) if e.kind() == io::ErrorKind::NotFound => false,
             Err(e) => return Err(e.into()),
         };
+        // Helper: restore the prior object's parts on any failure before commit so
+        // the (still-live) old sidecar + parts stay consistent.
+        macro_rules! restore_old {
+            () => {{
+                if std::fs::metadata(&parts_store).is_ok() {
+                    // The staged store is in place; move it back to `staging`.
+                    let _ = directio::rename(&parts_store, &staging);
+                    staging_guard.rearm();
+                }
+                if had_old {
+                    let _ = directio::rename(&old_aside, &parts_store);
+                }
+            }};
+        }
         // 2. Move the staged store INTO place. If this fails, restore the old one.
         if let Err(e) = directio::rename(&staging, &parts_store) {
-            if had_old {
-                let _ = directio::rename(&old_aside, &parts_store);
-            }
+            restore_old!();
             return Err(e.into());
         }
         staging_guard.disarm();
         // 3. The reassembled-on-read object has no single data file; write a
-        // zero-byte placeholder at obj_path so existence checks behave. Propagate
-        // any error (do NOT swallow it) — but first try to restore the prior
-        // object's parts so we don't leave it half-destroyed.
+        // zero-byte placeholder at obj_path so existence checks behave.
         //
         // F5: create the placeholder via DioFile (O_NOFOLLOW), NOT std::fs::write,
         // which would FOLLOW a symlink planted at obj_path and truncate an external
-        // target to zero bytes. Every other data-bearing write here is already
-        // O_NOFOLLOW-guarded; this is the last unguarded one. A legitimate
-        // pre-existing placeholder is a regular file (we create it here, never a
-        // symlink), so O_NOFOLLOW still succeeds on the normal overwrite path.
+        // target to zero bytes. A legitimate pre-existing placeholder is a regular
+        // file (we create it here, never a symlink), so O_NOFOLLOW still succeeds
+        // on the normal overwrite path.
         match DioFile::create_write(&obj_path) {
             Ok(file) => {
                 // Drop closes the (empty) fd; O_CREATE|O_TRUNC already made/cleared it.
                 drop(file);
             }
             Err(e) => {
-                // Roll back: move the new store aside and the old one back, and
-                // re-arm the staging guard so the (now-moved-back) staging dir is
-                // cleaned on drop — disarm() was called above before this point.
-                let _ = directio::rename(&parts_store, &staging);
-                staging_guard.rearm();
-                if had_old {
-                    let _ = directio::rename(&old_aside, &parts_store);
-                }
+                restore_old!();
                 return Err(e.into());
             }
         }
-        // 4. Publish the sidecar (durably when --fsync). After this the new object
-        // is live; only now is it safe to delete the old parts. If the manifest
-        // write fails, the placeholder + new parts are in place but the prior
-        // object's parts are still preserved in `old_aside` (we do NOT delete
-        // them on the error path), so the caller sees an error without us having
-        // destroyed the previously-published object.
-        self.publish_sidecar(&obj_path, &meta)?;
+        // C1 verification hook: forced failure injected AFTER the parts swap but
+        // BEFORE the sidecar commit. The restore_old! path must leave the prior
+        // object fully intact (old sidecar + old parts), proving the sidecar is
+        // the commit point. Gated by `S3GW_FORCE_SIDECAR_FAIL` (env, for manual
+        // verification) or the per-thread test flag.
+        if force_sidecar_fail() {
+            restore_old!();
+            return Err(StorageError::Io(io::Error::other(
+                "forced sidecar-commit failure (S3GW_FORCE_SIDECAR_FAIL)",
+            )));
+        }
+        // 4. COMMIT: rename the staged sidecar into place. THIS is the atomic
+        // commit point — after it the new object is live. On failure, restore the
+        // prior object so it is not left half-destroyed.
+        if let Err(e) = commit_metadata_temp(&meta_tmp, &meta_final, self.fsync) {
+            restore_old!();
+            return Err(e.into());
+        }
+        meta_tmp_guard.disarm();
         // 5. New object fully published — now remove the old parts store.
         if had_old {
             let _ = std::fs::remove_dir_all(&old_aside);
@@ -816,7 +1010,8 @@ impl Filesystem {
         if !bucket.is_empty() {
             self.head_bucket(bucket)?;
         }
-        let mp_dir = self.root.join(MULTIPART_DIR);
+        // C5: reject a symlinked `.multipart` before scanning it.
+        let mp_dir = self.multipart_root()?;
         let rd = match std::fs::read_dir(&mp_dir) {
             Ok(rd) => rd,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -879,14 +1074,52 @@ impl Filesystem {
 
     // ---- helpers ----
 
+    /// C5: resolve the per-root `.multipart` working dir, rejecting a SYMLINKED
+    /// `.multipart` that would redirect multipart storage outside the data root.
+    /// A planted `data-dir/.multipart -> /external` symlink is followed by
+    /// `create_dir_all`/`read_dir`/file opens, so without this check
+    /// create_multipart_upload (and friends) would write/read outside root. We
+    /// check the `.multipart` component itself with `symlink_metadata` (does NOT
+    /// follow): if it exists and is a symlink, reject; if it canonicalizes outside
+    /// the data root, reject. The gateway always creates `.multipart` as a real
+    /// directory, so this never rejects legitimate use.
+    fn multipart_root(&self) -> Result<PathBuf> {
+        let mp = self.root.join(MULTIPART_DIR);
+        match std::fs::symlink_metadata(&mp) {
+            Ok(m) => {
+                if m.file_type().is_symlink() {
+                    return Err(StorageError::PathTraversal);
+                }
+                if !m.file_type().is_dir() {
+                    // A non-dir `.multipart` (e.g. a regular file) is not usable.
+                    return Err(StorageError::PathTraversal);
+                }
+                // Defense in depth: even a real dir must canonicalize inside root
+                // (covers a symlinked ROOT or an intermediate symlink).
+                if let (Ok(real_mp), Ok(real_root)) = (
+                    std::fs::canonicalize(&mp),
+                    std::fs::canonicalize(&self.root),
+                ) {
+                    if real_mp != real_root && !real_mp.starts_with(&real_root) {
+                        return Err(StorageError::PathTraversal);
+                    }
+                }
+            }
+            // Not yet created — that's fine; the caller will create it as a real dir.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        Ok(mp)
+    }
+
     /// Resolve the working dir for an upload, validating the client-supplied
     /// `upload_id` is a well-formed UUID FIRST. Without this, a crafted id like
     /// `../../etc` would join outside `root/.multipart/` and let upload_part /
     /// complete / abort / list_parts read or `remove_dir_all` arbitrary paths.
-    /// The check is a cheap parse, no IO.
+    /// The check is a cheap parse, no IO. C5: also rejects a symlinked `.multipart`.
     fn upload_dir(&self, upload_id: &str) -> Result<PathBuf> {
         Uuid::parse_str(upload_id).map_err(|_| StorageError::NoSuchUpload)?;
-        Ok(self.root.join(MULTIPART_DIR).join(upload_id))
+        Ok(self.multipart_root()?.join(upload_id))
     }
 
     /// B4: load the upload's `meta.json` and require its stored bucket/key match
@@ -1051,22 +1284,6 @@ impl Filesystem {
         let root = normalize(&self.root);
         if path == root || !path.starts_with(&root) {
             return Err(StorageError::PathTraversal);
-        }
-        Ok(())
-    }
-
-    /// Write the object's `.s3meta` sidecar and, when durability is enabled,
-    /// fsync it and the object's parent directory so the just-published object
-    /// (data file + sidecar, both already renamed into place) survives a crash.
-    /// When `--fsync=false`, fall back to the non-durable atomic write.
-    fn publish_sidecar(&self, obj_path: &Path, meta: &ObjectMetadata) -> Result<()> {
-        if self.fsync {
-            write_metadata_durable(&meta_path(obj_path), meta)?;
-            // The data file's rename shares the same parent dir; the sidecar's
-            // durable write already fsync'd that dir, so the data-file rename is
-            // covered too. No second dir fsync is needed.
-        } else {
-            write_metadata(&meta_path(obj_path), meta)?;
         }
         Ok(())
     }
@@ -1360,6 +1577,7 @@ fn is_ipv4(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::super::metadata::write_metadata;
     use super::*;
 
     fn fs() -> (tempfile::TempDir, Filesystem) {
@@ -1471,6 +1689,27 @@ mod tests {
     }
 
     #[test]
+    fn delete_object_missing_bucket_is_no_such_bucket() {
+        // C7 regression: DELETE in a MISSING bucket must be NoSuchBucket (not a
+        // silent Ok/204). Deleting a MISSING KEY in an EXISTING bucket stays Ok
+        // (idempotent), as today.
+        //
+        // Mutation evidence: remove the `self.head_bucket(bucket)?;` in
+        // delete_object and this test fails — the missing-bucket delete returns Ok.
+        let (_d, f) = fs();
+        assert!(
+            matches!(
+                f.delete_object("no-such-bucket", "k"),
+                Err(StorageError::BucketNotFound)
+            ),
+            "delete in a missing bucket must be NoSuchBucket"
+        );
+        // Missing key in an existing bucket is still Ok (idempotent).
+        f.create_bucket("buck").unwrap();
+        f.delete_object("buck", "absent-key").unwrap();
+    }
+
+    #[test]
     fn user_metadata_preserved() {
         let (_d, f) = fs();
         f.create_bucket("buck").unwrap();
@@ -1515,14 +1754,68 @@ mod tests {
         f.create_bucket("buck").unwrap();
         let data: Vec<u8> = (0..5000).map(|i| (i % 256) as u8).collect();
         f.put_object("buck", "k", &data[..], "", um()).unwrap();
-        let r = ByteRange {
-            start: 1000,
-            end: 1999,
-        };
-        let mut res = f.get_object("buck", "k", Some(r)).unwrap();
+        // C3: get_object now resolves the raw Range header against the object size.
+        let mut res = f.get_object("buck", "k", Some("bytes=1000-1999")).unwrap();
         let mut got = Vec::new();
         res.body.read_to_end(&mut got).unwrap();
         assert_eq!(got, data[1000..=1999]);
+        assert_eq!(
+            res.resolved_range,
+            Some(ByteRange {
+                start: 1000,
+                end: 1999
+            })
+        );
+        // The full object size is reported from the same snapshot.
+        assert_eq!(res.total_size, 5000);
+    }
+
+    #[test]
+    fn get_object_returns_consistent_snapshot() {
+        // C3 regression: get_object resolves the raw Range header AND returns
+        // metadata + total_size from ONE snapshot, so the handler can build all
+        // response headers (ETag, Content-Length, Content-Range) from the same
+        // result it streams the body from — no separate head_object on the GET
+        // path, closing the head/get TOCTOU.
+        let (_d, f) = fs();
+        f.create_bucket("buck").unwrap();
+        let data: Vec<u8> = (0..2048).map(|i| (i % 251) as u8).collect();
+        let etag = f
+            .put_object("buck", "k", &data[..], "application/x-snap", um())
+            .unwrap();
+
+        // Full GET: metadata + total_size come from the snapshot.
+        let mut res = f.get_object("buck", "k", None).unwrap();
+        assert_eq!(res.metadata.etag, etag);
+        assert_eq!(res.metadata.content_type, "application/x-snap");
+        assert_eq!(res.total_size, 2048);
+        assert_eq!(res.resolved_range, None);
+        let mut got = Vec::new();
+        res.body.read_to_end(&mut got).unwrap();
+        assert_eq!(got, data);
+
+        // Range GET: resolved_range + total_size are from the same snapshot, and
+        // the served body matches the resolved range.
+        let mut res = f.get_object("buck", "k", Some("bytes=100-199")).unwrap();
+        assert_eq!(res.metadata.etag, etag, "ETag must come from GET snapshot");
+        assert_eq!(res.total_size, 2048);
+        assert_eq!(
+            res.resolved_range,
+            Some(ByteRange {
+                start: 100,
+                end: 199
+            })
+        );
+        let mut got = Vec::new();
+        res.body.read_to_end(&mut got).unwrap();
+        assert_eq!(got, data[100..=199]);
+
+        // Unsatisfiable range surfaces RangeNotSatisfiable carrying the size.
+        match f.get_object("buck", "k", Some("bytes=99999-")) {
+            Err(StorageError::RangeNotSatisfiable { size }) => assert_eq!(size, 2048),
+            Err(e) => panic!("expected RangeNotSatisfiable, got Err({e:?})"),
+            Ok(_) => panic!("expected RangeNotSatisfiable, got Ok"),
+        }
     }
 
     #[test]
@@ -1732,6 +2025,87 @@ mod tests {
     }
 
     #[test]
+    fn pagination_token_from_last_emitted_with_common_prefix() {
+        // C6 regression (load-bearing): when the last EMITTED item on a truncated
+        // page is a CommonPrefix (not an object), the continuation token must be
+        // that prefix string — not `objects.last()` — so the next page resumes
+        // strictly after the prefix and does NOT re-emit it or skip later items.
+        //
+        // Scenario: objects a, b, p/1, p/2, z with delimiter "/" and max-keys=3.
+        //   Sorted merge of objects {a,b,z} + prefixes {p/} = [a, b, p/, z]
+        //   Page 1 (max 3) = [a, b, p/]  (p/ is the last emitted item)
+        //   Token must be "p/" so page 2 = [z] (NOT re-emitting p/, NOT skipping z).
+        //
+        // Mutation evidence: revert to `out.objects.last()` for the token and this
+        // test fails — the token becomes "b", so page 2 re-emits the "p/" prefix.
+        let (_d, f) = fs();
+        f.create_bucket("buck").unwrap();
+        for k in ["a", "b", "p/1", "p/2", "z"] {
+            f.put_object("buck", k, &b"x"[..], "", um()).unwrap();
+        }
+
+        let page1 = f
+            .list_objects(&ListObjectsInput {
+                bucket: "buck".into(),
+                delimiter: "/".into(),
+                max_keys: Some(3),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            page1
+                .objects
+                .iter()
+                .map(|o| o.key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
+        assert_eq!(page1.common_prefixes, vec!["p/".to_string()]);
+        assert!(page1.is_truncated);
+        assert_eq!(
+            page1.next_continuation_token, "p/",
+            "token must be the last EMITTED item (the p/ prefix)"
+        );
+
+        let page2 = f
+            .list_objects(&ListObjectsInput {
+                bucket: "buck".into(),
+                delimiter: "/".into(),
+                max_keys: Some(3),
+                continuation_token: page1.next_continuation_token.clone(),
+                ..Default::default()
+            })
+            .unwrap();
+        // Page 2 must be exactly [z] — no re-emitted p/, no skipped z.
+        assert_eq!(
+            page2
+                .objects
+                .iter()
+                .map(|o| o.key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["z"]
+        );
+        assert!(
+            page2.common_prefixes.is_empty(),
+            "page 2 re-emitted the p/ prefix"
+        );
+        assert!(!page2.is_truncated);
+
+        // Full pagination yields each object/prefix exactly once.
+        let mut seen_objs: Vec<String> = page1
+            .objects
+            .iter()
+            .chain(page2.objects.iter())
+            .map(|o| o.key.clone())
+            .collect();
+        seen_objs.sort();
+        assert_eq!(seen_objs, vec!["a", "b", "z"]);
+        let mut seen_pfx = page1.common_prefixes.clone();
+        seen_pfx.extend(page2.common_prefixes.clone());
+        assert_eq!(seen_pfx, vec!["p/".to_string()]);
+    }
+
+    #[test]
     fn list_empty_bucket() {
         let (_d, f) = fs();
         f.create_bucket("buck").unwrap();
@@ -1835,14 +2209,21 @@ mod tests {
         assert_eq!(got, full);
 
         // range read across reassembled object
-        let r = ByteRange {
-            start: 5 * 1024 * 1024 - 2,
-            end: 5 * 1024 * 1024 + 2,
-        };
-        let mut res = f.get_object("buck", "big.bin", Some(r)).unwrap();
+        let start = 5 * 1024 * 1024 - 2;
+        let end = 5 * 1024 * 1024 + 2;
+        let mut res = f
+            .get_object("buck", "big.bin", Some(&format!("bytes={start}-{end}")))
+            .unwrap();
         let mut got = Vec::new();
         res.body.read_to_end(&mut got).unwrap();
-        assert_eq!(got, &full[(5 * 1024 * 1024 - 2)..=(5 * 1024 * 1024 + 2)]);
+        assert_eq!(got, &full[start..=end]);
+        assert_eq!(
+            res.resolved_range,
+            Some(ByteRange {
+                start: start as u64,
+                end: end as u64
+            })
+        );
 
         // upload dir cleaned up
         assert!(matches!(
@@ -2447,6 +2828,113 @@ mod tests {
     }
 
     #[test]
+    fn symlinked_bucket_rejected_and_not_walked() {
+        // C4 regression (load-bearing): a bucket directory that is actually a
+        // SYMLINK pointing OUTSIDE the data root must be rejected by head_bucket
+        // (NoSuchBucket) and therefore NOT walked by ListObjectsV2 — otherwise a
+        // planted `data-dir/bucket -> /external` would let listing enumerate files
+        // outside the root. A REAL bucket must still work.
+        //
+        // Mutation evidence: revert head_bucket to `std::fs::metadata` (follows
+        // symlinks) and this test fails — head_bucket returns Ok and ListObjectsV2
+        // walks the external directory, surfacing `outside-secret.txt`.
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let f = Filesystem::new(&root);
+
+        // External directory with a file, OUTSIDE the data root.
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("outside-secret.txt"), b"SECRET").unwrap();
+
+        // Plant a symlinked "bucket" pointing at the external dir.
+        let linked_bucket = root.join("linkbucket");
+        symlink(outside.path(), &linked_bucket).unwrap();
+
+        // head_bucket must reject it.
+        assert!(
+            matches!(
+                f.head_bucket("linkbucket"),
+                Err(StorageError::BucketNotFound)
+            ),
+            "symlinked bucket must be rejected by head_bucket"
+        );
+        // ListObjectsV2 must NOT walk it (it calls head_bucket first -> NoSuchBucket).
+        assert!(matches!(
+            f.list_objects(&ListObjectsInput {
+                bucket: "linkbucket".into(),
+                ..Default::default()
+            }),
+            Err(StorageError::BucketNotFound)
+        ));
+
+        // A REAL bucket still works.
+        f.create_bucket("realbucket").unwrap();
+        f.head_bucket("realbucket").unwrap();
+        f.put_object("realbucket", "k", &b"hi"[..], "", um())
+            .unwrap();
+        let out = f
+            .list_objects(&ListObjectsInput {
+                bucket: "realbucket".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(out.objects.len(), 1);
+        assert_eq!(out.objects[0].key, "k");
+    }
+
+    #[test]
+    fn symlinked_multipart_root_rejected() {
+        // C5 regression (load-bearing): a planted `data-dir/.multipart -> /external`
+        // symlink must NOT redirect multipart storage outside the data root.
+        // create_multipart_upload must error (contained) rather than write into the
+        // external directory. list_multipart_uploads must also reject it.
+        //
+        // Mutation evidence: route create/list back through
+        // `self.root.join(MULTIPART_DIR)` (bypassing `multipart_root()`) and this
+        // test fails — create_multipart_upload succeeds and writes the upload's
+        // meta.json/parts INTO the external dir.
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let f = Filesystem::new(&root);
+        f.create_bucket("buck").unwrap();
+
+        // External target the `.multipart` symlink points at.
+        let outside = tempfile::tempdir().unwrap();
+        let mp_link = root.join(MULTIPART_DIR);
+        symlink(outside.path(), &mp_link).unwrap();
+
+        // create_multipart_upload must be rejected (contained), not write outside.
+        let res = f.create_multipart_upload("buck", "k", "", um());
+        assert!(
+            res.is_err(),
+            "create_multipart_upload must reject a symlinked .multipart"
+        );
+        // Nothing was written into the external directory.
+        let leaked: Vec<_> = std::fs::read_dir(outside.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "multipart data leaked outside root via symlinked .multipart: {} entries",
+            leaked.len()
+        );
+
+        // list_multipart_uploads must also reject it.
+        assert!(
+            f.list_multipart_uploads("buck").is_err(),
+            "list_multipart_uploads must reject a symlinked .multipart"
+        );
+
+        // Replacing the symlink with a real dir lets multipart work normally.
+        std::fs::remove_file(&mp_link).unwrap();
+        let uid = f.create_multipart_upload("buck", "k", "", um()).unwrap();
+        assert!(root.join(MULTIPART_DIR).join(&uid).join("parts").exists());
+    }
+
+    #[test]
     fn complete_multipart_placeholder_does_not_follow_symlink() {
         // F5 (placeholder fix): CompleteMultipartUpload writes a zero-byte
         // placeholder at the object path. If a symlink to an EXTERNAL file sits at
@@ -2604,6 +3092,75 @@ mod tests {
     }
 
     #[test]
+    fn put_overwrite_sidecar_failure_preserves_prior_object() {
+        // C2 regression (load-bearing): the `.s3meta` sidecar is the PUT commit
+        // point. On an OVERWRITE, a forced sidecar-commit failure must leave the
+        // PRIOR object completely unchanged (old bytes + old metadata) and the PUT
+        // must error — never new data paired with the old sidecar's stale length.
+        //
+        // Mutation evidence: revert put_object to rename the data into place and
+        // then write the sidecar (without staging the sidecar first / without
+        // rolling back the data on sidecar failure) and this test fails: after the
+        // forced failure GET returns the NEW bytes or a mismatched Content-Length.
+        let (_d, f) = fs();
+        f.create_bucket("buck").unwrap();
+
+        // Prior object.
+        let old = b"ORIGINAL-CONTENT-v1";
+        let old_etag = f
+            .put_object("buck", "k", &old[..], "text/plain", um())
+            .unwrap();
+        let old_head = f.head_object("buck", "k").unwrap();
+
+        // Overwrite attempt that fails at the sidecar-commit step.
+        let new = b"NEW-CONTENT-THAT-MUST-NOT-WIN-much-longer-than-the-original";
+        FORCE_SIDECAR_FAIL.with(|c| c.set(true));
+        let res = f.put_object("buck", "k", &new[..], "application/x-new", um());
+        FORCE_SIDECAR_FAIL.with(|c| c.set(false));
+        assert!(res.is_err(), "forced sidecar failure must make PUT error");
+
+        // The prior object is unchanged: bytes, length, ETag, content-type.
+        let head = f.head_object("buck", "k").unwrap();
+        assert_eq!(head.etag, old_etag, "prior ETag changed");
+        assert_eq!(
+            head.content_length, old_head.content_length,
+            "prior Content-Length changed"
+        );
+        assert_eq!(
+            head.content_type, "text/plain",
+            "prior Content-Type changed"
+        );
+        let mut got = Vec::new();
+        f.get_object("buck", "k", None)
+            .unwrap()
+            .body
+            .read_to_end(&mut got)
+            .unwrap();
+        assert_eq!(got, old, "prior bytes were overwritten by a failed PUT");
+
+        // No stray temp/aside files leaked next to the object.
+        let bucket_dir = f.root().join("buck");
+        for entry in std::fs::read_dir(&bucket_dir).unwrap() {
+            let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+            assert!(!name.contains(".tmp."), "temp/aside leaked: {name}");
+        }
+
+        // A FRESH PUT that fails at the sidecar step must leave NO orphan data file.
+        FORCE_SIDECAR_FAIL.with(|c| c.set(true));
+        let res2 = f.put_object("buck", "fresh", &b"data"[..], "", um());
+        FORCE_SIDECAR_FAIL.with(|c| c.set(false));
+        assert!(res2.is_err());
+        assert!(
+            !f.root().join("buck").join("fresh").exists(),
+            "fresh PUT left an orphan data file after sidecar failure"
+        );
+        assert!(matches!(
+            f.head_object("buck", "fresh"),
+            Err(StorageError::ObjectNotFound)
+        ));
+    }
+
+    #[test]
     fn complete_stages_new_parts_before_destroying_old() {
         // F7 regression: completing a 2-part upload over a prior 3-part object
         // must NOT destroy the old parts before the new ones are published. We
@@ -2691,6 +3248,115 @@ mod tests {
         let mut expected = b1.clone();
         expected.extend_from_slice(&b2);
         assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn complete_sidecar_failure_preserves_prior_object() {
+        // C1 regression (load-bearing): the `.s3meta` sidecar is the atomic commit
+        // point of CompleteMultipartUpload. Inject a forced failure AT the
+        // sidecar-commit step (FORCE_SIDECAR_FAIL thread-local; the env var
+        // S3GW_FORCE_SIDECAR_FAIL is the equivalent gate for manual verification)
+        // while completing a 2-part upload OVER a prior 3-part object. The
+        // complete must ERROR and
+        // the prior 3-part object must still GET correctly with its ORIGINAL bytes,
+        // length, and ETag.
+        //
+        // Mutation evidence: revert the commit ordering so the new sidecar is
+        // published in place BEFORE the parts swap is the last durable step (i.e.
+        // restore the old "swap parts -> placeholder -> publish_sidecar" order
+        // without restore_old! on failure) and this test fails: after the forced
+        // failure the prior object reads NEW bytes / wrong length, or GET errors.
+        let (_d, f) = fs();
+        f.create_bucket("buck").unwrap();
+        let key = "obj.bin";
+
+        // Prior 3-part object.
+        let uid3 = f.create_multipart_upload("buck", key, "", um()).unwrap();
+        let a1 = vec![1u8; 5 * 1024 * 1024];
+        let a2 = vec![2u8; 5 * 1024 * 1024];
+        let a3 = vec![3u8; 1234];
+        let e1 = f.upload_part("buck", key, &uid3, 1, &a1[..]).unwrap();
+        let e2 = f.upload_part("buck", key, &uid3, 2, &a2[..]).unwrap();
+        let e3 = f.upload_part("buck", key, &uid3, 3, &a3[..]).unwrap();
+        let prior_etag = f
+            .complete_multipart_upload(
+                "buck",
+                key,
+                &uid3,
+                &[
+                    CompletePart {
+                        part_number: 1,
+                        etag: e1,
+                    },
+                    CompletePart {
+                        part_number: 2,
+                        etag: e2,
+                    },
+                    CompletePart {
+                        part_number: 3,
+                        etag: e3,
+                    },
+                ],
+            )
+            .unwrap();
+        let mut prior_bytes = a1.clone();
+        prior_bytes.extend_from_slice(&a2);
+        prior_bytes.extend_from_slice(&a3);
+
+        // Begin a 2-part overwrite, then force the sidecar-commit step to fail.
+        let uid2 = f.create_multipart_upload("buck", key, "", um()).unwrap();
+        let b1 = vec![4u8; 5 * 1024 * 1024];
+        let b2 = vec![5u8; 2000];
+        let g1 = f.upload_part("buck", key, &uid2, 1, &b1[..]).unwrap();
+        let g2 = f.upload_part("buck", key, &uid2, 2, &b2[..]).unwrap();
+
+        FORCE_SIDECAR_FAIL.with(|c| c.set(true));
+        let res = f.complete_multipart_upload(
+            "buck",
+            key,
+            &uid2,
+            &[
+                CompletePart {
+                    part_number: 1,
+                    etag: g1,
+                },
+                CompletePart {
+                    part_number: 2,
+                    etag: g2,
+                },
+            ],
+        );
+        FORCE_SIDECAR_FAIL.with(|c| c.set(false));
+        assert!(
+            res.is_err(),
+            "forced sidecar-commit failure must make complete error"
+        );
+
+        // The PRIOR 3-part object must be fully intact: original bytes, length, ETag.
+        let head = f.head_object("buck", key).unwrap();
+        assert_eq!(
+            head.content_length as usize,
+            prior_bytes.len(),
+            "prior object length changed after failed complete"
+        );
+        assert_eq!(head.etag, prior_etag, "prior object ETag changed");
+        let mut res = f.get_object("buck", key, None).unwrap();
+        let mut got = Vec::new();
+        res.body.read_to_end(&mut got).unwrap();
+        assert_eq!(
+            got, prior_bytes,
+            "prior object bytes were corrupted by a failed complete"
+        );
+
+        // No swap dirs leaked.
+        let bucket_dir = f.root().join("buck");
+        for entry in std::fs::read_dir(&bucket_dir).unwrap() {
+            let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+            assert!(
+                !name.contains(".parts.new.") && !name.contains(".parts.old."),
+                "swap dir leaked after failed complete: {name}"
+            );
+        }
     }
 
     #[test]

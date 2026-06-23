@@ -96,6 +96,15 @@ extra `open`/`close` calls at part boundaries, negligible against the bytes move
 The only real downside is more inodes per object and slightly more complex GET
 code — both acceptable for the throughput gained.
 
+**Known limitation — no 5 MiB minimum part size (intentionally lenient).** S3
+requires every multipart part except the last to be at least 5 MiB. This gateway
+deliberately does **not** enforce that minimum: small-part uploads work, which
+keeps small clients and the integration tests simple. Enforcing the AWS minimum
+would reject legitimate-but-small parts for no benefit on a single-machine
+gateway, so leniency here matches the gateway's posture. Part numbers are still
+validated (1..=10000, strictly ascending) and the composite-ETag format is
+unaffected.
+
 ## Integrity model: signature binds the declared hash, TLS protects the bytes
 
 SigV4 binds the request signature to the client-supplied `x-amz-content-sha256`

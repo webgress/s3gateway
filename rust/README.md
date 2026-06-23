@@ -279,6 +279,11 @@ Out of scope by design — this gateway favors throughput on a narrow API surfac
 - No batch/`DeleteObjects` multi-delete
 - Path-style addressing only (no virtual-hosted-style)
 - Single-region SigV4; no STS / temporary credentials
+- **No 5 MiB minimum part size for multipart uploads (lenient by design).** S3
+  requires every multipart part except the last to be at least 5 MiB; this
+  gateway does **not** enforce that minimum, so small-part uploads (and clients /
+  tests that rely on them) work. This is a deliberate leniency that matches the
+  gateway's posture; it does not affect the composite-ETag format or correctness.
 
 ### Security & integrity model (by design)
 

@@ -17,7 +17,7 @@ use hyper::{Response, StatusCode};
 
 use crate::auth::ChunkedReader;
 use crate::s3response::{render_error_xml, S3ErrorCode};
-use crate::storage::{parse_range, ByteRange, ObjectMetadata, StorageError};
+use crate::storage::{ObjectMetadata, StorageError};
 
 use super::{empty_body, full_body, map_storage_error, ChannelBody, Ctx, HandlerRequest, RespBody};
 
@@ -95,37 +95,30 @@ async fn object_response(
         return Ok(resp);
     }
 
-    // GET: open a streaming reader on the blocking thread.
+    // GET: take a SINGLE consistent snapshot (C3). `get_object` reads the sidecar,
+    // resolves the Range against THIS object's size, and opens the body — all
+    // under one snapshot — so metadata, total size, resolved range, and body are
+    // mutually consistent. We do NOT call `head_object` on the GET path, which
+    // closes the head/get TOCTOU. An unsatisfiable range surfaces as
+    // `RangeNotSatisfiable { size }`, which we turn into a 416 carrying the
+    // object's own size.
     let fs = ctx.fs.clone();
     let (b, k) = (bucket.clone(), key.clone());
-    // First resolve total size + metadata (need it to parse Range).
-    let head_fs = ctx.fs.clone();
-    let (hb, hk) = (bucket.clone(), key.clone());
-    let meta = tokio::task::spawn_blocking(move || head_fs.head_object(&hb, &hk))
+    let rh = range_header.clone();
+    let result = match tokio::task::spawn_blocking(move || fs.get_object(&b, &k, rh.as_deref()))
         .await
         .map_err(|_| S3ErrorCode::InternalError)?
-        .map_err(|e| map_storage_error(&e))?;
-    let total_size = meta.content_length as u64;
-
-    // Parse the range against the known size.
-    let range: Option<ByteRange> = match &range_header {
-        Some(h) => match parse_range(h, total_size) {
-            Ok(r) => r,
-            // Unsatisfiable range: 416 with `Content-Range: bytes */<size>`
-            // per RFC 7233 §4.4 / S3 behavior. Build the response here so we
-            // can attach the required Content-Range header.
-            Err(()) => return Ok(range_not_satisfiable(&req.resource, total_size)),
-        },
-        None => None,
+    {
+        Ok(r) => r,
+        Err(StorageError::RangeNotSatisfiable { size }) => {
+            return Ok(range_not_satisfiable(&req.resource, size));
+        }
+        Err(e) => return Err(map_storage_error(&e)),
     };
 
-    let get_range = range;
-    let result = tokio::task::spawn_blocking(move || fs.get_object(&b, &k, get_range))
-        .await
-        .map_err(|_| S3ErrorCode::InternalError)?
-        .map_err(|e| map_storage_error(&e))?;
-
-    let served_range = result.range;
+    let meta = result.metadata;
+    let total_size = result.total_size;
+    let served_range = result.resolved_range;
     let mut reader = result.body;
 
     // Compute Content-Length for the served portion.
@@ -190,7 +183,8 @@ async fn object_response(
     Ok(resp)
 }
 
-/// DELETE /{bucket}/{key} — DeleteObject (always 204).
+/// DELETE /{bucket}/{key} — DeleteObject. 204 on success (idempotent for a
+/// missing key in an existing bucket); NoSuchBucket if the bucket is missing (C7).
 pub async fn delete_object(
     ctx: &Ctx,
     req: HandlerRequest,
