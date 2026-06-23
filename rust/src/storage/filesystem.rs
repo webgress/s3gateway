@@ -347,6 +347,11 @@ impl Filesystem {
         };
 
         if let Some(parts) = &meta.multipart {
+            // B1: the manifest is trusted but defense-in-depth — a crafted sidecar
+            // could list an absolute/outside-root part path (which DioFile would
+            // open verbatim) or a symlinked part. Validate every part path is a
+            // regular file contained in the canonical data root before streaming.
+            self.validate_part_paths(parts)?;
             let total: u64 = parts.iter().map(|p| p.size).sum();
             let body = MultipartReader::new(parts.clone(), range);
             return Ok(GetObjectResult {
@@ -550,16 +555,26 @@ impl Filesystem {
 
     /// UploadPart: stream the part to `parts/{NNNNN}` with a ONE-PASS MD5.
     /// Part MD5s are independent, so concurrent UploadPart requests parallelize.
+    ///
+    /// B4: `bucket`/`key` are the REQUEST path; they must match the upload's stored
+    /// bucket/key or this is `NoSuchUpload` (a valid uploadId addressed via the
+    /// wrong object path must not succeed).
     pub fn upload_part<R: Read>(
         &self,
+        bucket: &str,
+        key: &str,
         upload_id: &str,
         part_number: i32,
         mut body: R,
     ) -> Result<String> {
-        let upload_dir = self.upload_dir(upload_id)?;
-        if !upload_dir.join("meta.json").exists() {
-            return Err(StorageError::NoSuchUpload);
+        // B5: S3 part numbers are 1..=10000. Reject out-of-range numbers BEFORE
+        // building the path (a negative number would otherwise format as e.g.
+        // `-0001`, and 0 would collide with the list-scan's "00000" parse).
+        if !(1..=10_000).contains(&part_number) {
+            return Err(StorageError::InvalidPart);
         }
+        let upload_dir = self.upload_dir(upload_id)?;
+        self.assert_upload_matches(&upload_dir, bucket, key)?;
         let part_path = upload_dir.join("parts").join(format!("{:05}", part_number));
         let tmp_path = tmp_sibling(&part_path);
         let mut guard = TmpGuard::new(tmp_path.clone());
@@ -593,24 +608,32 @@ impl Filesystem {
     /// read. Returns the composite ETag.
     pub fn complete_multipart_upload(
         &self,
+        bucket: &str,
+        key: &str,
         upload_id: &str,
         parts: &[CompletePart],
     ) -> Result<String> {
         let upload_dir = self.upload_dir(upload_id)?;
-        let meta_raw = match std::fs::read(upload_dir.join("meta.json")) {
-            Ok(d) => d,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                return Err(StorageError::NoSuchUpload)
-            }
-            Err(e) => return Err(e.into()),
-        };
-        let upload: MultipartUpload = serde_json::from_slice(&meta_raw)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        // B4: cross-check the REQUEST path matches the upload; stored values remain
+        // the source of truth below, but a mismatched path is NoSuchUpload.
+        let upload = self.assert_upload_matches(&upload_dir, bucket, key)?;
 
         // Re-validate the recorded bucket/key before joining (defense in depth:
         // the manifest is trusted, but the containment check also covers the
         // `{key}.parts` store dir we create below).
         self.validate_object_path(&upload.bucket, &upload.key)?;
+
+        // B5: an empty parts list is not a valid completion (it would otherwise
+        // yield a `...-0` composite ETag and a 0-byte object).
+        if parts.is_empty() {
+            return Err(StorageError::InvalidPart);
+        }
+        // B5: every claimed part number must be in S3's valid range 1..=10000.
+        for p in parts {
+            if !(1..=10_000).contains(&p.part_number) {
+                return Err(StorageError::InvalidPart);
+            }
+        }
 
         // Parts must be strictly ascending by number.
         for w in parts.windows(2) {
@@ -777,16 +800,22 @@ impl Filesystem {
         Ok(etag)
     }
 
-    pub fn abort_multipart_upload(&self, upload_id: &str) -> Result<()> {
+    /// B4: `bucket`/`key` are the REQUEST path and must match the upload's stored
+    /// values or this is `NoSuchUpload`.
+    pub fn abort_multipart_upload(&self, bucket: &str, key: &str, upload_id: &str) -> Result<()> {
         let upload_dir = self.upload_dir(upload_id)?;
-        if !upload_dir.join("meta.json").exists() {
-            return Err(StorageError::NoSuchUpload);
-        }
+        self.assert_upload_matches(&upload_dir, bucket, key)?;
         std::fs::remove_dir_all(&upload_dir)?;
         Ok(())
     }
 
     pub fn list_multipart_uploads(&self, bucket: &str) -> Result<Vec<MultipartUpload>> {
+        // B6: a named bucket must exist or this is NoSuchBucket. (`.multipart/` is
+        // a per-root working dir; scanning it for a missing bucket would otherwise
+        // return an empty success and mask the absent bucket.)
+        if !bucket.is_empty() {
+            self.head_bucket(bucket)?;
+        }
         let mp_dir = self.root.join(MULTIPART_DIR);
         let rd = match std::fs::read_dir(&mp_dir) {
             Ok(rd) => rd,
@@ -814,11 +843,11 @@ impl Filesystem {
         Ok(out)
     }
 
-    pub fn list_parts(&self, upload_id: &str) -> Result<Vec<PartInfo>> {
+    /// B4: `bucket`/`key` are the REQUEST path and must match the upload's stored
+    /// values or this is `NoSuchUpload`.
+    pub fn list_parts(&self, bucket: &str, key: &str, upload_id: &str) -> Result<Vec<PartInfo>> {
         let upload_dir = self.upload_dir(upload_id)?;
-        if !upload_dir.join("meta.json").exists() {
-            return Err(StorageError::NoSuchUpload);
-        }
+        self.assert_upload_matches(&upload_dir, bucket, key)?;
         let parts_dir = upload_dir.join("parts");
         let mut out = Vec::new();
         for entry in std::fs::read_dir(&parts_dir)? {
@@ -860,6 +889,31 @@ impl Filesystem {
         Ok(self.root.join(MULTIPART_DIR).join(upload_id))
     }
 
+    /// B4: load the upload's `meta.json` and require its stored bucket/key match
+    /// the REQUEST path. A valid uploadId addressed via a different bucket/key
+    /// must be rejected as `NoSuchUpload`. Also serves as the meta.json existence
+    /// check (missing -> NoSuchUpload). Returns the parsed upload on success.
+    fn assert_upload_matches(
+        &self,
+        upload_dir: &Path,
+        bucket: &str,
+        key: &str,
+    ) -> Result<MultipartUpload> {
+        let raw = match std::fs::read(upload_dir.join("meta.json")) {
+            Ok(d) => d,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                return Err(StorageError::NoSuchUpload)
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let upload: MultipartUpload = serde_json::from_slice(&raw)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        if upload.bucket != bucket || upload.key != key {
+            return Err(StorageError::NoSuchUpload);
+        }
+        Ok(upload)
+    }
+
     /// Validate the bucket NAME as a path component: reject `..`, `.`, empty,
     /// embedded separators / null bytes, and anything failing S3 bucket-name
     /// rules. This must run BEFORE the bucket is ever joined onto `self.root`,
@@ -892,13 +946,17 @@ impl Filesystem {
         if Path::new(key).is_absolute() {
             return Err(StorageError::PathTraversal);
         }
-        // F6: reject keys whose FINAL component collides with our internal files,
-        // so a client object can never shadow / clobber a sidecar, a part store,
-        // or a temp file. (e.g. `foo.s3meta` would be hidden from ListObjects, and
-        // a `remove_dir_all("{key}.parts")` could wipe a legit `foo.parts/` tree.)
-        let last = key.rsplit('/').next().unwrap_or(key);
-        if last.ends_with(META_SUFFIX) || last.ends_with(".parts") || last.contains(".tmp.") {
-            return Err(StorageError::ReservedKey);
+        // F6 + B3: reject keys whose ANY path segment collides with our internal
+        // files, so a client object can never shadow / clobber a sidecar, a part
+        // store, a staging dir, or a temp file — including via an intermediate
+        // directory segment that the ListObjectsV2 walk would silently skip.
+        // (e.g. `foo.s3meta` shadows a sidecar; `a.parts.new.x/obj` is hidden by
+        // the `.parts.` skip; `foo.s3meta.tmp` collides with the sidecar temp;
+        // `.multipart` is the per-bucket working dir.)
+        for seg in key.split('/') {
+            if is_reserved_segment(seg) {
+                return Err(StorageError::ReservedKey);
+            }
         }
         let bucket_path = self.root.join(bucket);
         let full = bucket_path.join(key);
@@ -942,6 +1000,41 @@ impl Filesystem {
                 }
                 // This ancestor doesn't exist yet (new nested key); go shallower.
                 Err(_) => probe = dir.parent(),
+            }
+        }
+        Ok(())
+    }
+
+    /// B1: validate every multipart part path in a (trusted-but-verified) manifest
+    /// before opening it for read. Each part must, after symlink resolution via
+    /// `canonicalize`, be a REGULAR FILE strictly inside the canonical data root.
+    /// This rejects a crafted sidecar that points a part at an absolute outside-
+    /// root path or via a symlink, so GET errors (ObjectNotFound) instead of
+    /// leaking external bytes. Lexical containment is also checked first so an
+    /// absolute path is rejected even if it does not exist.
+    fn validate_part_paths(&self, parts: &[PartRef]) -> Result<()> {
+        let real_root = std::fs::canonicalize(&self.root)?;
+        for p in parts {
+            let part = Path::new(&p.path);
+            // Reject absolute escapes lexically (cheap, catches non-existent too).
+            let lexical = normalize(part);
+            if !lexical.starts_with(&self.root) && !lexical.starts_with(&real_root) {
+                return Err(StorageError::ObjectNotFound);
+            }
+            // Canonicalize (follows symlinks): the real target must be inside the
+            // data root AND be a regular file (not a symlink/dir).
+            let real = match std::fs::canonicalize(part) {
+                Ok(r) => r,
+                Err(_) => return Err(StorageError::ObjectNotFound),
+            };
+            if !real.starts_with(&real_root) {
+                return Err(StorageError::ObjectNotFound);
+            }
+            // symlink_metadata so a symlinked part (canonicalizing inside root but
+            // itself a link) is still rejected as not-a-regular-file.
+            let md = std::fs::symlink_metadata(part)?;
+            if !md.file_type().is_file() {
+                return Err(StorageError::ObjectNotFound);
             }
         }
         Ok(())
@@ -1057,6 +1150,22 @@ fn tmp_sibling(path: &Path) -> PathBuf {
     let mut s = path.as_os_str().to_owned();
     s.push(format!(".tmp.{}", Uuid::new_v4()));
     PathBuf::from(s)
+}
+
+/// B3: True if a single key path segment collides with one of our internal
+/// on-disk names and must be rejected as a reserved key. The forms mirror exactly
+/// what storage creates: `{key}.s3meta` sidecars, `{key}.parts` part stores,
+/// `{key}.s3meta.tmp` sidecar temps, `{path}.tmp.<uuid>` data/part temps,
+/// `{key}.parts.new.<uuid>` Complete staging dirs, and the per-bucket
+/// `.multipart` working dir. Lexical only (no IO). Ordinary keys with dots —
+/// e.g. `report.parts-list.txt` — are unaffected.
+fn is_reserved_segment(seg: &str) -> bool {
+    seg == MULTIPART_DIR
+        || seg.ends_with(META_SUFFIX)
+        || seg.ends_with(".parts")
+        || seg.ends_with(".s3meta.tmp")
+        || seg.contains(".tmp.")
+        || seg.contains(".parts.new.")
 }
 
 /// Read up to `buf.len()` bytes, looping until the buffer is full or EOF.
@@ -1630,13 +1739,13 @@ mod tests {
         let p1 = vec![1u8; 5 * 1024 * 1024];
         let p2 = vec![2u8; 5 * 1024 * 1024];
         let p3 = vec![3u8; 1234];
-        let e1 = f.upload_part(&uid, 1, &p1[..]).unwrap();
-        let e2 = f.upload_part(&uid, 2, &p2[..]).unwrap();
-        let e3 = f.upload_part(&uid, 3, &p3[..]).unwrap();
+        let e1 = f.upload_part("buck", "big.bin", &uid, 1, &p1[..]).unwrap();
+        let e2 = f.upload_part("buck", "big.bin", &uid, 2, &p2[..]).unwrap();
+        let e3 = f.upload_part("buck", "big.bin", &uid, 3, &p3[..]).unwrap();
         assert_eq!(e1, format!("\"{}\"", hex::encode(Md5::digest(&p1))));
 
         // list parts
-        let parts = f.list_parts(&uid).unwrap();
+        let parts = f.list_parts("buck", "big.bin", &uid).unwrap();
         assert_eq!(parts.len(), 3);
         assert_eq!(parts[0].part_number, 1);
 
@@ -1648,6 +1757,8 @@ mod tests {
         // complete
         let etag = f
             .complete_multipart_upload(
+                "buck",
+                "big.bin",
                 &uid,
                 &[
                     CompletePart {
@@ -1697,7 +1808,7 @@ mod tests {
 
         // upload dir cleaned up
         assert!(matches!(
-            f.list_parts(&uid),
+            f.list_parts("buck", "big.bin", &uid),
             Err(StorageError::NoSuchUpload)
         ));
     }
@@ -1714,10 +1825,12 @@ mod tests {
             .unwrap();
         let p1 = vec![7u8; 5 * 1024 * 1024];
         let p2 = vec![9u8; 4096];
-        let e1 = f.upload_part(&uid, 1, &p1[..]).unwrap();
-        let e2 = f.upload_part(&uid, 2, &p2[..]).unwrap();
+        let e1 = f.upload_part("buck", "mp.bin", &uid, 1, &p1[..]).unwrap();
+        let e2 = f.upload_part("buck", "mp.bin", &uid, 2, &p2[..]).unwrap();
         let composite = f
             .complete_multipart_upload(
+                "buck",
+                "mp.bin",
                 &uid,
                 &[
                     CompletePart {
@@ -1758,8 +1871,10 @@ mod tests {
         let (_d, f) = fs();
         f.create_bucket("buck").unwrap();
         let uid = f.create_multipart_upload("buck", "k", "", um()).unwrap();
-        f.upload_part(&uid, 1, &b"hello"[..]).unwrap();
+        f.upload_part("buck", "k", &uid, 1, &b"hello"[..]).unwrap();
         let err = f.complete_multipart_upload(
+            "buck",
+            "k",
             &uid,
             &[CompletePart {
                 part_number: 1,
@@ -1774,12 +1889,14 @@ mod tests {
         let (_d, f) = fs();
         f.create_bucket("buck").unwrap();
         let uid = f.create_multipart_upload("buck", "k", "", um()).unwrap();
-        f.upload_part(&uid, 1, &b"a"[..]).unwrap();
-        f.upload_part(&uid, 2, &b"b"[..]).unwrap();
+        f.upload_part("buck", "k", &uid, 1, &b"a"[..]).unwrap();
+        f.upload_part("buck", "k", &uid, 2, &b"b"[..]).unwrap();
         // Non-empty (but irrelevant) ETags: order is checked before ETag, and an
         // empty ETag would now be rejected as InvalidPart (F15), so use dummies
         // to keep this test exercising the ORDER path specifically.
         let err = f.complete_multipart_upload(
+            "buck",
+            "k",
             &uid,
             &[
                 CompletePart {
@@ -1800,14 +1917,14 @@ mod tests {
         let (_d, f) = fs();
         f.create_bucket("buck").unwrap();
         let uid = f.create_multipart_upload("buck", "k", "", um()).unwrap();
-        f.upload_part(&uid, 1, &b"a"[..]).unwrap();
-        f.abort_multipart_upload(&uid).unwrap();
+        f.upload_part("buck", "k", &uid, 1, &b"a"[..]).unwrap();
+        f.abort_multipart_upload("buck", "k", &uid).unwrap();
         assert!(matches!(
-            f.list_parts(&uid),
+            f.list_parts("buck", "k", &uid),
             Err(StorageError::NoSuchUpload)
         ));
         assert!(matches!(
-            f.abort_multipart_upload(&uid),
+            f.abort_multipart_upload("buck", "k", &uid),
             Err(StorageError::NoSuchUpload)
         ));
     }
@@ -1817,13 +1934,15 @@ mod tests {
         let (_d, f) = fs();
         f.create_bucket("buck").unwrap();
         let uid = f.create_multipart_upload("buck", "k", "", um()).unwrap();
-        f.upload_part(&uid, 1, &b"first"[..]).unwrap();
-        let e = f.upload_part(&uid, 1, &b"second-version"[..]).unwrap();
+        f.upload_part("buck", "k", &uid, 1, &b"first"[..]).unwrap();
+        let e = f
+            .upload_part("buck", "k", &uid, 1, &b"second-version"[..])
+            .unwrap();
         assert_eq!(
             e,
             format!("\"{}\"", hex::encode(Md5::digest(b"second-version")))
         );
-        let parts = f.list_parts(&uid).unwrap();
+        let parts = f.list_parts("buck", "k", &uid).unwrap();
         assert_eq!(parts.len(), 1);
         assert_eq!(parts[0].size, "second-version".len() as i64);
     }
@@ -1837,9 +1956,11 @@ mod tests {
             .unwrap();
         let p1 = vec![1u8; 5 * 1024 * 1024];
         let p2 = vec![2u8; 1024];
-        let e1 = f.upload_part(&uid, 1, &p1[..]).unwrap();
-        let e2 = f.upload_part(&uid, 2, &p2[..]).unwrap();
+        let e1 = f.upload_part("buck", "obj.bin", &uid, 1, &p1[..]).unwrap();
+        let e2 = f.upload_part("buck", "obj.bin", &uid, 2, &p2[..]).unwrap();
         f.complete_multipart_upload(
+            "buck",
+            "obj.bin",
             &uid,
             &[
                 CompletePart {
@@ -1880,10 +2001,12 @@ mod tests {
         let a1 = vec![1u8; 5 * 1024 * 1024];
         let a2 = vec![2u8; 5 * 1024 * 1024];
         let a3 = vec![3u8; 1234];
-        let e1 = f.upload_part(&uid3, 1, &a1[..]).unwrap();
-        let e2 = f.upload_part(&uid3, 2, &a2[..]).unwrap();
-        let e3 = f.upload_part(&uid3, 3, &a3[..]).unwrap();
+        let e1 = f.upload_part("buck", key, &uid3, 1, &a1[..]).unwrap();
+        let e2 = f.upload_part("buck", key, &uid3, 2, &a2[..]).unwrap();
+        let e3 = f.upload_part("buck", key, &uid3, 3, &a3[..]).unwrap();
         f.complete_multipart_upload(
+            "buck",
+            key,
             &uid3,
             &[
                 CompletePart {
@@ -1908,9 +2031,11 @@ mod tests {
         let uid2 = f.create_multipart_upload("buck", key, "", um()).unwrap();
         let b1 = vec![4u8; 5 * 1024 * 1024];
         let b2 = vec![5u8; 4321];
-        let f1 = f.upload_part(&uid2, 1, &b1[..]).unwrap();
-        let f2 = f.upload_part(&uid2, 2, &b2[..]).unwrap();
+        let f1 = f.upload_part("buck", key, &uid2, 1, &b1[..]).unwrap();
+        let f2 = f.upload_part("buck", key, &uid2, 2, &b2[..]).unwrap();
         f.complete_multipart_upload(
+            "buck",
+            key,
             &uid2,
             &[
                 CompletePart {
@@ -1954,9 +2079,11 @@ mod tests {
         let uid = f.create_multipart_upload("buck", key, "", um()).unwrap();
         let p1 = vec![1u8; 5 * 1024 * 1024];
         let p2 = vec![2u8; 2048];
-        let e1 = f.upload_part(&uid, 1, &p1[..]).unwrap();
-        let e2 = f.upload_part(&uid, 2, &p2[..]).unwrap();
+        let e1 = f.upload_part("buck", key, &uid, 1, &p1[..]).unwrap();
+        let e2 = f.upload_part("buck", key, &uid, 2, &p2[..]).unwrap();
         f.complete_multipart_upload(
+            "buck",
+            key,
             &uid,
             &[
                 CompletePart {
@@ -2000,7 +2127,7 @@ mod tests {
         let (_d, f) = fs();
         f.create_bucket("buck").unwrap();
         assert!(matches!(
-            f.upload_part("does-not-exist", 1, &b"x"[..]),
+            f.upload_part("buck", "k", "does-not-exist", 1, &b"x"[..]),
             Err(StorageError::NoSuchUpload)
         ));
     }
@@ -2016,25 +2143,28 @@ mod tests {
         for bad in ["../../etc", "..", "../escape", "not-a-uuid", "", "a/b"] {
             assert!(
                 matches!(
-                    f.upload_part(bad, 1, &b"x"[..]),
+                    f.upload_part("buck", "k", bad, 1, &b"x"[..]),
                     Err(StorageError::NoSuchUpload)
                 ),
                 "upload_part should reject uploadId {bad:?}"
             );
             assert!(
-                matches!(f.list_parts(bad), Err(StorageError::NoSuchUpload)),
+                matches!(
+                    f.list_parts("buck", "k", bad),
+                    Err(StorageError::NoSuchUpload)
+                ),
                 "list_parts should reject uploadId {bad:?}"
             );
             assert!(
                 matches!(
-                    f.abort_multipart_upload(bad),
+                    f.abort_multipart_upload("buck", "k", bad),
                     Err(StorageError::NoSuchUpload)
                 ),
                 "abort should reject uploadId {bad:?}"
             );
             assert!(
                 matches!(
-                    f.complete_multipart_upload(bad, &[]),
+                    f.complete_multipart_upload("buck", "k", bad, &[]),
                     Err(StorageError::NoSuchUpload)
                 ),
                 "complete should reject uploadId {bad:?}"
@@ -2043,10 +2173,14 @@ mod tests {
         // A real server-issued UUID still drives the upload end to end.
         let uid = f.create_multipart_upload("buck", "k", "", um()).unwrap();
         assert!(Uuid::parse_str(&uid).is_ok());
-        let e1 = f.upload_part(&uid, 1, &b"hello-part"[..]).unwrap();
-        let parts = f.list_parts(&uid).unwrap();
+        let e1 = f
+            .upload_part("buck", "k", &uid, 1, &b"hello-part"[..])
+            .unwrap();
+        let parts = f.list_parts("buck", "k", &uid).unwrap();
         assert_eq!(parts.len(), 1);
         f.complete_multipart_upload(
+            "buck",
+            "k",
             &uid,
             &[CompletePart {
                 part_number: 1,
@@ -2105,13 +2239,19 @@ mod tests {
         // The traversing id resolves to the planted upload IFF the UUID check is
         // absent. Every entry point must still reject it as NoSuchUpload.
         let traverse = "../escape-upload";
+        // The planted upload records bucket="buck", key="victim"; pass those so the
+        // B4 path-match check would PASS — proving the UUID check (not B4) is what
+        // rejects the traversal.
         assert!(
-            matches!(f.list_parts(traverse), Err(StorageError::NoSuchUpload)),
+            matches!(
+                f.list_parts("buck", "victim", traverse),
+                Err(StorageError::NoSuchUpload)
+            ),
             "list_parts must reject traversing uploadId even when a valid meta.json exists at the target"
         );
         assert!(
             matches!(
-                f.upload_part(traverse, 2, &b"x"[..]),
+                f.upload_part("buck", "victim", traverse, 2, &b"x"[..]),
                 Err(StorageError::NoSuchUpload)
             ),
             "upload_part must reject traversing uploadId"
@@ -2119,6 +2259,8 @@ mod tests {
         assert!(
             matches!(
                 f.complete_multipart_upload(
+                    "buck",
+                    "victim",
                     traverse,
                     &[CompletePart {
                         part_number: 1,
@@ -2131,7 +2273,7 @@ mod tests {
         );
         assert!(
             matches!(
-                f.abort_multipart_upload(traverse),
+                f.abort_multipart_upload("buck", "victim", traverse),
                 Err(StorageError::NoSuchUpload)
             ),
             "abort must reject traversing uploadId even when a valid meta.json exists at the target"
@@ -2295,7 +2437,7 @@ mod tests {
             .create_multipart_upload("buck", "mpkey", "", um())
             .unwrap();
         let e1 = f
-            .upload_part(&uid, 1, &b"hello-multipart-body"[..])
+            .upload_part("buck", "mpkey", &uid, 1, &b"hello-multipart-body"[..])
             .unwrap();
 
         // Complete: the placeholder write must use O_NOFOLLOW. With the fix it
@@ -2303,6 +2445,8 @@ mod tests {
         // leaves the prior state and the external file is untouched. (We don't
         // assert Complete's Ok/Err — only that the external file is NOT truncated.)
         let _ = f.complete_multipart_upload(
+            "buck",
+            "mpkey",
             &uid,
             &[CompletePart {
                 part_number: 1,
@@ -2340,8 +2484,12 @@ mod tests {
 
         // First complete.
         let uid1 = f.create_multipart_upload("buck", "k", "", um()).unwrap();
-        let a1 = f.upload_part(&uid1, 1, &b"first-version-data"[..]).unwrap();
+        let a1 = f
+            .upload_part("buck", "k", &uid1, 1, &b"first-version-data"[..])
+            .unwrap();
         f.complete_multipart_upload(
+            "buck",
+            "k",
             &uid1,
             &[CompletePart {
                 part_number: 1,
@@ -2357,9 +2505,11 @@ mod tests {
         // Second complete OVERWRITES the existing (regular-file) placeholder.
         let uid2 = f.create_multipart_upload("buck", "k", "", um()).unwrap();
         let b1 = f
-            .upload_part(&uid2, 1, &b"second-version-data"[..])
+            .upload_part("buck", "k", &uid2, 1, &b"second-version-data"[..])
             .unwrap();
         f.complete_multipart_upload(
+            "buck",
+            "k",
             &uid2,
             &[CompletePart {
                 part_number: 1,
@@ -2430,10 +2580,12 @@ mod tests {
         let a1 = vec![1u8; 5 * 1024 * 1024];
         let a2 = vec![2u8; 5 * 1024 * 1024];
         let a3 = vec![3u8; 1000];
-        let e1 = f.upload_part(&uid3, 1, &a1[..]).unwrap();
-        let e2 = f.upload_part(&uid3, 2, &a2[..]).unwrap();
-        let e3 = f.upload_part(&uid3, 3, &a3[..]).unwrap();
+        let e1 = f.upload_part("buck", key, &uid3, 1, &a1[..]).unwrap();
+        let e2 = f.upload_part("buck", key, &uid3, 2, &a2[..]).unwrap();
+        let e3 = f.upload_part("buck", key, &uid3, 3, &a3[..]).unwrap();
         f.complete_multipart_upload(
+            "buck",
+            key,
             &uid3,
             &[
                 CompletePart {
@@ -2458,9 +2610,11 @@ mod tests {
         let uid2 = f.create_multipart_upload("buck", key, "", um()).unwrap();
         let b1 = vec![4u8; 5 * 1024 * 1024];
         let b2 = vec![5u8; 2000];
-        let g1 = f.upload_part(&uid2, 1, &b1[..]).unwrap();
-        let g2 = f.upload_part(&uid2, 2, &b2[..]).unwrap();
+        let g1 = f.upload_part("buck", key, &uid2, 1, &b1[..]).unwrap();
+        let g2 = f.upload_part("buck", key, &uid2, 2, &b2[..]).unwrap();
         f.complete_multipart_upload(
+            "buck",
+            key,
             &uid2,
             &[
                 CompletePart {
@@ -2535,5 +2689,339 @@ mod tests {
             .unwrap();
         assert_eq!(out2.objects.len(), 5);
         assert!(!out2.is_truncated);
+    }
+
+    // ---- B1: multipart manifest part-path containment ----
+
+    /// Build a completed-but-tampered multipart object: drive a real complete,
+    /// then rewrite the `.s3meta` manifest's first part `path` to `tampered_path`.
+    /// Returns the Filesystem and tempdir so the caller can attempt a GET.
+    fn complete_then_tamper_manifest(tampered_path: String) -> (tempfile::TempDir, Filesystem) {
+        let dir = tempfile::tempdir().unwrap();
+        let f = Filesystem::new(dir.path());
+        f.create_bucket("buck").unwrap();
+        let uid = f.create_multipart_upload("buck", "mp", "", um()).unwrap();
+        let p1 = vec![1u8; 5 * 1024 * 1024];
+        let p2 = vec![2u8; 4096];
+        let e1 = f.upload_part("buck", "mp", &uid, 1, &p1[..]).unwrap();
+        let e2 = f.upload_part("buck", "mp", &uid, 2, &p2[..]).unwrap();
+        f.complete_multipart_upload(
+            "buck",
+            "mp",
+            &uid,
+            &[
+                CompletePart {
+                    part_number: 1,
+                    etag: e1,
+                },
+                CompletePart {
+                    part_number: 2,
+                    etag: e2,
+                },
+            ],
+        )
+        .unwrap();
+        // Rewrite the manifest so part 1 points at `tampered_path`.
+        let mp = meta_path(&f.root().join("buck").join("mp"));
+        let mut meta = read_metadata(&mp).unwrap();
+        meta.multipart.as_mut().unwrap()[0].path = tampered_path;
+        write_metadata(&mp, &meta).unwrap();
+        (dir, f)
+    }
+
+    #[test]
+    fn multipart_manifest_absolute_outside_path_rejected() {
+        // B1: a crafted sidecar whose part path points at an ABSOLUTE outside-root
+        // file must make GET ERROR rather than stream the external file's bytes.
+        //
+        // Mutation evidence: remove the `self.validate_part_paths(parts)?;` call in
+        // `get_object` and this test fails — GET opens the outside-root file and
+        // streams its contents.
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().join("secret.bin");
+        std::fs::write(&secret, vec![9u8; 5 * 1024 * 1024]).unwrap();
+
+        let (_d, f) = complete_then_tamper_manifest(secret.to_string_lossy().into_owned());
+        // GET must error (containment rejects the outside-root part path).
+        let res = f.get_object("buck", "mp", None);
+        match res {
+            Err(_) => { /* containment rejected it — correct */ }
+            Ok(mut r) => {
+                // If the build is broken and it streamed, the bytes would be the
+                // secret's (all 9s). Assert that did NOT happen.
+                let mut got = Vec::new();
+                let _ = r.body.read_to_end(&mut got);
+                assert!(
+                    !got.iter().take(4096).all(|&b| b == 9),
+                    "GET leaked outside-root bytes via a crafted manifest part path"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn multipart_manifest_symlinked_part_rejected() {
+        // B1: a part path that is a SYMLINK (even if the link target is inside or
+        // outside root) must be rejected — `symlink_metadata` shows it is not a
+        // regular file. GET must error rather than follow the link.
+        use std::os::unix::fs::symlink;
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().join("secret.bin");
+        std::fs::write(&secret, vec![7u8; 4096]).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let f = Filesystem::new(dir.path());
+        f.create_bucket("buck").unwrap();
+        let uid = f.create_multipart_upload("buck", "mp", "", um()).unwrap();
+        let p1 = vec![1u8; 4096];
+        let e1 = f.upload_part("buck", "mp", &uid, 1, &p1[..]).unwrap();
+        f.complete_multipart_upload(
+            "buck",
+            "mp",
+            &uid,
+            &[CompletePart {
+                part_number: 1,
+                etag: e1,
+            }],
+        )
+        .unwrap();
+        // Replace the real part file with a symlink to the outside secret, and
+        // rewrite the manifest path to that symlink (a path INSIDE the part store,
+        // so only the symlink-vs-regular-file check catches it).
+        let store = parts_store_dir(&f.root().join("buck").join("mp"));
+        let part = store.join("00001");
+        std::fs::remove_file(&part).unwrap();
+        symlink(&secret, &part).unwrap();
+
+        let res = f.get_object("buck", "mp", None);
+        assert!(
+            res.is_err(),
+            "GET must reject a symlinked part rather than follow it"
+        );
+        // The external secret must be untouched.
+        assert_eq!(std::fs::read(&secret).unwrap().len(), 4096);
+    }
+
+    #[test]
+    fn symlinked_sidecar_rejected_on_read() {
+        // B1: a SYMLINKED `.s3meta` sidecar (pointing at an outside-root JSON) must
+        // be rejected (O_NOFOLLOW) rather than read through. We point the sidecar
+        // symlink at a valid metadata file outside root; read_metadata must error.
+        //
+        // Mutation evidence: revert `read_metadata` to `std::fs::read(path)` and
+        // this test fails — the outside-root sidecar JSON is read and parsed.
+        use std::os::unix::fs::symlink;
+        let outside = tempfile::tempdir().unwrap();
+        let external_meta = outside.path().join("external.s3meta");
+        let m = ObjectMetadata {
+            content_type: "text/plain".into(),
+            content_length: 3,
+            etag: "\"abc\"".into(),
+            last_modified: now_unix(),
+            user_metadata: um(),
+            content_disposition: String::new(),
+            content_encoding: String::new(),
+            cache_control: String::new(),
+            multipart: None,
+        };
+        write_metadata(&external_meta, &m).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let f = Filesystem::new(dir.path());
+        f.create_bucket("buck").unwrap();
+        // Plant a symlinked sidecar for key "obj" pointing outside root.
+        let obj = f.root().join("buck").join("obj");
+        symlink(&external_meta, meta_path(&obj)).unwrap();
+        // Also create a (regular) data file so only the sidecar is the symlink.
+        std::fs::write(&obj, b"abc").unwrap();
+
+        // head_object reads the sidecar via read_metadata (O_NOFOLLOW) -> error,
+        // and because the sidecar "exists" (as a dangling-open symlink) the open
+        // fails with ELOOP, surfaced as an Io error (NOT a successful read).
+        let res = f.head_object("buck", "obj");
+        assert!(
+            res.is_err(),
+            "head_object must not read a symlinked sidecar through to outside root"
+        );
+    }
+
+    // ---- B3: reserved-name segment gaps ----
+
+    #[test]
+    fn reserved_name_segment_gaps_rejected() {
+        // B3: the reserved-name check must apply to EVERY path segment and cover
+        // the sidecar-temp collision form and the staging-dir form, while still
+        // accepting ordinary keys that merely contain the tokens mid-name.
+        let (_d, f) = fs();
+        f.create_bucket("buck").unwrap();
+        for bad in [
+            "foo.s3meta.tmp",    // collides with the sidecar temp form
+            "a.parts.new.x/obj", // intermediate staging-dir segment (hidden by walk)
+            "x/.multipart/y",    // the per-bucket working dir name as a segment
+            "dir/inner.s3meta",  // sidecar in a sub-segment
+            "deep/a.parts/leaf", // part-store dir as an intermediate segment
+        ] {
+            assert!(
+                matches!(
+                    f.put_object("buck", bad, &b"x"[..], "", um()),
+                    Err(StorageError::ReservedKey)
+                ),
+                "put_object should reject reserved key {bad:?}"
+            );
+        }
+        // Ordinary keys with dots must still work (NOT the exact internal forms).
+        for good in [
+            "report.parts-list.txt",
+            "notes.parts.txt",
+            "x.s3meta.txt",
+            "a/b/c.txt",
+            "my.multipart.notes.txt",
+        ] {
+            f.put_object("buck", good, &b"ok"[..], "", um())
+                .unwrap_or_else(|e| panic!("good key {good:?} should be accepted, got {e:?}"));
+        }
+    }
+
+    // ---- B4: multipart ops must match request bucket/key ----
+
+    #[test]
+    fn multipart_ops_reject_mismatched_bucket_key() {
+        // B4: a valid uploadId addressed via the WRONG bucket/key must be rejected
+        // as NoSuchUpload on every op; the MATCHING path works.
+        let (_d, f) = fs();
+        f.create_bucket("buck").unwrap();
+        f.create_bucket("other-buck").unwrap();
+        let uid = f
+            .create_multipart_upload("buck", "real-key", "", um())
+            .unwrap();
+        let e1 = f
+            .upload_part("buck", "real-key", &uid, 1, &b"part-data"[..])
+            .unwrap();
+
+        // Mismatched key -> NoSuchUpload.
+        assert!(matches!(
+            f.upload_part("buck", "wrong-key", &uid, 2, &b"x"[..]),
+            Err(StorageError::NoSuchUpload)
+        ));
+        // Mismatched bucket -> NoSuchUpload.
+        assert!(matches!(
+            f.upload_part("other-buck", "real-key", &uid, 2, &b"x"[..]),
+            Err(StorageError::NoSuchUpload)
+        ));
+        assert!(matches!(
+            f.list_parts("buck", "wrong-key", &uid),
+            Err(StorageError::NoSuchUpload)
+        ));
+        assert!(matches!(
+            f.complete_multipart_upload(
+                "buck",
+                "wrong-key",
+                &uid,
+                &[CompletePart {
+                    part_number: 1,
+                    etag: e1.clone(),
+                }]
+            ),
+            Err(StorageError::NoSuchUpload)
+        ));
+        assert!(matches!(
+            f.abort_multipart_upload("other-buck", "real-key", &uid),
+            Err(StorageError::NoSuchUpload)
+        ));
+
+        // The matching path drives the upload to completion.
+        let parts = f.list_parts("buck", "real-key", &uid).unwrap();
+        assert_eq!(parts.len(), 1);
+        f.complete_multipart_upload(
+            "buck",
+            "real-key",
+            &uid,
+            &[CompletePart {
+                part_number: 1,
+                etag: e1,
+            }],
+        )
+        .unwrap();
+        let mut r = f.get_object("buck", "real-key", None).unwrap();
+        let mut got = Vec::new();
+        r.body.read_to_end(&mut got).unwrap();
+        assert_eq!(got, b"part-data");
+    }
+
+    // ---- B5: zero parts / out-of-range part numbers ----
+
+    #[test]
+    fn upload_part_rejects_out_of_range_numbers() {
+        // B5: part numbers must be 1..=10000; 0/-1/10001 are rejected on upload.
+        let (_d, f) = fs();
+        f.create_bucket("buck").unwrap();
+        let uid = f.create_multipart_upload("buck", "k", "", um()).unwrap();
+        for bad in [0, -1, 10_001, i32::MIN] {
+            assert!(
+                matches!(
+                    f.upload_part("buck", "k", &uid, bad, &b"x"[..]),
+                    Err(StorageError::InvalidPart)
+                ),
+                "upload_part should reject part_number {bad}"
+            );
+        }
+        // The boundary values are accepted.
+        f.upload_part("buck", "k", &uid, 1, &b"a"[..]).unwrap();
+        f.upload_part("buck", "k", &uid, 10_000, &b"b"[..]).unwrap();
+    }
+
+    #[test]
+    fn complete_rejects_empty_and_out_of_range_parts() {
+        // B5: an empty parts list and out-of-range part numbers are rejected by
+        // complete (independent of upload-time checks).
+        let (_d, f) = fs();
+        f.create_bucket("buck").unwrap();
+        let uid = f.create_multipart_upload("buck", "k", "", um()).unwrap();
+        let e1 = f.upload_part("buck", "k", &uid, 1, &b"hello"[..]).unwrap();
+
+        // Empty parts list -> InvalidPart (no `...-0` ETag).
+        assert!(matches!(
+            f.complete_multipart_upload("buck", "k", &uid, &[]),
+            Err(StorageError::InvalidPart)
+        ));
+        // Out-of-range part number -> InvalidPart.
+        for bad in [0, -1, 10_001] {
+            assert!(
+                matches!(
+                    f.complete_multipart_upload(
+                        "buck",
+                        "k",
+                        &uid,
+                        &[CompletePart {
+                            part_number: bad,
+                            etag: e1.clone(),
+                        }]
+                    ),
+                    Err(StorageError::InvalidPart)
+                ),
+                "complete should reject part_number {bad}"
+            );
+        }
+    }
+
+    // ---- B6: ListMultipartUploads missing-bucket ----
+
+    #[test]
+    fn list_multipart_uploads_missing_bucket() {
+        // B6: ListMultipartUploads on a missing bucket is NoSuchBucket (not an
+        // empty success); on an existing bucket it works.
+        let (_d, f) = fs();
+        assert!(matches!(
+            f.list_multipart_uploads("no-such-bucket"),
+            Err(StorageError::BucketNotFound)
+        ));
+        f.create_bucket("buck").unwrap();
+        let uid = f.create_multipart_upload("buck", "k", "", um()).unwrap();
+        let ups = f.list_multipart_uploads("buck").unwrap();
+        assert_eq!(ups.len(), 1);
+        assert_eq!(ups[0].upload_id, uid);
+        // Empty-bucket arg still scans all (server passes the real bucket though).
+        let all = f.list_multipart_uploads("").unwrap();
+        assert_eq!(all.len(), 1);
     }
 }

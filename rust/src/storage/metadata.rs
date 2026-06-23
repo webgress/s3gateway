@@ -108,8 +108,21 @@ pub fn write_metadata_durable(path: &Path, meta: &ObjectMetadata) -> io::Result<
 }
 
 /// Read+parse a metadata sidecar.
+///
+/// B1: open the sidecar with `O_NOFOLLOW` so a SYMLINK planted at the `.s3meta`
+/// path (pointing at an outside-root file) is rejected (ELOOP) rather than
+/// followed — `std::fs::read` follows symlinks. The sidecar is small JSON, so we
+/// read it through a plain buffered fd (NOT DioFile/O_DIRECT, which would impose
+/// alignment on a tiny metadata read).
 pub fn read_metadata(path: &Path) -> io::Result<ObjectMetadata> {
-    let data = std::fs::read(path)?;
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    let mut data = Vec::new();
+    f.read_to_end(&mut data)?;
     serde_json::from_slice(&data).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 

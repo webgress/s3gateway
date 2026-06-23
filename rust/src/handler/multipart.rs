@@ -61,6 +61,8 @@ pub async fn upload_part(
         .ok_or(S3ErrorCode::InvalidArgument)?;
 
     let is_streaming = super::is_chunked_upload(&req.headers);
+    let bucket = req.bucket.clone();
+    let key = req.key.clone();
 
     let bridge = super::body_to_blocking_read(req.body);
 
@@ -68,9 +70,9 @@ pub async fn upload_part(
     let etag = tokio::task::spawn_blocking(move || -> Result<String, StorageError> {
         if is_streaming {
             let reader = ChunkedReader::new(bridge);
-            fs.upload_part(&upload_id, part_number, reader)
+            fs.upload_part(&bucket, &key, &upload_id, part_number, reader)
         } else {
-            fs.upload_part(&upload_id, part_number, bridge)
+            fs.upload_part(&bucket, &key, &upload_id, part_number, bridge)
         }
     })
     .await
@@ -119,10 +121,12 @@ pub async fn complete_multipart_upload(
 
     let fs = ctx.fs.clone();
     let uid = upload_id.clone();
-    let etag = tokio::task::spawn_blocking(move || fs.complete_multipart_upload(&uid, &parts))
-        .await
-        .map_err(|_| S3ErrorCode::InternalError)?
-        .map_err(|e| map_storage_error(&e))?;
+    let (cb, ck) = (bucket.clone(), key.clone());
+    let etag =
+        tokio::task::spawn_blocking(move || fs.complete_multipart_upload(&cb, &ck, &uid, &parts))
+            .await
+            .map_err(|_| S3ErrorCode::InternalError)?
+            .map_err(|e| map_storage_error(&e))?;
 
     let result = CompleteMultipartUploadResult {
         location: format!("/{}/{}", bucket, key),
@@ -142,8 +146,10 @@ pub async fn abort_multipart_upload(
         .query1("uploadId")
         .ok_or(S3ErrorCode::InvalidArgument)?
         .to_string();
+    let bucket = req.bucket.clone();
+    let key = req.key.clone();
     let fs = ctx.fs.clone();
-    tokio::task::spawn_blocking(move || fs.abort_multipart_upload(&upload_id))
+    tokio::task::spawn_blocking(move || fs.abort_multipart_upload(&bucket, &key, &upload_id))
         .await
         .map_err(|_| S3ErrorCode::InternalError)?
         .map_err(|e| map_storage_error(&e))?;
@@ -163,7 +169,8 @@ pub async fn list_parts(ctx: &Ctx, req: HandlerRequest) -> Result<Response<RespB
 
     let fs = ctx.fs.clone();
     let uid = upload_id.clone();
-    let parts = tokio::task::spawn_blocking(move || fs.list_parts(&uid))
+    let (lb, lk) = (bucket.clone(), key.clone());
+    let parts = tokio::task::spawn_blocking(move || fs.list_parts(&lb, &lk, &uid))
         .await
         .map_err(|_| S3ErrorCode::InternalError)?
         .map_err(|e| map_storage_error(&e))?;

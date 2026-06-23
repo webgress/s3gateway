@@ -174,6 +174,11 @@ fn verify_header(
         return Err(SigV4Error::Skewed);
     }
 
+    // B2: AWS requires EVERY `x-amz-*` request header to be signed. If any such
+    // header is present but absent from SignedHeaders, an attacker could inject
+    // unsigned `x-amz-meta-*` (etc.) that the server would honor. Reject.
+    assert_all_amz_headers_signed(req, &sv.signed_headers)?;
+
     let cred = store
         .lookup(&sv.credential.access_key)
         .ok_or(SigV4Error::InvalidAccessKey)?;
@@ -262,6 +267,10 @@ fn verify_presigned(
         .split(';')
         .map(|s| s.to_string())
         .collect();
+
+    // B2: presigned requests must also sign every `x-amz-*` request header.
+    assert_all_amz_headers_signed(req, &signed_headers)?;
+
     let provided_sig = req.query1("X-Amz-Signature").unwrap_or("");
 
     let hashed_payload = req
@@ -421,6 +430,28 @@ fn canonical_request_for(
         req.escaped_path
     };
     get_canonical_request(req.method, url_path, &query_str, &extracted, hashed_payload)
+}
+
+/// B2: assert that every `x-amz-*` header present on the request is included in
+/// the client's SignedHeaders set. AWS mandates that all `x-amz-*` headers be
+/// signed; an unsigned one (e.g. an injected `x-amz-meta-*`) must be rejected as
+/// SignatureDoesNotMatch. Comparison is case-insensitive (header names are
+/// already lowercased in the request map; we lowercase the signed list too).
+fn assert_all_amz_headers_signed(
+    req: &SignableRequest,
+    signed_headers: &[String],
+) -> Result<(), SigV4Error> {
+    let signed_set: std::collections::BTreeSet<String> = signed_headers
+        .iter()
+        .map(|h| h.to_ascii_lowercase())
+        .collect();
+    for name in req.headers.keys() {
+        // req.headers keys are already lowercased (see router::collect_headers).
+        if name.starts_with("x-amz-") && !signed_set.contains(name) {
+            return Err(SigV4Error::SignatureMismatch);
+        }
+    }
+    Ok(())
 }
 
 /// Extract the values of the signed headers (lowercased name -> values),
@@ -1131,5 +1162,174 @@ mod tests {
         };
         let err = verify_request(&req, &store, region, now).unwrap_err();
         assert_eq!(err, SigV4Error::Skewed);
+    }
+
+    /// B2 helper: build a header-auth PUT that signs exactly `signed_header_names`
+    /// over the header map `h`. Inserts the computed `authorization` into `h`.
+    fn sign_header_request_with(
+        secret: &str,
+        access: &str,
+        region: &str,
+        now_unix: i64,
+        h: &mut BTreeMap<String, Vec<String>>,
+        signed_header_names: &[&str],
+    ) {
+        let service = "s3";
+        let yyyymmdd = {
+            let d = t::iso8601_from_unix(now_unix);
+            d[..8].to_string()
+        };
+        let amz_date = h.get("x-amz-date").unwrap()[0].clone();
+        let signed: Vec<String> = signed_header_names.iter().map(|s| s.to_string()).collect();
+        let req = SignableRequest {
+            method: "PUT",
+            escaped_path: "/bucket/key",
+            query: &BTreeMap::new(),
+            headers: h,
+            host: "localhost:8333",
+        };
+        let extracted = extract_signed_headers(&signed, &req);
+        let canonical =
+            get_canonical_request("PUT", "/bucket/key", "", &extracted, UNSIGNED_PAYLOAD);
+        let scope = get_scope(&yyyymmdd, region, service);
+        let sts = get_string_to_sign(&canonical, &amz_date, &scope);
+        let key = get_signing_key(secret, &yyyymmdd, region, service);
+        let sig = get_signature(&key, &sts);
+        let cred_str = format!(
+            "{}/{}/{}/{}/aws4_request",
+            access, yyyymmdd, region, service
+        );
+        let auth = format!(
+            "{} Credential={}, SignedHeaders={}, Signature={}",
+            SIGN_V4_ALGORITHM,
+            cred_str,
+            signed.join(";"),
+            sig
+        );
+        h.insert("authorization".into(), vec![auth]);
+    }
+
+    #[test]
+    fn unsigned_amz_header_rejected() {
+        // B2: a request with a VALID signature but an extra UNSIGNED `x-amz-meta-*`
+        // header must be rejected (SignatureDoesNotMatch). Mutation evidence:
+        // remove the `assert_all_amz_headers_signed` call in `verify_header` and
+        // this test fails (the unsigned header would be honored).
+        let store = CredentialStore::from_json(
+            br#"{"credentials":[{"accessKeyId":"AKID","secretAccessKey":"SECRET"}]}"#,
+        )
+        .unwrap();
+        let now = 1_700_000_000;
+        let amz_date = t::iso8601_from_unix(now);
+        let mut h = BTreeMap::new();
+        h.insert("host".into(), vec!["localhost:8333".into()]);
+        h.insert("x-amz-date".into(), vec![amz_date]);
+        h.insert("x-amz-content-sha256".into(), vec![UNSIGNED_PAYLOAD.into()]);
+        // Sign WITHOUT x-amz-meta-foo.
+        sign_header_request_with(
+            "SECRET",
+            "AKID",
+            "us-east-1",
+            now,
+            &mut h,
+            &["host", "x-amz-content-sha256", "x-amz-date"],
+        );
+        // Inject an UNSIGNED x-amz-meta-* header AFTER signing.
+        h.insert("x-amz-meta-foo".into(), vec!["evil".into()]);
+
+        let q = BTreeMap::new();
+        let req = SignableRequest {
+            method: "PUT",
+            escaped_path: "/bucket/key",
+            query: &q,
+            headers: &h,
+            host: "localhost:8333",
+        };
+        let err = verify_request(&req, &store, "us-east-1", now).unwrap_err();
+        assert_eq!(err, SigV4Error::SignatureMismatch);
+    }
+
+    #[test]
+    fn correctly_signed_amz_header_accepted() {
+        // B2 (positive): when the same `x-amz-meta-foo` header IS in SignedHeaders
+        // (and signed), the request succeeds.
+        let store = CredentialStore::from_json(
+            br#"{"credentials":[{"accessKeyId":"AKID","secretAccessKey":"SECRET"}]}"#,
+        )
+        .unwrap();
+        let now = 1_700_000_000;
+        let amz_date = t::iso8601_from_unix(now);
+        let mut h = BTreeMap::new();
+        h.insert("host".into(), vec!["localhost:8333".into()]);
+        h.insert("x-amz-date".into(), vec![amz_date]);
+        h.insert("x-amz-content-sha256".into(), vec![UNSIGNED_PAYLOAD.into()]);
+        h.insert("x-amz-meta-foo".into(), vec!["good".into()]);
+        // Sign INCLUDING x-amz-meta-foo.
+        sign_header_request_with(
+            "SECRET",
+            "AKID",
+            "us-east-1",
+            now,
+            &mut h,
+            &[
+                "host",
+                "x-amz-content-sha256",
+                "x-amz-date",
+                "x-amz-meta-foo",
+            ],
+        );
+        let q = BTreeMap::new();
+        let req = SignableRequest {
+            method: "PUT",
+            escaped_path: "/bucket/key",
+            query: &q,
+            headers: &h,
+            host: "localhost:8333",
+        };
+        let res = verify_request(&req, &store, "us-east-1", now).unwrap();
+        assert_eq!(res.access_key_id, "AKID");
+    }
+
+    #[test]
+    fn presigned_unsigned_amz_header_rejected() {
+        // B2: the same rule applies to presigned requests. A presigned URL whose
+        // SignedHeaders omits a present `x-amz-meta-*` header is rejected.
+        let store = CredentialStore::from_json(
+            br#"{"credentials":[{"accessKeyId":"AKID","secretAccessKey":"SECRET"}]}"#,
+        )
+        .unwrap();
+        let now = 1_700_000_000;
+        let amz_date = t::iso8601_from_unix(now);
+        let yyyymmdd = &amz_date[..8];
+        let region = "us-east-1";
+        let service = "s3";
+        let mut q: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        q.insert("X-Amz-Algorithm".into(), vec![SIGN_V4_ALGORITHM.into()]);
+        q.insert(
+            "X-Amz-Credential".into(),
+            vec![format!(
+                "AKID/{}/{}/{}/aws4_request",
+                yyyymmdd, region, service
+            )],
+        );
+        q.insert("X-Amz-Date".into(), vec![amz_date.clone()]);
+        q.insert("X-Amz-Expires".into(), vec!["3600".into()]);
+        q.insert("X-Amz-SignedHeaders".into(), vec!["host".into()]);
+        // A signature value is irrelevant: the amz-header check runs before the
+        // signature comparison.
+        q.insert("X-Amz-Signature".into(), vec!["deadbeef".into()]);
+        let mut h = BTreeMap::new();
+        h.insert("host".into(), vec!["localhost:8333".into()]);
+        // Present x-amz-meta-* header NOT in SignedHeaders (only host signed).
+        h.insert("x-amz-meta-foo".into(), vec!["evil".into()]);
+        let req = SignableRequest {
+            method: "GET",
+            escaped_path: "/bucket/key",
+            query: &q,
+            headers: &h,
+            host: "localhost:8333",
+        };
+        let err = verify_request(&req, &store, region, now).unwrap_err();
+        assert_eq!(err, SigV4Error::SignatureMismatch);
     }
 }
