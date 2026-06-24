@@ -775,6 +775,48 @@ acceptable for a pre-deployment clean break. Document this in README/DESIGN.
    rewrite) and Complete reads the dir — closest to today's `parts/{NNNNN}` model and keeps
    UploadPart maximally parallel. (Updated recommendation; supersedes the single-JSON note in §9.)
 
+### 13.6 Codex review pass B — resolutions & accepted limitations (IMPLEMENTED)
+
+- **B1 — Complete moves part blobs to fresh manifest-owned ids (live-data-loss fix, IMPLEMENTED).**
+  `CompleteMultipartUpload` no longer references the upload's part-blob ids verbatim. After the
+  A7 blob-stat, each part blob is MOVED to a fresh manifest-owned uuid via a same-filesystem
+  `rename(2)` (`blob::move_blob_to_new_id`) — O(1), **no data copy**, so the one-pass-MD5 /
+  no-copy payload invariant is preserved. The manifest references the NEW ids; the upload's
+  surviving `parts/*.ref` then point at the moved-away (now-ENOENT) OLD ids, so a stale upload
+  dir (best-effort rmdir failed, or a crash after publish) can NEVER cause a later Abort /
+  `gc_abandoned_uploads` / Complete-RETRY to delete the live object's blobs (the `commit_nonce`
+  rule alone could not protect this — old & new previously shared ids).
+  - *Retryability (E2):* if any per-part rename OR the subsequent commit fails, the renames done
+    so far are ROLLED BACK (each blob moved back to its original `.ref` id) and the error is
+    returned, leaving the upload intact and retryable.
+  - *Crash edge (accepted):* a crash MID-rename is safe — the manifest is not committed yet, so
+    no live object is affected; the partially-moved blobs become orphans the **opt-in**
+    `gc_orphan_blobs` reclaims (an in-flight upload dir's part blobs are otherwise treated as
+    referenced, so the routine GC never reaps them).
+  - After a successful commit the upload dir is removed best-effort — now SAFE, since its refs
+    are dangling.
+- **B2 — ListMultipartUploads scan is bounded by in-flight uploads (ACCEPTED, documented).**
+  `list_multipart_uploads` reads the candidate `arriving/{uuid}/` dirs before truncating to the
+  requested cap. The cost is bounded by the number of IN-FLIGHT uploads — operator-controlled
+  (every scanned dir is a live CreateMultipartUpload not yet Completed/Aborted/GC'd), exactly
+  analogous to the accepted whole-bucket `list_objects` walk that is bounded by live-object
+  count (§7.2). To keep a pathological `arriving/` from forcing an unbounded readdir, the scan
+  stops after a generous hard cap of `MAX_UPLOADS_CAP * 4` candidate dirs and sets
+  `is_truncated`. This is an accepted, documented limitation, not a blocker.
+- **B3 — ListObjectsV2 prefix walk-root is sanitized (traversal/DoS fix, IMPLEMENTED).** The
+  client `prefix` is a FILTER, never a path. `prefix_walk_root` now sanitizes the prefix's
+  dir-portion: any `..`/`.`/empty segment, or an absolute dir-portion, DROPS the subtree-prune
+  optimization and roots the walk at `current/`. The existing per-key `starts_with(prefix)`
+  filter then matches nothing for such an escaping prefix (no 400). Clean prefixes still prune.
+- **B4 — UploadPart propagates the `parts/` dir-fsync error (IMPLEMENTED).** Under `--fsync`,
+  a failed `parts/`-dir fsync is now propagated (not swallowed) and the just-written part ref +
+  blob are rolled back, so an ACKed part is never left with a non-durable dir entry.
+- **B5 — Reclaim keeps the journal on a genuine unlink error (blob-leak fix, IMPLEMENTED).**
+  `publish`, `delete_object`, and `apply_journal` now remove the reclaim journal ONLY when every
+  reclaim succeeded (Ok, including the missing/invalid no-op). A real unlink error (e.g. EIO)
+  leaves the journal in place so `recover()` retries the reclaim (the §3.2 nonce / "K absent"
+  rules keep the retry safe), instead of dropping the journal and leaking the blob.
+
 ---
 
 ## 14. Phased implementation plan (dispatchable to coders)

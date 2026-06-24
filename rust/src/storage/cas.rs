@@ -131,6 +131,20 @@ fn simulated_crash() -> StorageError {
     StorageError::Io(io::Error::other("simulated crash (test fault injection)"))
 }
 
+// B4 test hook: when armed, `upload_part`'s `parts/`-dir fsync (under `--fsync`)
+// is forced to fail, so a test can prove the error is PROPAGATED (not swallowed)
+// and the just-written part is rolled back. Thread-local — never leaks across the
+// parallel test runner. Compiles out entirely in non-test builds.
+#[cfg(test)]
+thread_local! {
+    static FORCE_PARTS_FSYNC_FAIL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_force_parts_fsync_fail(v: bool) {
+    FORCE_PARTS_FSYNC_FAIL.with(|c| c.set(v));
+}
+
 /// Test-only, DETERMINISTIC injection points that let a test reproduce the exact
 /// two-writer interleaving the per-key publish lock (`lock_key`) exists to
 /// prevent — without any sleeps or timing races. Ported from the (removed)
@@ -903,15 +917,26 @@ impl CasStore {
 
         // ---- step 4: reclaim OLD blobs (idempotent) ----
         if let Some((jpath, journal)) = &journal_path {
+            // B5 [blob leak]: track whether EVERY reclaim succeeded (Ok, incl. the
+            // no-op on a missing/invalid id, which `reclaim_blob` reports as Ok). A
+            // genuine unlink error (e.g. EIO) means the blob is NOT yet reclaimed; if
+            // we still deleted the journal the blob would leak with nothing to retry it.
+            // So: only remove the journal when ALL reclaims succeeded — otherwise LEAVE
+            // it for `recover()` to retry (the §3.2 nonce rule keeps the retry safe).
+            let mut all_reclaimed = true;
             for blob_id in &journal.blobs {
-                let _ = blob::reclaim_blob(&bucket_root, blob_id);
+                if blob::reclaim_blob(&bucket_root, blob_id).is_err() {
+                    all_reclaimed = false;
+                }
             }
             #[cfg(test)]
             if fault_armed(FaultPoint::BeforeJournalCleanup) {
                 return Ok(());
             }
-            // ---- step 5: cleanup the journal ----
-            let _ = std::fs::remove_file(jpath);
+            // ---- step 5: cleanup the journal (only if the reclaim fully landed) ----
+            if all_reclaimed {
+                let _ = std::fs::remove_file(jpath);
+            }
         }
         Ok(())
     }
@@ -974,11 +999,19 @@ impl CasStore {
             }
         }
 
-        // reclaim + cleanup.
+        // reclaim + cleanup. B5: only remove the journal if EVERY blob was reclaimed
+        // (Ok, incl. the missing/invalid no-op); a genuine unlink error (EIO) leaves
+        // the journal so `recover()` retries the reclaim (the delete-mode rule "K
+        // absent" stays true, so the retry is safe). Otherwise the blob would leak.
+        let mut all_reclaimed = true;
         for blob_id in &journal.blobs {
-            let _ = blob::reclaim_blob(&bucket_root, blob_id);
+            if blob::reclaim_blob(&bucket_root, blob_id).is_err() {
+                all_reclaimed = false;
+            }
         }
-        let _ = std::fs::remove_file(&jpath);
+        if all_reclaimed {
+            let _ = std::fs::remove_file(&jpath);
+        }
 
         // prune now-empty ancestor dirs in current/ up to (not incl.) current/.
         let mut dir = k.parent().map(PathBuf::from);
@@ -1204,6 +1237,11 @@ impl CasStore {
         };
 
         let mut stats = ReclaimStats::default();
+        // B5: track whether every ATTEMPTED reclaim actually landed. A genuine unlink
+        // error (e.g. EIO) means the blob is NOT yet reclaimed; we then KEEP the journal
+        // so a future `recover()` retries it, rather than deleting the journal and
+        // leaking the blob with nothing to drive the retry.
+        let mut all_reclaimed = true;
         if execute {
             for blob_id in &journal.blobs {
                 // A4: a journal is on-disk data (a planted/corrupt one could carry a
@@ -1215,18 +1253,25 @@ impl CasStore {
                     continue;
                 }
                 if blob::blob_path(&bucket_root, blob_id).exists() {
-                    let _ = blob::reclaim_blob(&bucket_root, blob_id);
-                    stats.blobs_deleted += 1;
+                    match blob::reclaim_blob(&bucket_root, blob_id) {
+                        Ok(()) => stats.blobs_deleted += 1,
+                        // A real unlink failure: leave this blob + keep the journal.
+                        Err(_) => all_reclaimed = false,
+                    }
                 }
             }
         }
-        // Always remove the journal: either we executed it, or the live manifest
-        // shows the commit/delete didn't land (the blobs are still-live-old or a
-        // later journal owns them, and the fallback GC backstops genuine orphans).
-        match std::fs::remove_file(journal_path) {
-            Ok(()) => stats.journals_removed += 1,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e.into()),
+        // Remove the journal UNLESS an executed reclaim genuinely failed. When `execute`
+        // is false (commit/delete didn't land — blobs are still-live-old or a later
+        // journal owns them) `all_reclaimed` stays true and we drop the journal as
+        // before; the fallback GC backstops genuine orphans. When a reclaim errored we
+        // KEEP the journal so `recover()` retries (B5).
+        if all_reclaimed {
+            match std::fs::remove_file(journal_path) {
+                Ok(()) => stats.journals_removed += 1,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
         }
         Ok(stats)
     }
@@ -1911,11 +1956,29 @@ impl CasStore {
             return Err(e.into());
         }
         guard.disarm();
-        // A6: under --fsync, fsync the `parts/` dir so the renamed `.ref` directory
+        // A6/B4: under --fsync, fsync the `parts/` dir so the renamed `.ref` directory
         // ENTRY is durable — otherwise a crash can lose an acknowledged part-ref while
-        // its part blob (already fsynced) lingers as an orphan.
+        // its part blob (already fsynced) lingers as an orphan. B4: PROPAGATE this error
+        // rather than swallowing it — an UploadPart that ACKs a part whose dir entry is
+        // not confirmed durable is a false durability promise. On failure, roll back the
+        // just-installed ref + its new blob (matching the failure-arm posture above) so
+        // the part number is left in its prior state and the client can retry the part.
         if self.fsync {
-            let _ = super::directio::fsync_dir(&upload_dir.join("parts"));
+            let fsync_res = {
+                #[cfg(test)]
+                if FORCE_PARTS_FSYNC_FAIL.with(|c| c.get()) {
+                    Err(io::Error::other("forced parts/ dir fsync failure (test)"))
+                } else {
+                    super::directio::fsync_dir(&upload_dir.join("parts"))
+                }
+                #[cfg(not(test))]
+                super::directio::fsync_dir(&upload_dir.join("parts"))
+            };
+            if let Err(e) = fsync_res {
+                let _ = std::fs::remove_file(&ref_path);
+                let _ = blob::reclaim_blob(&bucket_root, &info.blob_id);
+                return Err(e.into());
+            }
         }
         // The superseded part's blob (if any) is now unreferenced -> reclaim it.
         if let Some(old) = prev_blob {
@@ -2028,24 +2091,53 @@ impl CasStore {
         let stored = Self::read_part_refs(&upload_dir)?;
         let bucket_root = self.bucket_root(&upload.bucket);
 
-        // Validate each claimed part against its stored ref; build the ordered
-        // manifest parts referencing the part blobs.
+        // B1 [HIGH — live data loss]: the committed manifest must own its part blobs
+        // under FRESH ids that the upload's `.ref`s do NOT name. Otherwise the upload's
+        // refs and the live manifest would share blob ids, so a surviving upload dir
+        // (rmdir failed, or a crash after publish) lets a later abort/gc/Complete-RETRY
+        // reclaim those shared ids — deleting the LIVE object's blobs (the commit_nonce
+        // rule cannot protect this: old & new share ids). After A7's stat, we MOVE each
+        // part blob to a new manifest-owned uuid via a same-filesystem `rename` (O(1),
+        // NO data copy — the one-pass-MD5 / no-copy payload invariant is preserved); the
+        // manifest references the NEW id and the surviving refs point at the moved-away
+        // (now-ENOENT) OLD id, so any later reclaim through those refs is a no-op.
+        //
+        // `moved` records (new_manifest_id, original_ref_id) so a failure of a LATER
+        // rename OR the commit can roll the moves back (move each blob to its original
+        // ref id), leaving the upload intact and RETRYABLE (E2). A crash MID-rename is
+        // acceptable: the manifest is not committed yet, so no live object is affected;
+        // the partially-moved blobs become orphans the opt-in `gc_orphan_blobs` reclaims.
         let mut manifest_parts: Vec<ManifestPartRef> = Vec::with_capacity(parts.len());
         let mut md5_concat: Vec<u8> = Vec::with_capacity(parts.len() * 16);
         let mut total: u64 = 0;
+        let mut moved: Vec<(String, String)> = Vec::with_capacity(parts.len());
+
+        // Roll back any blobs already moved to manifest-owned ids, restoring them to
+        // their original ref ids so the upload stays retryable. Best-effort on unwind.
+        let rollback_moves = |moved: &[(String, String)]| {
+            for (new_id, orig_id) in moved {
+                let _ = blob::move_blob_back(&bucket_root, new_id, orig_id);
+            }
+        };
+
         for p in parts {
             let stored_ref = match stored.get(&(p.part_number as u32)) {
                 Some(r) => r,
-                None => return Err(StorageError::InvalidPart),
+                None => {
+                    rollback_moves(&moved);
+                    return Err(StorageError::InvalidPart);
+                }
             };
             // F15: an empty client ETag is NOT a free pass — reject it, then compare.
             let provided = p.etag.trim_matches('"');
             if provided.is_empty() || provided != stored_ref.md5_hex {
+                rollback_moves(&moved);
                 return Err(StorageError::InvalidPart);
             }
             // The blob backing the ref must be a syntactically valid uuid (it always
             // is when written by UploadPart; this guards a hand-tampered ref).
             if !blob::is_valid_blob_id(&stored_ref.blob_id) {
+                rollback_moves(&moved);
                 return Err(StorageError::InvalidPart);
             }
             // A7: do not trust the ref blindly — STAT the referenced blob before
@@ -2059,15 +2151,29 @@ impl CasStore {
             let blob_p = blob::blob_path(&bucket_root, &stored_ref.blob_id);
             match std::fs::symlink_metadata(&blob_p) {
                 Ok(m) if m.file_type().is_file() && m.len() == stored_ref.size => {}
-                _ => return Err(StorageError::InvalidPart),
+                _ => {
+                    rollback_moves(&moved);
+                    return Err(StorageError::InvalidPart);
+                }
             }
+            // B1: hand the blob to a fresh manifest-owned id (no data copy). On failure
+            // roll back the moves done so far and leave the upload intact.
+            let new_id = match blob::move_blob_to_new_id(&bucket_root, &stored_ref.blob_id) {
+                Ok(id) => id,
+                Err(e) => {
+                    rollback_moves(&moved);
+                    return Err(e.into());
+                }
+            };
+            moved.push((new_id.clone(), stored_ref.blob_id.clone()));
+
             let raw = hex::decode(&stored_ref.md5_hex)
                 .map_err(|_| StorageError::InvalidPart)?;
             md5_concat.extend_from_slice(&raw);
             total += stored_ref.size;
             manifest_parts.push(ManifestPartRef {
                 part_number: p.part_number as u32,
-                blob_id: stored_ref.blob_id.clone(),
+                blob_id: new_id,
                 size: stored_ref.size,
                 md5_hex: stored_ref.md5_hex.clone(),
             });
@@ -2099,16 +2205,21 @@ impl CasStore {
             commit_nonce: Manifest::new_nonce(),
         };
 
-        // COMMIT via the §3 publish path. The part blobs already live in `blobs/`
-        // (written+fsynced by UploadPart), so publish just stages+journals+renames
-        // the manifest — no part data is copied. A pre-commit failure here returns
-        // Err WITHOUT touching the upload's blobs/refs -> the upload stays RETRYABLE
-        // (E2). We do NOT roll back the part blobs (unlike single-PUT) because they
-        // are owned by the still-live upload, not by this attempt.
-        self.publish(&upload.bucket, &upload.key, &manifest)?;
+        // COMMIT via the §3 publish path. The part blobs now live under FRESH manifest-
+        // owned ids (moved above), so publish just stages+journals+renames the manifest
+        // — no part data is copied. On a pre-commit failure we ROLL BACK the moves
+        // (restoring the blobs to their original ref ids) and return Err WITHOUT having
+        // removed the upload dir -> the upload stays RETRYABLE (E2).
+        if let Err(e) = self.publish(&upload.bucket, &upload.key, &manifest) {
+            rollback_moves(&moved);
+            return Err(e);
+        }
 
-        // Success: remove the upload working dir. The part blobs are now owned by the
-        // committed manifest; only the refs + upload.json are discarded.
+        // Success: remove the upload working dir. This is now SAFE as best-effort — the
+        // upload's `.ref`s point at the moved-away (ENOENT) original ids, so even if the
+        // rmdir fails (or a crash hits here) any later abort/gc/Complete-RETRY reclaim
+        // through those dangling refs is a harmless no-op that can never touch the live
+        // object's freshly-id'd blobs.
         let _ = std::fs::remove_dir_all(&upload_dir);
         Ok(etag)
     }
@@ -2180,6 +2291,16 @@ impl CasStore {
     /// ListMultipartUploads for `bucket`, BOUNDED by `max_uploads` (E7: hard-capped
     /// at [`MAX_UPLOADS_CAP`], returns `is_truncated`). Scans `arriving/{uuid}/
     /// upload.json`. Signature identical to `Filesystem::list_multipart_uploads`.
+    ///
+    /// B2 [accepted-by-design]: this reads up to a bounded number of upload dirs
+    /// BEFORE truncating to `cap`. The cost is bounded by the number of IN-FLIGHT
+    /// uploads (operator-controlled — every dir scanned is a live CreateMultipartUpload
+    /// that has not yet been Completed/Aborted/GC'd), exactly like the accepted whole-
+    /// bucket [`list_objects`] walk that is bounded by the number of live objects. To
+    /// keep a pathological `arriving/` (e.g. many never-finished uploads) from forcing
+    /// an unbounded scan, we stop after a GENEROUS hard cap of `MAX_UPLOADS_CAP * 4`
+    /// candidate dirs and report `is_truncated` — the page is still correct, just
+    /// capped. Documented in REDESIGN.md §13.6.
     pub fn list_multipart_uploads(
         &self,
         bucket: &str,
@@ -2187,6 +2308,9 @@ impl CasStore {
     ) -> Result<(Vec<MultipartUpload>, bool)> {
         self.head_bucket(bucket)?;
         let cap = max_uploads.min(MAX_UPLOADS_CAP);
+        // Generous hard scan cap so a pathologically large `arriving/` cannot force an
+        // unbounded readdir; well above any realistic in-flight-upload count.
+        let scan_cap = MAX_UPLOADS_CAP.saturating_mul(4);
         let arriving = self.arriving_root(bucket);
         let rd = match std::fs::read_dir(&arriving) {
             Ok(rd) => rd,
@@ -2194,12 +2318,19 @@ impl CasStore {
             Err(e) => return Err(e.into()),
         };
         let mut out = Vec::new();
+        let mut scanned = 0usize;
+        let mut scan_capped = false;
         for entry in rd {
             let entry = entry?;
             // Only `{uuid}/` working dirs are uploads; staged `{uuid}.manifest`
             // files (single-PUT/Complete temps) are not.
             if !entry.file_type()?.is_dir() {
                 continue;
+            }
+            scanned += 1;
+            if scanned > scan_cap {
+                scan_capped = true;
+                break;
             }
             let meta_path = entry.path().join("upload.json");
             let data = match read_nofollow(&meta_path) {
@@ -2211,8 +2342,8 @@ impl CasStore {
             }
         }
         out.sort_by(|a, b| a.key.cmp(&b.key).then_with(|| a.upload_id.cmp(&b.upload_id)));
-        let is_truncated = out.len() > cap;
-        if is_truncated {
+        let is_truncated = scan_capped || out.len() > cap;
+        if out.len() > cap {
             out.truncate(cap);
         }
         Ok((out, is_truncated))
@@ -2394,8 +2525,23 @@ impl CasStore {
             Some(idx) => &prefix[..idx], // segments before the last slash
             None => "",
         };
+        // B3 [traversal/DoS]: the client prefix is UNTRUSTED. A dir-portion like
+        // `../../x` (or an absolute path) would, if pushed verbatim, root the walk
+        // OUTSIDE `current/` and make the server recursively readdir arbitrary host
+        // directories (unbounded-I/O DoS; results are suppressed by the strip_prefix +
+        // `starts_with(prefix)` filter, but the walk still happens). The prefix is only
+        // a FILTER, never a path: if any dir-portion segment is `..`/`.`/empty, or the
+        // dir-portion is absolute, we DROP the prune optimization and root at
+        // `current_root`. The existing per-key `starts_with(prefix)` filter then matches
+        // nothing for such an escaping prefix (correct, no 400). A clean prefix still
+        // prunes to its subtree below.
+        let dir_safe = !dir_portion.is_empty()
+            && !Path::new(dir_portion).is_absolute()
+            && dir_portion
+                .split('/')
+                .all(|seg| !seg.is_empty() && seg != "." && seg != "..");
         let mut root = current_root.to_path_buf();
-        if !dir_portion.is_empty() {
+        if dir_safe {
             for seg in dir_portion.split('/') {
                 root.push(seg);
             }
@@ -4065,6 +4211,60 @@ mod tests {
     }
 
     #[test]
+    fn apply_journal_keeps_journal_when_reclaim_unlink_fails_then_recover_retries() {
+        // B5 [LOW — blob leak], LOAD-BEARING for the keep-journal decision. The reclaim
+        // step unlinks blobs then removes the journal. Before the fix the journal was
+        // removed UNCONDITIONALLY (`let _ = reclaim_blob(...)`), so a transient unlink
+        // error (e.g. EIO) leaked the blob with NO journal left to drive a retry. The
+        // fix keeps the journal whenever any reclaim genuinely errored, so `recover()`
+        // retries it.
+        //
+        // We force a real unlink error by making the blob's fanout PARENT directory
+        // read-only (no write perm -> `remove_file` fails EACCES for a non-root user).
+        //
+        // Fail-without-fix: revert to unconditional `remove_file(journal)` and the
+        // first assert (journal still present) FAILS.
+        use std::os::unix::fs::PermissionsExt as _;
+        let (dir, fs) = store();
+        let bk = dir.path().join("bkt");
+        let info = blob::write_blob(&bk, &b"blob whose unlink will fail"[..]).unwrap();
+        let blob_p = blob::blob_path(&bk, &info.blob_id);
+        let blob_parent = blob_p.parent().unwrap().to_path_buf();
+
+        let jpath = bk.join("deleted").join(format!("{}.journal", Uuid::new_v4()));
+        let j = Journal {
+            mode: JournalMode::Delete,
+            supersedes_key: "gone".into(), // absent key -> delete journal EXECUTES
+            commit_nonce: String::new(),
+            expected_new_etag: String::new(),
+            blobs: vec![info.blob_id.clone()],
+        };
+        fs.write_journal(&jpath, &j).unwrap();
+
+        // Make the blob un-unlinkable: drop write permission on its parent dir.
+        let orig_mode = std::fs::metadata(&blob_parent).unwrap().permissions();
+        std::fs::set_permissions(&blob_parent, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        // apply_journal: the unlink fails -> the journal is KEPT (not removed), and the
+        // blob is still present.
+        let stats = fs.apply_journal("bkt", &jpath).unwrap();
+        // Restore perms regardless of outcome so the temp dir cleans up.
+        std::fs::set_permissions(&blob_parent, orig_mode).unwrap();
+
+        assert_eq!(stats.blobs_deleted, 0, "the unlink failed -> nothing counted deleted");
+        assert_eq!(stats.journals_removed, 0, "the journal must NOT be removed on reclaim failure");
+        assert!(jpath.exists(), "journal must remain so recover() can retry the reclaim");
+        assert!(blob_p.exists(), "the blob is still present (its unlink failed)");
+
+        // recover() now retries (perms restored): the blob is reclaimed and the journal
+        // removed.
+        let rec = fs.recover().unwrap();
+        assert!(rec.journals_processed >= 1, "recover() should have processed the kept journal");
+        assert!(!blob_p.exists(), "recover() retry reclaims the blob");
+        assert!(!jpath.exists(), "recover() retry removes the journal once the blob is gone");
+    }
+
+    #[test]
     fn planted_journal_with_escaping_blob_id_does_not_unlink_outside() {
         // A4 [HIGH], LOAD-BEARING. recover()/apply_journal unlinks blob ids listed in a
         // `deleted/{uuid}.journal`, which is ON-DISK data. A planted/corrupt journal
@@ -4571,6 +4771,122 @@ mod tests {
     }
 
     #[test]
+    fn complete_moves_part_blobs_so_surviving_refs_cannot_delete_live_object() {
+        // B1 [HIGH — LIVE DATA LOSS], LOAD-BEARING. Reproduces the stale-`.ref` bug:
+        // before the fix, CompleteMultipartUpload referenced the UPLOAD's part-blob ids
+        // verbatim and only best-effort removed the upload dir. If the rmdir failed (or
+        // a crash hit after publish) the surviving `arriving/{uuid}/parts/*.ref` pointed
+        // at the LIVE committed object's blobs, so a later Abort / gc_abandoned_uploads /
+        // Complete-RETRY would reclaim those shared ids and DELETE the live object's
+        // blobs (GET -> ObjectNotFound). The fix MOVES each part blob to a fresh
+        // manifest-owned uuid on Complete, so the surviving refs name moved-away (ENOENT)
+        // ids and any reclaim through them is a harmless no-op.
+        //
+        // Fail-without-fix: revert the rename-on-complete and step (i)/(ii) below delete
+        // the live object's blobs -> the GET / count_blobs / consistency asserts FAIL.
+        let (dir, fs) = store();
+        let bk = dir.path().join("bkt");
+        let key = "live/object.bin";
+        let (upload_id, parts, etags) = upload_3_parts(&fs, "bkt", key);
+
+        // Snapshot the upload's part `.ref` BYTES (which name the part-blob ids) BEFORE
+        // Complete, so we can recreate a SURVIVING upload dir afterward — modelling "the
+        // best-effort rmdir failed / the refs lingered".
+        let upload_dir = bk.join("arriving").join(&upload_id);
+        let parts_dir = upload_dir.join("parts");
+        let upload_json = std::fs::read(upload_dir.join("upload.json")).unwrap();
+        let saved_refs: Vec<(String, Vec<u8>)> = std::fs::read_dir(&parts_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| {
+                (
+                    e.file_name().to_string_lossy().into_owned(),
+                    std::fs::read(e.path()).unwrap(),
+                )
+            })
+            .collect();
+
+        // Complete the upload. With the fix this MOVES the 3 part blobs to fresh ids.
+        let complete: Vec<CompletePart> = (0..3)
+            .map(|i| CompletePart { part_number: (i + 1) as i32, etag: etags[i].clone() })
+            .collect();
+        let composite = fs
+            .complete_multipart_upload("bkt", key, &upload_id, &complete)
+            .unwrap();
+
+        // The live object is intact: exactly 3 blobs, GET returns the exact bytes.
+        let mut want = Vec::new();
+        for p in &parts {
+            want.extend_from_slice(p);
+        }
+        let live_blob_count = count_blobs(&bk);
+        assert_eq!(live_blob_count, 3, "committed object owns exactly its 3 blobs");
+        assert_object_consistent(&fs, "bkt", key).unwrap();
+        let got = read_all(fs.get_object("bkt", key, None).unwrap().body);
+        assert_eq!(md5_hex(&got), md5_hex(&want), "live object bytes after Complete");
+
+        // Re-PLANT the surviving upload dir with the ORIGINAL refs (pointing at the
+        // pre-Complete blob ids). Before the fix those ids are the live object's blobs;
+        // with the fix they were moved away and no longer exist.
+        std::fs::create_dir_all(&parts_dir).unwrap();
+        std::fs::write(upload_dir.join("upload.json"), &upload_json).unwrap();
+        for (name, data) in &saved_refs {
+            std::fs::write(parts_dir.join(name), data).unwrap();
+        }
+
+        // (i) Abort that uploadId: it reclaims the blobs named by the surviving refs.
+        fs.abort_multipart_upload("bkt", key, &upload_id).unwrap();
+        assert_eq!(
+            count_blobs(&bk),
+            3,
+            "Abort via the surviving refs must NOT touch the live object's blobs"
+        );
+        assert_object_consistent(&fs, "bkt", key)
+            .unwrap_or_else(|e| panic!("live object damaged by stale-ref Abort: {e}"));
+        let got = read_all(fs.get_object("bkt", key, None).unwrap().body);
+        assert_eq!(md5_hex(&got), md5_hex(&want), "live object survives Abort");
+
+        // (ii) gc_abandoned_uploads: re-plant the dir again (Abort removed it) and age
+        // it past the threshold so the sweeper reaps it via the surviving refs.
+        std::fs::create_dir_all(&parts_dir).unwrap();
+        std::fs::write(upload_dir.join("upload.json"), &upload_json).unwrap();
+        for (name, data) in &saved_refs {
+            std::fs::write(parts_dir.join(name), data).unwrap();
+        }
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(48 * 3600);
+        set_mtime(&upload_dir.join("upload.json"), old);
+        fs.gc_abandoned_uploads(std::time::Duration::from_secs(3600))
+            .unwrap();
+        assert_eq!(
+            count_blobs(&bk),
+            3,
+            "gc_abandoned_uploads via the surviving refs must NOT touch the live blobs"
+        );
+        let got = read_all(fs.get_object("bkt", key, None).unwrap().body);
+        assert_eq!(md5_hex(&got), md5_hex(&want), "live object survives GC");
+
+        // (iii) A Complete RETRY for the same uploadId must not destroy the object.
+        // Re-plant the dir; the retry either no-ops (blobs gone -> InvalidPart, upload
+        // intact) or re-commits, but EITHER WAY the live object's bytes are preserved.
+        std::fs::create_dir_all(&parts_dir).unwrap();
+        std::fs::write(upload_dir.join("upload.json"), &upload_json).unwrap();
+        for (name, data) in &saved_refs {
+            std::fs::write(parts_dir.join(name), data).unwrap();
+        }
+        let _ = fs.complete_multipart_upload("bkt", key, &upload_id, &complete);
+        assert_object_consistent(&fs, "bkt", key)
+            .unwrap_or_else(|e| panic!("live object damaged by Complete RETRY: {e}"));
+        let got = read_all(fs.get_object("bkt", key, None).unwrap().body);
+        assert_eq!(
+            md5_hex(&got),
+            md5_hex(&want),
+            "live object survives a Complete RETRY against the surviving upload dir"
+        );
+        // The HEAD etag is unchanged (still the composite from the first Complete).
+        assert_eq!(fs.head_object("bkt", key).unwrap().etag, composite);
+    }
+
+    #[test]
     fn multipart_under_fsync_dir_fsync_path_round_trips() {
         // A6 [MED]. Under --fsync, CreateMultipartUpload and UploadPart fsync the
         // CONTAINING directories (arriving/, the upload dir, parts/) so the upload.json
@@ -4604,6 +4920,58 @@ mod tests {
         let got = read_all(fs.get_object("bkt", key, None).unwrap().body);
         assert_eq!(got, want, "fsync-path multipart object must round-trip exactly");
         assert_object_consistent(&fs, "bkt", key).unwrap();
+    }
+
+    #[test]
+    fn upload_part_propagates_parts_dir_fsync_error_and_rolls_back() {
+        // B4 [MED]. Under --fsync, UploadPart fsyncs the `parts/` dir so the renamed
+        // `.ref` ENTRY is durable. The fsync error must be PROPAGATED (not swallowed) —
+        // a part ACKed with a non-durable dir entry is a false durability promise — and
+        // the just-written part (ref + blob) must be rolled back so the part number is
+        // left in its prior state and the client can retry.
+        //
+        // Fail-without-fix: revert the `?`-propagation (`let _ = fsync_dir(...)`) and the
+        // upload_part below returns Ok(_) instead of Err -> the asserts FAIL.
+        let dir = tempfile::tempdir().unwrap();
+        let fs = CasStore::with_fsync(dir.path(), true); // --fsync ON
+        fs.create_bucket("bkt").unwrap();
+        let bk = dir.path().join("bkt");
+        let key = "fsync/part";
+        let upload_id = fs
+            .create_multipart_upload("bkt", key, "application/octet-stream", BTreeMap::new())
+            .unwrap();
+
+        // Arm the parts/-dir fsync failure for the next upload_part on this thread.
+        set_force_parts_fsync_fail(true);
+        let res = fs.upload_part("bkt", key, &upload_id, 1, &vec![9u8; 4096][..]);
+        set_force_parts_fsync_fail(false);
+
+        // The error PROPAGATED.
+        assert!(
+            matches!(res, Err(StorageError::Io(_))),
+            "parts/ dir-fsync error must propagate from upload_part, got {res:?}"
+        );
+        // Rolled back: no `.ref` installed, and the part blob was reclaimed (0 blobs).
+        let upload_dir = bk.join("arriving").join(&upload_id);
+        assert!(
+            !upload_dir.join("parts").join("00001.ref").exists(),
+            "the part ref must be rolled back on a propagated fsync error"
+        );
+        assert_eq!(
+            count_blobs(&bk),
+            0,
+            "the part blob must be reclaimed on a propagated fsync error"
+        );
+        assert!(
+            fs.list_parts("bkt", key, &upload_id).unwrap().is_empty(),
+            "no part should be recorded after the rolled-back upload_part"
+        );
+
+        // A subsequent (un-armed) retry of the same part succeeds and is durable.
+        let etag = fs.upload_part("bkt", key, &upload_id, 1, &vec![9u8; 4096][..]).unwrap();
+        assert_eq!(etag, format!("\"{}\"", md5_hex(&vec![9u8; 4096])));
+        assert_eq!(count_blobs(&bk), 1);
+        assert_eq!(fs.list_parts("bkt", key, &upload_id).unwrap().len(), 1);
     }
 
     #[test]
@@ -5108,6 +5476,76 @@ mod tests {
         input2.prefix = "alpha/".into();
         let out2 = fs.list_objects(&input2).unwrap();
         assert_eq!(keys_of(&out2), vec!["alpha/1", "alpha/2"]);
+    }
+
+    #[test]
+    fn list_prefix_with_dotdot_does_not_escape_walk_root() {
+        // B3 [MED — API-reachable traversal/DoS], LOAD-BEARING. A client ListObjectsV2
+        // `prefix` is a FILTER, never a path. Before the fix, `prefix_walk_root` pushed
+        // the prefix's dir-portion segments onto `current_root` with NO sanitization, so
+        // a prefix like `../<sentinel>/...` rooted the recursive walk OUTSIDE `current/`
+        // — an unbounded-readdir DoS over arbitrary host dirs. The fix sanitizes the
+        // dir-portion: any `..`/`.`/empty segment (or an absolute dir-portion) DROPS the
+        // prune and roots the walk at `current_root`; the per-key `starts_with(prefix)`
+        // filter then matches nothing (no 400 — the escaping prefix is simply unmatched).
+        //
+        // Fail-without-fix: revert the sanitization and `walk_root` resolves to the
+        // sentinel dir OUTSIDE current/, so the assert `walk_root == current_root` FAILS.
+        let (dir, fs) = store();
+        let bk = dir.path().join("bkt");
+        let current_root = bk.join("current");
+
+        // Plant a SENTINEL directory OUTSIDE current/ (a sibling under the bucket root),
+        // containing a manifest-looking file. If the walk ever escaped to it, the walk
+        // would readdir here. It must NEVER be read.
+        let sentinel = bk.join("escape-sentinel");
+        std::fs::create_dir_all(&sentinel).unwrap();
+        std::fs::write(
+            sentinel.join("leaked.s3gw-live.meta"),
+            b"{\"should\":\"never be listed\"}",
+        )
+        .unwrap();
+
+        // A legitimate object so the bucket is non-empty.
+        put(&fs, "real/key");
+
+        // The escaping prefix's dir-portion is `../escape-sentinel` -> walk_root MUST
+        // fall back to current_root (no escape).
+        let escaping_prefix = "../escape-sentinel/leaked";
+        let (walk_root, strip) = fs.prefix_walk_root(&current_root, escaping_prefix);
+        assert_eq!(
+            walk_root, current_root,
+            "escaping prefix must NOT root the walk outside current/"
+        );
+        assert_eq!(strip, current_root);
+
+        // End-to-end: the listing with the escaping prefix returns NOTHING (the sentinel
+        // is never surfaced) and does not error.
+        let mut input = li("bkt");
+        input.prefix = escaping_prefix.to_string();
+        let out = fs.list_objects(&input).unwrap();
+        assert!(
+            out.objects.is_empty() && out.common_prefixes.is_empty(),
+            "escaping prefix must match nothing, got {out:?}"
+        );
+
+        // A normal directory-boundary prefix still prunes to its subtree.
+        let (clean_root, _) = fs.prefix_walk_root(&current_root, "real/");
+        assert_eq!(
+            clean_root,
+            current_root.join("real"),
+            "a clean prefix must still prune to current/real/"
+        );
+        let mut input2 = li("bkt");
+        input2.prefix = "real/".into();
+        let out2 = fs.list_objects(&input2).unwrap();
+        assert_eq!(keys_of(&out2), vec!["real/key"]);
+
+        // Absolute and `.`-laden dir-portions also fall back to current_root.
+        let (abs_root, _) = fs.prefix_walk_root(&current_root, "/etc/passwd");
+        assert_eq!(abs_root, current_root);
+        let (dot_root, _) = fs.prefix_walk_root(&current_root, "./x/y");
+        assert_eq!(dot_root, current_root);
     }
 
     #[test]

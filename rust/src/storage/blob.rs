@@ -141,6 +141,43 @@ pub fn write_blob<R: Read>(bucket_root: &Path, mut body: R) -> io::Result<BlobIn
     })
 }
 
+/// Move an existing blob to a FRESH uuid id via a same-filesystem `rename` (O(1),
+/// NO data copy), returning the new id. Used by CompleteMultipartUpload to give the
+/// committed manifest sole ownership of the part blobs: after the move the upload's
+/// surviving `.ref`s point at the now-ENOENT OLD id, so any later abort/gc/retry
+/// reclaim through those refs is a harmless no-op that can never touch the live
+/// object's blobs (REDESIGN §6 / Codex pass B1).
+///
+/// `rename(2)` within one filesystem is atomic and does not copy the bytes — the
+/// blob's inode is untouched, preserving the one-pass-MD5 / no-data-copy payload
+/// invariant. The destination's two fanout parent dirs are created first. The `from`
+/// id is assumed already validated (it came from a stored ref Complete vetted); the
+/// `to` id is a freshly minted uuid.
+pub fn move_blob_to_new_id(bucket_root: &Path, from_id: &str) -> io::Result<String> {
+    let new_id = Uuid::new_v4().to_string();
+    let from = blob_path(bucket_root, from_id);
+    let to = blob_path(bucket_root, &new_id);
+    if let Some(parent) = to.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    super::directio::rename(&from, &to)?;
+    Ok(new_id)
+}
+
+/// Move a blob BACK from its manifest-owned id to its original ref id — the rollback
+/// of [`move_blob_to_new_id`] when a later step of Complete fails. Same-filesystem
+/// `rename`, no copy. Restores the upload to its pre-Complete state so it stays
+/// retryable (E2). Idempotent-ish: if the source is already gone (e.g. a partial
+/// rollback) the caller treats the error as best-effort during unwind.
+pub fn move_blob_back(bucket_root: &Path, from_id: &str, to_id: &str) -> io::Result<()> {
+    let from = blob_path(bucket_root, from_id);
+    let to = blob_path(bucket_root, to_id);
+    if let Some(parent) = to.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    super::directio::rename(&from, &to)
+}
+
 /// Open a blob for streaming reads by id (Direct-IO, O_NOFOLLOW). A missing blob
 /// surfaces as an `io::Error` (`NotFound`) — the reader treats this as fail-fast
 /// truncation (REDESIGN §5).
