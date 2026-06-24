@@ -93,6 +93,17 @@ impl DioFile {
         self.direct.get()
     }
 
+    /// Test-only: force this file onto the buffered (non-O_DIRECT) IO path even on
+    /// a filesystem that accepted O_DIRECT, so the buffered branch of the blob
+    /// write loop can be exercised deterministically. No-op if already buffered.
+    #[cfg(test)]
+    pub fn force_buffered_for_test(&self) -> io::Result<()> {
+        if self.direct.get() {
+            self.fallback_buffered()?;
+        }
+        Ok(())
+    }
+
     /// Reopen the same file buffered (without O_DIRECT) after an alignment EINVAL.
     /// For a write fd this preserves already-written data (no O_TRUNC on reopen).
     fn fallback_buffered(&self) -> io::Result<()> {
