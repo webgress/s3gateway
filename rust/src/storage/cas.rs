@@ -3196,6 +3196,171 @@ mod tests {
     }
 
     #[test]
+    fn upload_part_lock_serializes_against_complete_deterministic() {
+        // LOAD-BEARING: `upload_part` takes the per-key WRITE lock around its
+        // read-prev-ref + ref-swap + blob-reclaim, keyed by the upload's STORED
+        // bucket/key — the SAME key `complete_multipart_upload` holds across
+        // read_part_refs -> manifest-build -> publish. This serializes a same-key
+        // re-UploadPart's ref-swap (which RECLAIMS the superseded part blob) against
+        // Complete's manifest build/commit. Without it, the re-UploadPart can reclaim
+        // a blob the in-flight Complete already captured into its manifest, committing
+        // a manifest that references a just-deleted blob (a torn multipart object).
+        //
+        // Interleaving (one upload of key K; part 1 = blob B1, part 2 = blob Bp2):
+        //   A (Complete[part1=etagB1, part2=etagBp2]): take per-key lock; read_part_refs
+        //      -> manifest references B1+Bp2; publish stages+journals the manifest, then
+        //      PARKS at the publish critical window (pre-commit-rename) STILL HOLDING
+        //      the lock.
+        //   B (UploadPart K, part 1, new bytes): write blob B2 (lock-free), then take
+        //      the per-key lock around the ref-swap + reclaim.
+        //     - real lock => B BLOCKS on lock_key (note_lock_contention fires). Release
+        //       A: A commits manifest(B1+Bp2) and removes the upload dir, frees the
+        //       lock. B then resumes but the upload dir/ref is GONE -> it never reclaims
+        //       B1 (it errors out and rolls back its own B2). The committed manifest's
+        //       B1 is intact; GET reassembles the correct bytes.
+        //     - lock gone => B does NOT block (it never calls lock_key); concurrently
+        //       with A parked in the window it reads the prev ref (B1 still present),
+        //       swaps in B2, and RECLAIMS B1. Release A: A commits manifest(B1+Bp2) on
+        //       top of a DELETED B1 -> torn object (GET errors / blob missing).
+        //
+        // THE LOAD-BEARING ASSERTION: B blocks on the per-key lock, and the completed
+        // object is internally consistent — its parts reference intact blobs B1+Bp2,
+        // GET returns exactly the concatenated part bytes, and count_blobs shows no
+        // missing blob.
+        //
+        // Fail-without-fix evidence: remove the `lock_key` acquisition from
+        // `upload_part` and this test FAILS — B never blocks on the lock (the
+        // disposition wait TIMES OUT, asserted as a clean failure) and, having
+        // reclaimed B1 mid-Complete, the committed manifest references a missing blob
+        // (assert_object_consistent / GET fail). With the lock it PASSES. Uses the
+        // deterministic Condvar handshake (no sleeps); stable across repeated runs.
+        use std::sync::Arc;
+        let _serial = publish_pause::serialize_test(); // single global hook slot.
+        let dir = tempfile::tempdir().unwrap();
+        let fs = Arc::new(CasStore::with_fsync(dir.path(), false));
+        fs.create_bucket("bkt").unwrap();
+        let bk = dir.path().join("bkt");
+        let key = "hot.mpu";
+
+        // Create the upload and upload two parts. Part 1 -> blob B1 is the blob
+        // Complete captures into its manifest and a racing re-UploadPart would reclaim.
+        // A second part keeps the completed manifest multipart (composite ETag), which
+        // is what `assert_object_consistent` validates.
+        let upload_id = fs
+            .create_multipart_upload("bkt", key, "text/mpu", BTreeMap::new())
+            .unwrap();
+        let part1 = vec![0xA1u8; 9000];
+        let part2 = vec![0xC3u8; 5000 + 3];
+        let etag1 = fs.upload_part("bkt", key, &upload_id, 1, &part1[..]).unwrap();
+        let etag2 = fs.upload_part("bkt", key, &upload_id, 2, &part2[..]).unwrap();
+        assert_eq!(count_blobs(&bk), 2, "exactly B1+Bp2 after the two part uploads");
+
+        // Distinct re-upload bytes (different length) for the racing UploadPart -> B2.
+        let part1b = vec![0xB2u8; 4000 + 5];
+
+        let hook = publish_pause::PauseHook::arm(&format!("bkt/{key}"));
+
+        // Writer A: Complete. It parks in the publish window holding the per-key lock,
+        // with a staged manifest referencing B1+Bp2.
+        let fa = Arc::clone(&fs);
+        let uid_a = upload_id.clone();
+        let a = std::thread::spawn(move || {
+            fa.complete_multipart_upload(
+                "bkt",
+                key,
+                &uid_a,
+                &[
+                    CompletePart { part_number: 1, etag: etag1 },
+                    CompletePart { part_number: 2, etag: etag2 },
+                ],
+            )
+        });
+        // Wait until A is parked in the critical window (manifest staged, lock held).
+        hook.wait_window_arrived();
+
+        // Writer B: re-UploadPart of part 1 with new bytes. With the lock it blocks on
+        // lock_key; without it, it reclaims B1 lock-free.
+        let fb = Arc::clone(&fs);
+        let uid_b = upload_id.clone();
+        let p1b = part1b.clone();
+        let b = std::thread::spawn(move || {
+            fb.upload_part("bkt", key, &uid_b, 1, &p1b[..])
+        });
+
+        // A blocked UploadPart fires note_lock_contention; a lock-free one produces no
+        // signal (UploadPart never reaches the publish window), so bound the wait — a
+        // timeout (None) means the lock is MISSING and surfaces as a clean failure
+        // instead of a hang. `Some(true)` = B blocked on the real lock.
+        let disposition = hook.wait_b_disposition_timeout(std::time::Duration::from_secs(5));
+
+        let (ra, rb) = match disposition {
+            Some(true) => {
+                // Real lock: B is parked on lock_key. Release A; it commits manifest(B1)
+                // and removes the upload dir, then B resumes (finds the dir gone).
+                hook.release();
+                (a.join().unwrap(), b.join().unwrap())
+            }
+            _ => {
+                // Lock missing/neutered: B raced the ref-swap + B1 reclaim ahead
+                // unsynchronized. Join B first (it reclaimed B1), THEN release A so its
+                // commit lands a manifest referencing the now-deleted B1.
+                let rb = b.join().unwrap();
+                hook.release();
+                (a.join().unwrap(), rb)
+            }
+        };
+        publish_pause::PauseHook::disarm();
+
+        // LOAD-BEARING #1: the re-UploadPart must have BLOCKED on the per-key lock.
+        // Without `upload_part`'s lock_key this is None (timeout) and fails here.
+        assert_eq!(
+            disposition,
+            Some(true),
+            "the racing UploadPart did NOT block on the per-key lock — `upload_part` \
+             is not serializing its ref-swap/reclaim against the in-flight Complete"
+        );
+
+        // Complete must have succeeded.
+        assert!(ra.is_ok(), "Complete failed: {ra:?}");
+        // B, resuming after the upload dir was removed by Complete, errors out and rolls
+        // back its own B2 — it must NOT have reclaimed B1.
+        assert!(
+            rb.is_err(),
+            "re-UploadPart unexpectedly succeeded after the upload was completed: {rb:?}"
+        );
+
+        // LOAD-BEARING #2: the committed object is internally consistent — its manifest
+        // references only intact, existing blobs (no reference to a reclaimed B1). With
+        // the lock removed, B reclaimed B1 mid-Complete and this trips ("blob missing").
+        assert_object_consistent(&fs, "bkt", key)
+            .unwrap_or_else(|e| panic!("completed multipart object inconsistent: {e}"));
+
+        // GET reassembles exactly part1 ++ part2 (the intact B1+Bp2), and the composite
+        // multipart ETag matches.
+        let head = fs.head_object("bkt", key).unwrap();
+        assert_eq!(head.content_type, "text/mpu");
+        let body = read_all(fs.get_object("bkt", key, None).unwrap().body);
+        let mut want = part1.clone();
+        want.extend_from_slice(&part2);
+        assert_eq!(body, want, "GET must return the intact part1++part2 (B1+Bp2) bytes");
+        use md5::{Digest, Md5};
+        let mut concat = Md5::digest(&part1).to_vec();
+        concat.extend_from_slice(&Md5::digest(&part2));
+        let composite = format!("\"{}-2\"", hex::encode(Md5::digest(&concat)));
+        assert_eq!(head.etag, composite, "composite multipart ETag");
+
+        // Exactly the committed manifest's two blobs (B1+Bp2) remain; B2 was rolled
+        // back, and no blob is missing/dangling. Without the lock B2 leaks and/or B1 is
+        // gone -> not 2.
+        assert_eq!(
+            count_blobs(&bk),
+            2,
+            "exactly the committed manifest's two blobs (B1+Bp2) must remain; B2 rolled back"
+        );
+        assert!(list_dir(&bk.join("deleted")).is_empty(), "no dangling journal");
+    }
+
+    #[test]
     fn delete_journal_left_then_recovered() {
         // Simulate "delete committed (manifest gone) but reclaim/cleanup lost":
         // hand-craft a delete journal for an absent key listing an orphan blob.
