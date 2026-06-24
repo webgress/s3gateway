@@ -16,7 +16,7 @@ use s3gateway_rs::auth::{
 };
 use s3gateway_rs::config::Config;
 use s3gateway_rs::handler::Ctx;
-use s3gateway_rs::storage::Filesystem;
+use s3gateway_rs::storage::CasStore;
 
 const ACCESS: &str = "test-access-key";
 const SECRET: &str = "test-secret-key";
@@ -54,8 +54,9 @@ fn start_server() -> u16 {
         ktls: false,
         fsync: true,
     };
-    let fs = Filesystem::new(&data_dir);
+    let fs = CasStore::new(&data_dir);
     std::fs::create_dir_all(fs.root()).unwrap();
+    fs.recover().unwrap();
     let ctx = Ctx {
         fs,
         creds: Arc::new(creds),

@@ -139,30 +139,6 @@ pub fn write_metadata_temp(tmp: &Path, meta: &ObjectMetadata) -> io::Result<()> 
     std::fs::write(tmp, &data)
 }
 
-// D2: test-only, THREAD-LOCAL injection of a forced dir-fsync failure that fires
-// AFTER the sidecar rename (the commit) has succeeded. Used to prove the
-// post-commit `fsync_dir` is a non-rollback DURABILITY warning, not a
-// commit-failure signal. Thread-local so it does not leak into parallel tests.
-#[cfg(test)]
-thread_local! {
-    static FORCE_DIR_FSYNC_FAIL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-#[cfg(test)]
-pub(crate) fn set_force_dir_fsync_fail(v: bool) {
-    FORCE_DIR_FSYNC_FAIL.with(|c| c.set(v));
-}
-
-fn force_dir_fsync_fail() -> bool {
-    #[cfg(test)]
-    {
-        if FORCE_DIR_FSYNC_FAIL.with(|c| c.get()) {
-            return true;
-        }
-    }
-    false
-}
-
 /// Commit a previously-staged temp sidecar (from [`write_metadata_temp_durable`]
 /// or [`write_metadata_temp`]) by RENAMING it into place at `path`. The rename is
 /// THE COMMIT POINT — its `Err` is the ONLY signal a caller should treat as a
@@ -202,13 +178,7 @@ pub fn commit_metadata_temp(tmp: &Path, path: &Path, durable: bool) -> io::Resul
 /// remains the sole rollback-triggering signal for callers.
 fn fsync_commit_dir(parent: &Path, committed: &Path) {
     use super::directio::fsync_dir;
-    let res = if force_dir_fsync_fail() {
-        Err(io::Error::other(
-            "forced dir-fsync failure (test injection)",
-        ))
-    } else {
-        fsync_dir(parent)
-    };
+    let res = fsync_dir(parent);
     if let Err(e) = res {
         tracing::warn!(
             path = %committed.display(),

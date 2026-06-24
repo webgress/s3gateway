@@ -28,11 +28,6 @@ pub enum S3ErrorCode {
     MethodNotAllowed,
     InvalidArgument,
     InvalidRequest,
-    /// F1: a PUT/CompleteMultipartUpload targets a key that already exists as a
-    /// DIRECTORY (because a nested key made it a prefix dir). AWS returns 409
-    /// Conflict for this object/prefix-name collision; we map it to a dedicated
-    /// 409 code rather than silently orphaning the nested children.
-    KeyPrefixConflict,
     EntityTooLarge,
     InvalidRange,
     /// E4/E5: the request body's actual size did not match what was declared/signed
@@ -149,11 +144,6 @@ impl S3ErrorCode {
                 message: "Invalid request.",
                 http_status: 400,
             },
-            KeyPrefixConflict => ApiError {
-                code: "KeyPrefixConflict",
-                message: "The specified key conflicts with an existing object-name prefix.",
-                http_status: 409,
-            },
             EntityTooLarge => ApiError {
                 code: "EntityTooLarge",
                 message: "Your proposed upload exceeds the maximum allowed size.",
@@ -243,12 +233,6 @@ mod tests {
         assert_eq!(S3ErrorCode::AccessDenied.http_status(), 403);
         assert_eq!(S3ErrorCode::InvalidArgument.http_status(), 400);
         assert_eq!(S3ErrorCode::InvalidRequest.http_status(), 400);
-        // F1: key/prefix (directory) conflict is a 409 Conflict.
-        assert_eq!(S3ErrorCode::KeyPrefixConflict.http_status(), 409);
-        assert_eq!(
-            S3ErrorCode::KeyPrefixConflict.code_str(),
-            "KeyPrefixConflict"
-        );
         assert_eq!(S3ErrorCode::InternalError.http_status(), 500);
         assert_eq!(S3ErrorCode::RequestTimeTooSkewed.http_status(), 403);
         assert_eq!(S3ErrorCode::MethodNotAllowed.http_status(), 405);

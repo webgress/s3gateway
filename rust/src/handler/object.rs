@@ -2,9 +2,9 @@
 //!
 //! These carry the async<->blocking bridge:
 //!   - PUT: hyper body -> StreamReader -> SyncIoBridge -> blocking Read, fed to
-//!     `Filesystem::put_object` inside spawn_blocking. STREAMING-AWS4 bodies are
+//!     `CasStore::put_object` inside spawn_blocking. STREAMING-AWS4 bodies are
 //!     wrapped in `auth::ChunkedReader` first, sized by x-amz-decoded-content-length.
-//!   - GET: `Filesystem::get_object` returns a blocking `Box<dyn Read>`; we pump
+//!   - GET: `CasStore::get_object` returns a blocking `Box<dyn Read>`; we pump
 //!     ~1 MiB chunks through a bounded mpsc channel into a hyper StreamBody so the
 //!     full object is never buffered.
 

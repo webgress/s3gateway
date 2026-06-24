@@ -206,10 +206,11 @@ const DEFAULT_MAX_UPLOADS: i32 = 1000;
 
 /// GET /{bucket}?uploads — ListMultipartUploads.
 ///
-/// E7: honors the `max-uploads` query param (default and hard-capped at
-/// [`DEFAULT_MAX_UPLOADS`]), caps the returned entries, and sets `IsTruncated`
-/// from the storage layer so memory/response are bounded even with a huge
-/// `.multipart/` working dir.
+/// E7: honors the `max-uploads` query param (absent -> default; negative or
+/// non-numeric -> 400 InvalidArgument; otherwise hard-capped at
+/// [`DEFAULT_MAX_UPLOADS`], mirroring the `max-keys` validation), caps the
+/// returned entries, and sets `IsTruncated` from the storage layer so
+/// memory/response are bounded even with a huge `arriving/` working dir.
 pub async fn list_multipart_uploads(
     ctx: &Ctx,
     req: HandlerRequest,

@@ -1,7 +1,7 @@
 //! HTTP handlers for S3 operations.
 //!
 //! Handlers are intentionally thin: they translate a parsed [`HandlerRequest`]
-//! into calls on the BLOCKING [`crate::storage::Filesystem`] (run via
+//! into calls on the BLOCKING [`crate::storage::CasStore`] (run via
 //! `spawn_blocking`) and map results/errors back to hyper responses. The router
 //! (see [`crate::server::router`]) does auth, route selection, and request
 //! adaptation before calling these.
@@ -25,7 +25,7 @@ use tokio_util::io::{StreamReader, SyncIoBridge};
 
 use crate::auth::CredentialStore;
 use crate::s3response::{render_error_xml, S3ErrorCode};
-use crate::storage::{Filesystem, StorageError};
+use crate::storage::{CasStore, StorageError};
 
 /// Boxed, unified response body type used by every handler.
 pub type RespBody = BoxBody<Bytes, std::io::Error>;
@@ -63,10 +63,10 @@ impl hyper::body::Body for ChannelBody {
 }
 
 /// Shared, cheaply-cloneable handler context (one logical instance per process,
-/// shared across all per-core runtimes; `Filesystem` is stateless/`Clone`).
+/// shared across all per-core runtimes; `CasStore` is stateless/`Clone`).
 #[derive(Clone)]
 pub struct Ctx {
-    pub fs: Filesystem,
+    pub fs: CasStore,
     pub creds: Arc<CredentialStore>,
     pub region: String,
 }
@@ -221,12 +221,12 @@ pub fn map_storage_error(e: &StorageError) -> S3ErrorCode {
         StorageError::BucketExists => S3ErrorCode::BucketAlreadyOwnedByYou,
         StorageError::ObjectNotFound => S3ErrorCode::NoSuchKey,
         StorageError::InvalidBucket => S3ErrorCode::InvalidBucketName,
+        // The CAS store rejects a reserved-suffix / traversal / NUL key up front as
+        // PathTraversal → 400 InvalidArgument (the old `ReservedKey`/`KeyPrefixConflict`
+        // variants are gone: the reserved `MANIFEST_SUFFIX` makes the key↔path map a
+        // collision-free bijection, so the prefix-conflict 409 is structurally
+        // impossible — see REDESIGN §7.2/§7.3).
         StorageError::PathTraversal => S3ErrorCode::InvalidArgument,
-        StorageError::ReservedKey => S3ErrorCode::InvalidArgument,
-        // F1: PUT/Complete to a key that already exists as a directory (a nested
-        // key made it a prefix) is a 409 Conflict — never a silent overwrite that
-        // orphans the children.
-        StorageError::KeyPrefixConflict => S3ErrorCode::KeyPrefixConflict,
         StorageError::NoSuchUpload => S3ErrorCode::NoSuchUpload,
         StorageError::InvalidPartOrder => S3ErrorCode::InvalidPartOrder,
         StorageError::InvalidPart => S3ErrorCode::InvalidPart,
@@ -286,12 +286,6 @@ mod tests {
             map_storage_error(&StorageError::PathTraversal),
             S3ErrorCode::InvalidArgument
         );
-        // F1: a key/prefix (directory) conflict maps to the 409 KeyPrefixConflict.
-        assert_eq!(
-            map_storage_error(&StorageError::KeyPrefixConflict),
-            S3ErrorCode::KeyPrefixConflict
-        );
-        assert_eq!(S3ErrorCode::KeyPrefixConflict.http_status(), 409);
         assert_eq!(
             map_storage_error(&StorageError::Io(std::io::Error::other("x"))),
             S3ErrorCode::InternalError

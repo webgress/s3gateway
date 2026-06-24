@@ -21,15 +21,15 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::blob;
-use super::filesystem::{
-    validate_bucket_name, BucketInfo, CompletePart, GetObjectResult, ListObjectsInput,
-    ListObjectsOutput, MultipartUpload, ObjectInfo, PartInfo, StorageError, MAX_UPLOADS_CAP,
-};
 use super::manifest::{
     self, Manifest, ManifestPartRef, ARRIVING_DIR, CURRENT_DIR, DELETED_DIR, MANIFEST_SUFFIX,
 };
 use super::metadata::ObjectMetadata;
 use super::reader::{parse_range, ByteRange, MultipartReader, PlainFileReader};
+use super::types::{
+    validate_bucket_name, BucketInfo, CompletePart, GetObjectResult, ListObjectsInput,
+    ListObjectsOutput, MultipartUpload, ObjectInfo, PartInfo, StorageError, MAX_UPLOADS_CAP,
+};
 
 pub type Result<T> = std::result::Result<T, StorageError>;
 
@@ -259,6 +259,37 @@ impl CasStore {
             Err(e) if e.kind() == io::ErrorKind::NotFound => Err(StorageError::BucketNotFound),
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// DeleteBucket: remove an EMPTY bucket. "Empty" means the `current/` manifest
+    /// tree holds no live object (the four infra dirs — `current/`, `arriving/`,
+    /// `blobs/`, `deleted/` — and any in-flight uploads/orphan blobs are NOT
+    /// objects and are torn down with the bucket). A bucket with at least one live
+    /// manifest is `BucketNotEmpty` (409). Symlink-aware existence check (mirrors
+    /// `head_bucket`), so a planted `data-dir/bucket -> /external` symlink is
+    /// rejected as `BucketNotFound` rather than having its contents scanned/removed.
+    pub fn delete_bucket(&self, name: &str) -> Result<()> {
+        self.validate_bucket_component(name)?;
+        self.head_bucket(name)?;
+        let path = self.bucket_root(name);
+
+        // Empty iff the current/ tree contains no committed manifest.
+        let mut has_object = false;
+        walk_dir_files(&self.current_root(name), &mut |p: &Path| -> io::Result<()> {
+            let fname = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            if fname.ends_with(MANIFEST_SUFFIX) && !fname.contains(".tmp.") {
+                has_object = true;
+            }
+            Ok(())
+        })?;
+        if has_object {
+            return Err(StorageError::BucketNotEmpty);
+        }
+
+        // No live objects: tear down the whole bucket (infra dirs + any orphan
+        // blobs / in-flight uploads / spent journals included).
+        std::fs::remove_dir_all(&path)?;
+        Ok(())
     }
 
     // ---- object: PUT (single-part) ----
@@ -1683,7 +1714,7 @@ impl Drop for FileGuard {
 
 /// Classify an io error from a blob/body write: an `InvalidData` kind is a client
 /// framing problem (aws-chunked length mismatch surfaced by ChunkedReader) ->
-/// `IncompleteBody`; anything else stays `Io`. Mirrors `filesystem::body_read_error`.
+/// `IncompleteBody`; anything else stays `Io` (mapped to 500 by the handler).
 fn body_or_io(e: io::Error) -> StorageError {
     if e.kind() == io::ErrorKind::InvalidData {
         StorageError::IncompleteBody
@@ -1757,8 +1788,7 @@ fn walk_dir_files(dir: &Path, cb: &mut dyn FnMut(&Path) -> io::Result<()>) -> io
     Ok(())
 }
 
-/// Dir mtime as Unix seconds (best-effort; 0 if unavailable). Mirrors
-/// `filesystem::mtime_unix`.
+/// Dir mtime as Unix seconds (best-effort; 0 if unavailable).
 fn mtime_unix(md: &std::fs::Metadata) -> i64 {
     md.modified()
         .ok()
@@ -3041,7 +3071,7 @@ mod tests {
 
     // ---- PART 3: ListObjectsV2 + ListBuckets over the manifest key-tree ----
 
-    use super::super::filesystem::ListObjectsInput;
+    use super::super::types::ListObjectsInput;
 
     fn li(bucket: &str) -> ListObjectsInput {
         ListObjectsInput {

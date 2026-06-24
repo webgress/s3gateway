@@ -11,7 +11,7 @@ use s3gateway_rs::auth::CredentialStore;
 use s3gateway_rs::config::Config;
 use s3gateway_rs::handler::Ctx;
 use s3gateway_rs::server;
-use s3gateway_rs::storage::Filesystem;
+use s3gateway_rs::storage::CasStore;
 
 fn main() {
     let cfg = Config::parse();
@@ -31,11 +31,31 @@ fn main() {
         }
     };
 
-    let fs = Filesystem::with_fsync(&cfg.data_dir, cfg.fsync);
+    let fs = CasStore::with_fsync(&cfg.data_dir, cfg.fsync);
     if let Err(e) = std::fs::create_dir_all(fs.root()) {
         eprintln!("failed to create data dir {}: {e}", cfg.data_dir);
         std::process::exit(1);
     }
+
+    // Crash-recovery sweep (REDESIGN §6.1+6.2+6.3): runs at startup, BEFORE the
+    // listener binds (zero live traffic → unconditionally safe). It removes
+    // uncommitted staged manifests, finishes/discards reclaim journals per the
+    // commit-nonce rule, and reclaims orphaned blobs. The opt-in full
+    // `gc_orphan_blobs` maintenance op is NOT run automatically.
+    let recovery = match fs.recover() {
+        Ok(stats) => stats,
+        Err(e) => {
+            eprintln!("crash-recovery sweep failed for {}: {e}", cfg.data_dir);
+            std::process::exit(1);
+        }
+    };
+    tracing::info!(
+        buckets = recovery.buckets,
+        arriving_manifests_removed = recovery.arriving_manifests_removed,
+        journals_processed = recovery.journals_processed,
+        journal_blobs_reclaimed = recovery.journal_blobs_reclaimed,
+        "crash-recovery sweep complete"
+    );
 
     tracing::info!(
         port = cfg.port,
