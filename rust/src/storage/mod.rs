@@ -28,7 +28,7 @@ pub use reader::{parse_range, ByteRange, MultipartReader, PlainFileReader};
 // here so it compiles as part of the public storage surface (no dead-code
 // warnings) ahead of the later wiring phase.
 pub use blob::{blob_path, is_valid_blob_id, open_blob, reclaim_blob, write_blob, BlobInfo};
-pub use cas::{CasStore, Journal, JournalMode, PartRefFile, ReclaimStats};
+pub use cas::{CasStore, Journal, JournalMode, PartRefFile, ReclaimStats, RecoveryStats};
 pub use manifest::{
     decode_relpath_to_key, escape_key_to_relpath, manifest_path, read_manifest,
     write_manifest_temp, Manifest, ManifestPartRef,

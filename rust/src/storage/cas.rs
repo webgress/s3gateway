@@ -141,6 +141,21 @@ pub struct ReclaimStats {
     pub journals_removed: usize,
 }
 
+/// Aggregate outcome of a [`CasStore::recover`] sweep across all buckets
+/// (REDESIGN §6). All counts are cumulative over every bucket swept.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct RecoveryStats {
+    /// Buckets the sweep visited.
+    pub buckets: usize,
+    /// Uncommitted staged single-PUT/Complete manifests removed from `arriving/`
+    /// (6.1). Multipart upload working dirs are KEPT (resumable; see `recover`).
+    pub arriving_manifests_removed: usize,
+    /// Reclaim journals processed (executed-or-discarded then unlinked) (6.2).
+    pub journals_processed: usize,
+    /// Blobs reclaimed while applying journals (6.2).
+    pub journal_blobs_reclaimed: usize,
+}
+
 impl CasStore {
     /// Create a store with durable publication enabled (fsync), like `Filesystem::new`.
     pub fn new(root: impl Into<PathBuf>) -> Self {
@@ -328,6 +343,21 @@ impl CasStore {
         let bucket_root = self.bucket_root(bucket);
         let k = manifest::manifest_path(&current_root, key);
 
+        // ---- step 0: detect the manifest-path-vs-directory collision (D1). ----
+        // The CAS key-tree gives `a` (`current/a.meta`, a FILE) and `a/b`
+        // (`current/a/b.meta`, under dir `current/a/`) DIFFERENT paths, so they
+        // coexist (REDESIGN §7.2). But a key `K` and a key `K.meta/…` DO collide:
+        //   - key `a`        -> manifest FILE      current/a.meta
+        //   - key `a.meta/b` -> needs DIRECTORY    current/a.meta/  (for b.meta)
+        // If `a` exists, `create_dir_all(current/a.meta)` for `a.meta/b` would hit a
+        // FILE (ENOTDIR); if `a.meta/b` exists, `rename(staged -> current/a.meta)`
+        // for `a` would hit a DIRECTORY (EISDIR/ENOTEMPTY). Either raw io error maps
+        // to a 500. Detect both up front and return KeyPrefixConflict (409) instead,
+        // BEFORE staging anything (so a rejected publish leaves no arriving orphan).
+        if let Some(conflict) = detect_prefix_conflict(&current_root, &k) {
+            return Err(conflict);
+        }
+
         // ---- step 1: stage the new manifest in arriving/ ----
         let staged_id = Uuid::new_v4().to_string();
         let staged = self.arriving_root(bucket).join(format!("{staged_id}{META_SUFFIX}"));
@@ -425,6 +455,15 @@ impl CasStore {
         let k = manifest::manifest_path(&current_root, key);
 
         let _guard = self.lock_key(bucket, key);
+
+        // D1: if the manifest path for this key is actually a DIRECTORY (because a
+        // `K.meta/…` key made `current/K.meta/` a dir), `read_manifest(k)` returns
+        // `IsADirectory`/`InvalidData` and `remove_file(k)` would `EISDIR` -> 500.
+        // Surface the same KeyPrefixConflict (409) the publish path returns. The
+        // `K.meta/…` objects remain addressable (they live under that directory).
+        if let Some(conflict) = detect_prefix_conflict(&current_root, &k) {
+            return Err(conflict);
+        }
 
         // K absent -> idempotent success (after head_bucket above, mirrors C7).
         let old = match manifest::read_manifest(&k) {
@@ -704,6 +743,190 @@ impl CasStore {
             }
         }
         Ok(removed)
+    }
+
+    // ---- crash-recovery sweep (REDESIGN §6) ----
+
+    /// Crash-recovery sweep, run at STARTUP before the listener binds (REDESIGN
+    /// §6). It makes crash cleanup deterministic and is **idempotent** — re-running
+    /// it causes no harm. It performs, for every bucket:
+    ///
+    ///  - **6.1 `arriving/` sweep.** Delete each staged `{uuid}.meta` — an
+    ///    uncommitted single-PUT/Complete manifest. A committed object lives in
+    ///    `current/`, so a manifest still sitting in `arriving/` is, by definition,
+    ///    a publish that never committed and is always safe to delete on startup.
+    ///    The new blob such a manifest may reference is an orphan reclaimed by the
+    ///    fallback GC (single-PUT pre-commit rollback already deleted it in the
+    ///    common path). **Multipart upload working dirs `arriving/{uuid}/` are
+    ///    KEPT** — see the retention rule below.
+    ///
+    ///  - **6.2 `deleted/` journals.** Apply each `*.journal` via the §3.2/§4 nonce
+    ///    rule ([`apply_journal`]): a *publish* journal deletes its OLD blobs IFF
+    ///    the live manifest carries the journal's `commit_nonce` (the commit
+    ///    landed); a *delete* journal deletes its blobs IFF the live manifest is
+    ///    absent. Either way the journal is then unlinked. Deletes are idempotent
+    ///    (unlink-missing == no-op), so a crash mid-reclaim replays cleanly.
+    ///
+    /// **Multipart-upload-dir retention rule (the deliberate choice, REDESIGN
+    /// §6.1/§6.4):** `recover()` does NOT delete `arriving/{uuid}/` multipart
+    /// working dirs. An in-flight multipart upload is *resumable* — it lives until
+    /// the client calls AbortMultipartUpload or an explicit expiry policy reaps it.
+    /// We cannot tell a "crashed mid-Complete" upload apart from a "client paused
+    /// between UploadPart and Complete" one on a normal restart, so the SAFE rule is
+    /// to keep them: nuking them would destroy valid in-flight uploads. A
+    /// crashed-mid-Complete upload simply stays Completable/Abortable after restart
+    /// (the part blobs are immutable and intact). Their part blobs are therefore
+    /// treated as REFERENCED by [`gc_orphan_blobs`] so the full GC never reaps a
+    /// live upload's parts. (A staged single `{uuid}.meta` is unambiguous — it is a
+    /// failed publish — so 6.1 deletes those; only the `{uuid}/` dirs are kept.)
+    ///
+    /// The full O(blobs) fallback GC (§6.3) is intentionally NOT run here — it is
+    /// the opt-in [`gc_orphan_blobs`], called only on explicit request (decision
+    /// #4), never automatically on startup.
+    ///
+    /// Errors reading one bucket's `arriving/`/`deleted/` do not abort the whole
+    /// sweep mid-bucket beyond that bucket; a hard io error is propagated.
+    pub fn recover(&self) -> Result<RecoveryStats> {
+        let mut stats = RecoveryStats::default();
+        let rd = match std::fs::read_dir(&self.root) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(stats),
+            Err(e) => return Err(e.into()),
+        };
+        for entry in rd {
+            let entry = entry?;
+            // Only real bucket directories (skip symlinks/files/hidden infra).
+            let md = match entry.metadata() {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if md.file_type().is_symlink() || !md.is_dir() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') {
+                continue;
+            }
+            stats.buckets += 1;
+            self.recover_bucket(&name, &mut stats)?;
+        }
+        Ok(stats)
+    }
+
+    /// Sweep one bucket's `arriving/` (6.1: drop staged manifests, keep upload
+    /// dirs) and `deleted/` (6.2: apply+remove journals).
+    fn recover_bucket(&self, bucket: &str, stats: &mut RecoveryStats) -> Result<()> {
+        // 6.1: delete staged single-PUT/Complete manifests; keep `{uuid}/` dirs.
+        stats.arriving_manifests_removed += self.cleanup_arriving(bucket)?;
+
+        // 6.2: apply each reclaim journal, then remove it.
+        let deleted = self.deleted_root(bucket);
+        let rd = match std::fs::read_dir(&deleted) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        // Collect first so applying (which unlinks) does not perturb the iterator.
+        let mut journals: Vec<PathBuf> = Vec::new();
+        for entry in rd {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.ends_with(".journal") {
+                journals.push(entry.path());
+            }
+        }
+        for jpath in journals {
+            let s = self.apply_journal(bucket, &jpath)?;
+            stats.journal_blobs_reclaimed += s.blobs_deleted;
+            stats.journals_processed += s.journals_removed;
+        }
+        Ok(())
+    }
+
+    /// FALLBACK full GC (REDESIGN §6.3, Defense B) — **opt-in / manual ONLY**, never
+    /// run automatically by [`recover`] or on a periodic timer (decision #4). This
+    /// is the O(total blobs) backstop that reclaims blobs orphaned by a LOST journal
+    /// (e.g. the filesystem lost a `deleted/` entry): it scans every LIVE manifest in
+    /// `current/` (and every in-flight `arriving/{uuid}/parts/*.ref`) to build the
+    /// set of REFERENCED blob ids, then deletes every blob under `blobs/` whose id is
+    /// not in that set.
+    ///
+    /// SAFETY (the load-bearing invariant): a blob referenced by ANY live manifest —
+    /// or by ANY in-flight multipart upload's part ref — is treated as referenced
+    /// and is NEVER deleted. This is what makes blob deletion monotonically safe
+    /// regardless of journal integrity. Because in-flight upload dirs are KEPT by
+    /// `recover()` (see its retention rule) and their part refs are scanned here, the
+    /// GC never reaps a live upload's parts.
+    ///
+    /// CONCURRENCY: this is intended to run at startup (no live traffic) or as an
+    /// offline maintenance op. Running it under live traffic risks reaping a blob a
+    /// concurrent in-flight PUT has just written to `blobs/` but not yet recorded in
+    /// any manifest/ref — callers must run it only when that hazard is excluded
+    /// (REDESIGN §6.4). It is per-bucket; returns the number of blobs reclaimed.
+    pub fn gc_orphan_blobs(&self, bucket: &str) -> Result<usize> {
+        self.head_bucket(bucket)?;
+        let bucket_root = self.bucket_root(bucket);
+
+        // 1. Build the referenced-id set from all live manifests in current/.
+        let mut referenced: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let current_root = self.current_root(bucket);
+        walk_dir_files(&current_root, &mut |path: &Path| -> io::Result<()> {
+            let fname = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            if !fname.ends_with(META_SUFFIX) || fname.contains(".tmp.") {
+                return Ok(());
+            }
+            // A corrupt manifest cannot be trusted to enumerate its blobs; to stay on
+            // the safe side (never delete a possibly-referenced blob) we abort the GC
+            // for this bucket rather than under-count references. Propagate the read
+            // error so the caller knows the GC did not run to completion.
+            let m = manifest::read_manifest(path)?;
+            for id in m.blob_ids() {
+                referenced.insert(id);
+            }
+            Ok(())
+        })?;
+
+        // 2. Also treat blobs referenced by in-flight multipart uploads as live (the
+        //    upload dirs are KEPT by recover(); reaping their parts would corrupt a
+        //    resumable upload). Scan arriving/{uuid}/parts/*.ref.
+        let arriving = self.arriving_root(bucket);
+        if let Ok(rd) = std::fs::read_dir(&arriving) {
+            for entry in rd.flatten() {
+                let ft = match entry.file_type() {
+                    Ok(ft) => ft,
+                    Err(_) => continue,
+                };
+                if !ft.is_dir() {
+                    continue; // staged {uuid}.meta files reference no kept blob.
+                }
+                if let Ok(refs) = Self::read_part_refs(&entry.path()) {
+                    for r in refs.values() {
+                        referenced.insert(r.blob_id.clone());
+                    }
+                }
+            }
+        }
+
+        // 3. Walk blobs/xx/yy/{id}; delete any id not in `referenced`.
+        let blobs_root = bucket_root.join(blob::BLOBS_DIR);
+        let mut reclaimed = 0usize;
+        walk_dir_files(&blobs_root, &mut |path: &Path| -> io::Result<()> {
+            let id = match path.file_name().and_then(|s| s.to_str()) {
+                Some(s) => s,
+                None => return Ok(()),
+            };
+            // Only consider syntactically valid blob ids (defensive; everything under
+            // blobs/ is uuid-named). An unreferenced valid blob is an orphan.
+            if blob::is_valid_blob_id(id)
+                && !referenced.contains(id)
+                && std::fs::remove_file(path).is_ok()
+            {
+                reclaimed += 1;
+            }
+            Ok(())
+        })?;
+        Ok(reclaimed)
     }
 
     // ---- validation (ported from filesystem.rs, with the .meta reserved rule) ----
@@ -1531,6 +1754,65 @@ fn mtime_unix(md: &std::fs::Metadata) -> i64 {
         .unwrap_or(0)
 }
 
+/// D1: detect the `K` vs `K.meta/…` manifest-path-vs-directory collision for a
+/// manifest path `k` under `current_root`, returning
+/// [`StorageError::KeyPrefixConflict`] when present (else `None`).
+///
+/// Two collision shapes, mirroring the two raw io errors the commit/delete path
+/// would otherwise hit:
+///
+///  1. **manifest file path is a DIRECTORY.** `k` itself already exists as a
+///     directory (a `K.meta/…` key made `current/K.meta/` a dir). A commit's
+///     `rename(staged -> k)` would `EISDIR`/`ENOTEMPTY`; a delete's
+///     `remove_file(k)` would `EISDIR`. -> conflict.
+///
+///  2. **a needed ancestor directory already exists as a FILE.** Some ancestor of
+///     `k` between `current_root` (exclusive) and `k` (exclusive) — i.e. a
+///     directory `create_dir_all(k.parent())` must create/traverse — already
+///     exists as a non-directory (key `K` made `current/K.meta` a file, and we
+///     are publishing `K.meta/…`). `create_dir_all` would `ENOTDIR`. -> conflict.
+///
+/// Symlink-aware (`symlink_metadata`): a symlinked entry at any of these paths is
+/// not a directory, so it also trips the conflict rather than being followed.
+///
+/// KNOWN LIMITATION (documented): a filesystem-backed manifest tree cannot host a
+/// key `K` and a key `K.meta/…` simultaneously — the first stores a FILE at
+/// `current/K.meta` and the second needs `current/K.meta/` to be a DIRECTORY, and
+/// no POSIX path can be both. Whichever is written first wins; the second is
+/// rejected with 409 KeyPrefixConflict (it is not a silent overwrite/orphaning).
+/// This is a narrow corner (a key plus a key formed by appending `.meta/<suffix>`
+/// to it) and does not affect ordinary nested keys (`a`, `a/b`, `a/b/c` all
+/// coexist — their manifest paths never collide).
+fn detect_prefix_conflict(current_root: &Path, k: &Path) -> Option<StorageError> {
+    // Shape 1: the manifest path itself is an existing directory.
+    if let Ok(meta) = std::fs::symlink_metadata(k) {
+        if meta.file_type().is_dir() {
+            return Some(StorageError::KeyPrefixConflict);
+        }
+    }
+
+    // Shape 2: walk each ancestor strictly between current_root and k. Any that
+    // exists as a NON-directory (a file/symlink) blocks `create_dir_all` of k's
+    // parent. We collect the chain from k's parent down to (but not including)
+    // current_root, then test each existing entry.
+    let mut ancestor = k.parent();
+    while let Some(dir) = ancestor {
+        if dir == current_root {
+            break;
+        }
+        match std::fs::symlink_metadata(dir) {
+            Ok(meta) if !meta.file_type().is_dir() => {
+                return Some(StorageError::KeyPrefixConflict);
+            }
+            // A directory (fine) or a missing ancestor (create_dir_all will make
+            // it) — keep walking up.
+            _ => {}
+        }
+        ancestor = dir.parent();
+    }
+    None
+}
+
 /// Pure lexical path normalization (no fs access), resolving `.`/`..`.
 fn normalize(p: &Path) -> PathBuf {
     let mut out = PathBuf::new();
@@ -1746,6 +2028,139 @@ mod tests {
         assert_eq!(read_all(res.body), b"meta-keyed object");
     }
 
+    // ---- D1: the `K` vs `K.meta/…` manifest-path-vs-directory collision. ----
+
+    #[test]
+    fn key_then_meta_suffix_child_is_prefix_conflict_not_500() {
+        // LOAD-BEARING (D1). PUT `a` (file current/a.meta) then PUT `a.meta/b`
+        // (needs dir current/a.meta/). The second must return KeyPrefixConflict (409)
+        // — NOT a raw Io(NotADirectory)/500 — and `a` must remain GETtable.
+        //
+        // FAIL-WITHOUT-FIX: removing the `detect_prefix_conflict` call in publish()
+        // makes `create_dir_all(current/a.meta)` hit a FILE -> Io(NotADirectory) ->
+        // 500 (StorageError::Io, not KeyPrefixConflict) and this assert fails.
+        let (_dir, fs) = store();
+        fs.put_object("bkt", "a", &b"i am a"[..], "", BTreeMap::new())
+            .unwrap();
+        let err = fs
+            .put_object("bkt", "a.meta/b", &b"child under a.meta dir"[..], "", BTreeMap::new())
+            .unwrap_err();
+        assert!(
+            matches!(err, StorageError::KeyPrefixConflict),
+            "expected KeyPrefixConflict (409), got {err:?}"
+        );
+        // `a` is untouched and still readable.
+        assert_eq!(read_all(fs.get_object("bkt", "a", None).unwrap().body), b"i am a");
+    }
+
+    #[test]
+    fn meta_suffix_child_then_key_is_prefix_conflict_not_500() {
+        // LOAD-BEARING (D1, reverse order). PUT `a.meta/b` (dir current/a.meta/ with
+        // b.meta inside) then PUT `a` (wants to rename a file over current/a.meta,
+        // which is now a DIRECTORY). The second must return KeyPrefixConflict (409)
+        // — NOT a raw Io(IsADirectory)/500 — and `a.meta/b` must remain GETtable.
+        //
+        // FAIL-WITHOUT-FIX: removing the detection makes `rename(staged ->
+        // current/a.meta)` hit a DIRECTORY -> Io(IsADirectory/DirectoryNotEmpty) ->
+        // 500 and this assert fails.
+        let (_dir, fs) = store();
+        fs.put_object("bkt", "a.meta/b", &b"child first"[..], "", BTreeMap::new())
+            .unwrap();
+        let err = fs
+            .put_object("bkt", "a", &b"impostor a"[..], "", BTreeMap::new())
+            .unwrap_err();
+        assert!(
+            matches!(err, StorageError::KeyPrefixConflict),
+            "expected KeyPrefixConflict (409), got {err:?}"
+        );
+        // `a.meta/b` is untouched and still readable.
+        assert_eq!(
+            read_all(fs.get_object("bkt", "a.meta/b", None).unwrap().body),
+            b"child first"
+        );
+    }
+
+    #[test]
+    fn complete_multipart_over_meta_prefix_is_conflict_not_500() {
+        // D1 also covers the multipart Complete publish path: PUT `a.meta/b` makes
+        // current/a.meta/ a dir; a multipart Complete targeting key `a` must reject
+        // with KeyPrefixConflict, and the upload's parts survive (retryable / not
+        // silently consumed).
+        let (dir, fs) = store();
+        let bk = dir.path().join("bkt");
+        fs.put_object("bkt", "a.meta/b", &b"child first"[..], "", BTreeMap::new())
+            .unwrap();
+        let (upload_id, _parts, etags) = upload_3_parts(&fs, "bkt", "a");
+        let complete: Vec<CompletePart> = (0..3)
+            .map(|i| CompletePart { part_number: (i + 1) as i32, etag: etags[i].clone() })
+            .collect();
+        let err = fs
+            .complete_multipart_upload("bkt", "a", &upload_id, &complete)
+            .unwrap_err();
+        assert!(
+            matches!(err, StorageError::KeyPrefixConflict),
+            "expected KeyPrefixConflict, got {err:?}"
+        );
+        // Upload dir + part blobs survive (publish failed pre-commit, E2 retryable).
+        assert!(bk.join("arriving").join(&upload_id).exists());
+        assert_eq!(fs.list_parts("bkt", "a", &upload_id).unwrap().len(), 3);
+        // The child object is intact.
+        assert_eq!(
+            read_all(fs.get_object("bkt", "a.meta/b", None).unwrap().body),
+            b"child first"
+        );
+    }
+
+    #[test]
+    fn delete_key_shadowed_by_meta_dir_is_conflict_not_500() {
+        // D1 delete path: with current/a.meta/ a directory (from `a.meta/b`), a
+        // DELETE of key `a` (whose manifest path is that directory) must return
+        // KeyPrefixConflict rather than a raw EISDIR/500, and must NOT remove the
+        // `a.meta/b` child.
+        let (_dir, fs) = store();
+        fs.put_object("bkt", "a.meta/b", &b"keep me"[..], "", BTreeMap::new())
+            .unwrap();
+        let err = fs.delete_object("bkt", "a").unwrap_err();
+        assert!(
+            matches!(err, StorageError::KeyPrefixConflict),
+            "expected KeyPrefixConflict, got {err:?}"
+        );
+        assert_eq!(
+            read_all(fs.get_object("bkt", "a.meta/b", None).unwrap().body),
+            b"keep me"
+        );
+    }
+
+    #[test]
+    fn normal_nested_keys_coexist_not_rejected() {
+        // The D1 detection must NOT reject ordinary nested keys: `a`, `a/b`, `a/b/c`
+        // and the `a` + `a/b` pair all coexist (their manifest paths never collide).
+        let (_dir, fs) = store();
+        for k in ["a", "a/b", "a/b/c"] {
+            fs.put_object("bkt", k, format!("body-{k}").as_bytes(), "", BTreeMap::new())
+                .unwrap();
+        }
+        for k in ["a", "a/b", "a/b/c"] {
+            assert_eq!(
+                read_all(fs.get_object("bkt", k, None).unwrap().body),
+                format!("body-{k}").as_bytes()
+            );
+        }
+        // Order independence: a/b/c first, then a/b, then a — still all coexist.
+        let (_dir2, fs2) = store();
+        for k in ["x/y/z", "x/y", "x"] {
+            fs2.put_object("bkt", k, format!("v-{k}").as_bytes(), "", BTreeMap::new())
+                .unwrap();
+        }
+        for k in ["x", "x/y", "x/y/z"] {
+            assert_eq!(
+                read_all(fs2.get_object("bkt", k, None).unwrap().body),
+                format!("v-{k}").as_bytes()
+            );
+        }
+        let _ = fs2;
+    }
+
     #[test]
     fn invalid_keys_rejected() {
         let (_dir, fs) = store();
@@ -1917,6 +2332,229 @@ mod tests {
         let stats = fs.apply_journal("bkt", &jpath).unwrap();
         assert_eq!(stats.blobs_deleted, 1);
         assert!(!blob::blob_path(&bk, &info.blob_id).exists());
+    }
+
+    // ---- D2: recover() crash-recovery sweep (REDESIGN §6) ----
+
+    #[test]
+    fn recover_removes_orphan_arriving_manifest_keeps_live_object() {
+        // (i) An orphaned arriving/{uuid}.meta + the blob it would have referenced.
+        // recover() removes the staged manifest; the live object is untouched. The
+        // orphan blob is left for gc_orphan_blobs (recover does NOT do the full GC).
+        let (dir, fs) = store();
+        let bk = dir.path().join("bkt");
+        fs.put_object("bkt", "live", &b"the live object"[..], "", BTreeMap::new())
+            .unwrap();
+        let live_blob = {
+            let m = manifest::read_manifest(&manifest::manifest_path(&bk.join("current"), "live")).unwrap();
+            m.parts[0].blob_id.clone()
+        };
+
+        // Crash a PUT to a DIFFERENT key after staging arriving, before commit (this
+        // leaves an orphan arriving manifest AND its new blob — the pre-commit
+        // rollback deletes the blob, so to model a TRULY-leaked blob too we write one
+        // by hand and reference it from a hand-staged orphan manifest).
+        set_fault(Some(FaultPoint::BeforeJournal));
+        let _ = fs.put_object("bkt", "doomed", &b"never commits"[..], "", BTreeMap::new());
+        set_fault(None);
+        let arriving = list_dir(&bk.join("arriving"));
+        assert_eq!(arriving.len(), 1, "one orphan arriving manifest: {arriving:?}");
+
+        // Also leave a leaked blob that a lost staged manifest would have owned.
+        let leaked = blob::write_blob(&bk, &b"leaked by a lost arriving manifest"[..]).unwrap();
+        assert!(blob::blob_path(&bk, &leaked.blob_id).exists());
+
+        let stats = fs.recover().unwrap();
+        assert_eq!(stats.arriving_manifests_removed, 1);
+        // The staged manifest is gone; the live object is intact.
+        assert!(list_dir(&bk.join("arriving")).is_empty());
+        assert!(blob::blob_path(&bk, &live_blob).exists());
+        assert_eq!(read_all(fs.get_object("bkt", "live", None).unwrap().body), b"the live object");
+        // recover() does NOT run the full GC, so the leaked blob is still present.
+        assert!(blob::blob_path(&bk, &leaked.blob_id).exists());
+
+        // (iv) Idempotent: a second recover() changes nothing and does not error.
+        let stats2 = fs.recover().unwrap();
+        assert_eq!(stats2.arriving_manifests_removed, 0);
+        assert_eq!(stats2.journals_processed, 0);
+        assert!(blob::blob_path(&bk, &live_blob).exists());
+    }
+
+    #[test]
+    fn recover_finishes_committed_swap_journal_reclaims_old_blobs() {
+        // (ii) A deleted/{uuid}.journal from a COMMITTED swap (post-commit crash via
+        // BeforeReclaim): recover() finishes the reclaim (nonce matches the live
+        // manifest), removes the journal, and the live object's blobs are untouched.
+        let (dir, fs) = store();
+        let bk = dir.path().join("bkt");
+        fs.put_object("bkt", "k", &b"v1-bytes-old"[..], "", BTreeMap::new())
+            .unwrap();
+        let v1_blob = {
+            let m = manifest::read_manifest(&manifest::manifest_path(&bk.join("current"), "k")).unwrap();
+            m.parts[0].blob_id.clone()
+        };
+        // Post-commit crash: new version live, old blob + journal left behind.
+        set_fault(Some(FaultPoint::BeforeReclaim));
+        fs.put_object("bkt", "k", &b"v2-bytes-new-and-longer"[..], "", BTreeMap::new())
+            .unwrap();
+        set_fault(None);
+        let v2_blob = {
+            let m = manifest::read_manifest(&manifest::manifest_path(&bk.join("current"), "k")).unwrap();
+            m.parts[0].blob_id.clone()
+        };
+        assert_eq!(list_dir(&bk.join("deleted")).len(), 1, "journal present pre-recovery");
+        assert_eq!(count_blobs(&bk), 2, "v1 + v2 both present pre-recovery");
+
+        let stats = fs.recover().unwrap();
+        assert_eq!(stats.journals_processed, 1);
+        assert_eq!(stats.journal_blobs_reclaimed, 1, "v1 (old) blob reclaimed");
+        // Journal gone; v1 reclaimed; v2 (the live object's blob) untouched.
+        assert!(list_dir(&bk.join("deleted")).is_empty());
+        assert!(!blob::blob_path(&bk, &v1_blob).exists());
+        assert!(blob::blob_path(&bk, &v2_blob).exists());
+        assert_eq!(read_all(fs.get_object("bkt", "k", None).unwrap().body), b"v2-bytes-new-and-longer");
+
+        // (iv) Idempotent re-run.
+        let stats2 = fs.recover().unwrap();
+        assert_eq!(stats2.journals_processed, 0);
+        assert_eq!(stats2.journal_blobs_reclaimed, 0);
+        assert!(blob::blob_path(&bk, &v2_blob).exists());
+    }
+
+    #[test]
+    fn recover_nonce_mismatch_journal_keeps_live_blobs() {
+        // (iii) A publish journal whose commit_nonce does NOT match the live manifest
+        // (the described commit never landed). recover() must NOT delete those blobs
+        // (they are still-live-old) — only remove the journal.
+        let (dir, fs) = store();
+        let bk = dir.path().join("bkt");
+        fs.put_object("bkt", "k", &b"still the live version"[..], "", BTreeMap::new())
+            .unwrap();
+        let live_blob = {
+            let m = manifest::read_manifest(&manifest::manifest_path(&bk.join("current"), "k")).unwrap();
+            m.parts[0].blob_id.clone()
+        };
+        // Hand-craft a stale publish journal listing the LIVE blob with a wrong nonce.
+        let jpath = bk.join("deleted").join(format!("{}.journal", Uuid::new_v4()));
+        fs.write_journal(
+            &jpath,
+            &Journal {
+                mode: JournalMode::Publish,
+                supersedes_key: "k".into(),
+                commit_nonce: "nonce-that-never-committed".into(),
+                expected_new_etag: "\"x\"".into(),
+                blobs: vec![live_blob.clone()],
+            },
+        )
+        .unwrap();
+
+        let stats = fs.recover().unwrap();
+        assert_eq!(stats.journals_processed, 1);
+        assert_eq!(stats.journal_blobs_reclaimed, 0, "must NOT delete a still-live blob");
+        assert!(list_dir(&bk.join("deleted")).is_empty(), "journal removed");
+        // Live blob and object intact.
+        assert!(blob::blob_path(&bk, &live_blob).exists());
+        assert_eq!(read_all(fs.get_object("bkt", "k", None).unwrap().body), b"still the live version");
+
+        // (iv) Idempotent.
+        let stats2 = fs.recover().unwrap();
+        assert_eq!(stats2, RecoveryStats { buckets: 1, ..Default::default() });
+    }
+
+    #[test]
+    fn recover_keeps_in_progress_multipart_upload_dir() {
+        // (v) recover() must NOT delete a valid in-progress multipart upload working
+        // dir (the retention rule) — its parts survive a restart and Complete still
+        // works afterward.
+        let (dir, fs) = store();
+        let bk = dir.path().join("bkt");
+        let key = "mp/in-flight";
+        let (upload_id, parts, etags) = upload_3_parts(&fs, "bkt", key);
+        assert!(bk.join("arriving").join(&upload_id).exists());
+        assert_eq!(count_blobs(&bk), 3);
+
+        let stats = fs.recover().unwrap();
+        // The upload dir is a {uuid}/ dir, NOT a staged {uuid}.meta -> NOT removed.
+        assert_eq!(stats.arriving_manifests_removed, 0);
+        assert!(
+            bk.join("arriving").join(&upload_id).exists(),
+            "in-progress multipart upload dir must survive recover()"
+        );
+        assert_eq!(count_blobs(&bk), 3, "part blobs survive recover()");
+        assert_eq!(fs.list_parts("bkt", key, &upload_id).unwrap().len(), 3);
+
+        // Complete still works after recovery.
+        let complete: Vec<CompletePart> = (0..3)
+            .map(|i| CompletePart { part_number: (i + 1) as i32, etag: etags[i].clone() })
+            .collect();
+        fs.complete_multipart_upload("bkt", key, &upload_id, &complete).unwrap();
+        let mut want = Vec::new();
+        for p in &parts {
+            want.extend_from_slice(p);
+        }
+        let got = read_all(fs.get_object("bkt", key, None).unwrap().body);
+        assert_eq!(md5_hex(&got), md5_hex(&want));
+    }
+
+    #[test]
+    fn gc_orphan_blobs_deletes_unreferenced_keeps_referenced() {
+        // (vi) gc_orphan_blobs deletes a truly-unreferenced blob but KEEPS every blob
+        // referenced by a live manifest AND by an in-flight multipart upload.
+        let (dir, fs) = store();
+        let bk = dir.path().join("bkt");
+        // A live single-part object.
+        fs.put_object("bkt", "live", &b"referenced by a live manifest"[..], "", BTreeMap::new())
+            .unwrap();
+        let live_blob = {
+            let m = manifest::read_manifest(&manifest::manifest_path(&bk.join("current"), "live")).unwrap();
+            m.parts[0].blob_id.clone()
+        };
+        // An in-flight multipart upload (its parts must NOT be GC'd).
+        let (upload_id, _parts, _etags) = upload_3_parts(&fs, "bkt", "mp/keep");
+        let kept_part_ids: Vec<String> = {
+            let refs = CasStore::read_part_refs(&bk.join("arriving").join(&upload_id)).unwrap();
+            refs.values().map(|r| r.blob_id.clone()).collect()
+        };
+        assert_eq!(kept_part_ids.len(), 3);
+
+        // A truly-orphaned blob (referenced by nothing — a lost-journal leak).
+        let orphan = blob::write_blob(&bk, &b"orphan from a lost journal"[..]).unwrap();
+        // Pre-GC: 1 (live) + 3 (upload parts) + 1 (orphan) = 5 blobs.
+        assert_eq!(count_blobs(&bk), 5);
+
+        let reclaimed = fs.gc_orphan_blobs("bkt").unwrap();
+        assert_eq!(reclaimed, 1, "exactly the one orphan blob is reclaimed");
+        assert!(!blob::blob_path(&bk, &orphan.blob_id).exists(), "orphan deleted");
+        assert!(blob::blob_path(&bk, &live_blob).exists(), "live manifest blob kept");
+        for id in &kept_part_ids {
+            assert!(blob::blob_path(&bk, id).exists(), "in-flight upload part {id} must be kept");
+        }
+        // Live object + the still-resumable upload are both intact.
+        assert_eq!(read_all(fs.get_object("bkt", "live", None).unwrap().body), b"referenced by a live manifest");
+        assert_eq!(fs.list_parts("bkt", "mp/keep", &upload_id).unwrap().len(), 3);
+
+        // Idempotent: a second GC reclaims nothing.
+        assert_eq!(fs.gc_orphan_blobs("bkt").unwrap(), 0);
+    }
+
+    #[test]
+    fn recover_sweeps_all_buckets() {
+        // recover() iterates every bucket; per-bucket artifacts are each cleaned.
+        let dir = tempfile::tempdir().unwrap();
+        let fs = CasStore::new(dir.path());
+        for b in ["bucket-one", "bucket-two"] {
+            fs.create_bucket(b).unwrap();
+            // Leave an orphan arriving manifest in each via a pre-commit crash.
+            set_fault(Some(FaultPoint::BeforeJournal));
+            let _ = fs.put_object(b, "doomed", &b"x"[..], "", BTreeMap::new());
+            set_fault(None);
+        }
+        let stats = fs.recover().unwrap();
+        assert_eq!(stats.buckets, 2);
+        assert_eq!(stats.arriving_manifests_removed, 2);
+        for b in ["bucket-one", "bucket-two"] {
+            assert!(list_dir(&dir.path().join(b).join("arriving")).is_empty());
+        }
     }
 
     // ---- PART 1 residual fixes (load-bearing) ----
