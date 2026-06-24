@@ -483,45 +483,72 @@ accepted limitation for the single-machine target. Keys *with* `/` fan out natur
 into the tree and are unaffected. If flat-bucket scale ever becomes a requirement,
 that is when the rejected hash+index option would be revisited.
 
-Also note: **key/prefix conflict** changes character. Today a nested key `a/b` makes
-`a/` a real directory, so a later PUT of `a` (a file at a dir path) raised
-`KeyPrefixConflict` (409). In the tree, `a/b` → `current/a/b.meta` makes `current/a/`
-a directory, and PUT of key `a` wants `current/a.meta` — these are **different paths**
-(`current/a/` dir vs `current/a.meta` file), so they **coexist with no conflict**, which
-is actually *more* S3-faithful (real S3 lets `a` and `a/b` both exist). **Decision:**
-drop `KeyPrefixConflict` for objects (keep the `StorageError` variant + mapping for
-compatibility but it becomes unreachable on the object path, or is removed — see §11
-risk). This removes the F1 move-aside-a-subtree hazard entirely.
+Also note: **key/prefix conflict** is GONE on the CAS object path. Today a nested key
+`a/b` makes `a/` a real directory, so a later PUT of `a` (a file at a dir path) raised
+`KeyPrefixConflict` (409). In the tree (encode v2, §7.3), `a/b` →
+`current/a/b.s3gw-live.meta` makes `current/a/` a directory and PUT of key `a` wants
+`current/a.s3gw-live.meta` — **different paths**, so they **coexist with no conflict**,
+which is *more* S3-faithful (real S3 lets `a` and `a/b` both exist). The longer
+`MANIFEST_SUFFIX` further dissolves the `a` vs `a.meta/b` corner (also distinct paths),
+and the single residual collision (`a` vs `a.s3gw-live.meta/b`) is prevented up front by
+the reserved-suffix rejection. **Implemented decision:** the new CAS store (`cas.rs`)
+removed `detect_prefix_conflict` and all `KeyPrefixConflict`/409 detection/call sites on
+the object path. The `StorageError::KeyPrefixConflict` variant + `S3ErrorCode` + the
+handler 409 mapping are LEFT DEFINED (still produced by the not-yet-cut-over old
+`filesystem.rs` impl); they become dead once the cutover removes `filesystem.rs`. This
+removes the F1 move-aside-a-subtree hazard entirely.
 
-### 7.3 Reserved-suffix handling for keys ending in `.meta`
+### 7.3 Reserved-suffix handling — CAS encode v2 (IMPLEMENTED)
 
-Manifests use the `.meta` suffix the way today's code uses `.s3meta`. A literal object
-key ending in `.meta` (e.g. `report.meta`) would collide with the manifest naming.
-**Mirror the existing reserved-suffix discipline:**
+**Implemented decision (supersedes the `.meta`/`\x00m`-escape sketch below):** the live
+manifest suffix is a single, distinctive, easily-changed constant
 
-- Define `META_SUFFIX = ".meta"`.
-- The manifest file for key `K` is at `current/{escape(K)}.meta`, where `escape`
-  appends a reserved escape marker to any key segment that *itself* ends in `.meta` (or
-  collides with `arriving`/`blobs`/`current`/`deleted` as a first-level segment). The
-  simplest robust escape: if the final key segment ends with `.meta`, store the
-  manifest as `…{segment}\x00m.meta` (a NUL is already rejected in *client* keys by
-  `validate_object_path`, so `\x00m` is an unambiguous internal escape that can never
-  be produced by a real key). Listing reverses the escape when decoding the filename
-  back to a key. This is the direct analog of today's `is_reserved_final_segment` /
-  `key_segment_is_reserved` logic, which already special-cases `.s3meta`, `.parts`,
-  `.tmp.`, etc.
-- Because there are **no more** `{key}` data files, `{key}.parts` dirs, or
-  `{key}.s3meta` sidecars colliding with client keys, the reserved set shrinks
-  dramatically: the *only* structural reservation left at the key level is the `.meta`
-  manifest suffix (plus the top-level dir names `current/arriving/blobs/deleted`, which
-  are under the bucket root and never collide with a key because keys live *under*
-  `current/`). `walk_dir`'s skip-set similarly shrinks to "decode `.meta`, skip
-  `.tmp.`-staged manifests." This is a net simplification of the path-security surface.
+```rust
+pub const MANIFEST_SUFFIX: &str = ".s3gw-live.meta";
+```
 
-> **Implementation guidance:** keep the position-aware reserved-segment predicate but
-> reduce it to the `.meta` rule + the temp-manifest (`.tmp.`/`arriving`) rule. Add unit
-> tests for keys `report.meta`, `a/b.meta`, `a.meta/b`, and a key literally containing
-> the escape bytes is impossible (NUL rejected), so the escape is collision-free.
+The manifest for key `K` is the FILE `current/{leaf}{MANIFEST_SUFFIX}`, where `{leaf}` is
+`K`'s final `/`-segment and every earlier segment is a **raw directory name** (no
+transform):
+
+- `a`        → `current/a.s3gw-live.meta`
+- `a/b`      → `current/a/b.s3gw-live.meta`            (raw dir `a/`)
+- `a/b/c`    → `current/a/b/c.s3gw-live.meta`          (raw dirs `a/`, `a/b/`)
+- `a.meta`   → `current/a.meta.s3gw-live.meta`         (ordinary `.meta` keys are fine)
+
+**Reserved-suffix rule (the entire reservation).** Reject — 400 InvalidArgument
+(`StorageError::PathTraversal`) — any key where ANY `/`-split segment ends in
+`MANIFEST_SUFFIX` (leaf OR ancestor: a non-leaf segment becomes a raw directory and a
+raw dir ending in the suffix would collide with a manifest file). Combined with the
+existing guards (empty key, empty segments, `..`, `.`, NUL, absolute), this makes the
+key↔path map a **collision-free bijection by construction**, so the old runtime
+`KeyPrefixConflict`/409 check is no longer needed: `a` + `a/b` and `a` + `a.meta/b`
+freely COEXIST at distinct paths (more S3-faithful), and the only residual clash —
+`a` (FILE `current/a.s3gw-live.meta`) vs `a.s3gw-live.meta/b` (needs DIRECTORY
+`current/a.s3gw-live.meta/`) — is impossible because the latter is rejected up front.
+
+**decode (listing) = exact inverse of encode.** Under `current/`, a FILE → strip the
+trailing `MANIFEST_SUFFIX` to recover the leaf and join with the raw ancestor dir
+names; a DIRECTORY → a raw key-prefix ancestor (never decoded). No escape to reverse.
+
+This replaces both the old `.meta`-double-suffix scheme (`report.meta` →
+`report.meta.meta`) AND the `\x00m`-escape sketch (a NUL is rejected by the OS in an
+on-disk filename anyway). Staged temps in `arriving/` are uuid-named
+(`arriving/{uuid}.manifest`) and journals (`deleted/{uuid}.journal`) are NOT key-derived,
+so they do not use `MANIFEST_SUFFIX`; only the live `current/` manifests do.
+
+**KNOWN LIMITATION (documented):** an object key may not contain a `/`-segment ending in
+`MANIFEST_SUFFIX` (`.s3gw-live.meta`). This is the single structural reservation the
+on-disk manifest tree requires; such keys are rejected with 400 InvalidArgument.
+
+---
+
+_Original design sketch (NOT implemented — kept for context):_
+
+- Define `META_SUFFIX = ".meta"` and escape a `.meta`-suffixed final segment as
+  `…{segment}\x00m.meta`. Rejected because (a) a NUL is unusable as an on-disk filename
+  byte, and (b) the longer distinctive `MANIFEST_SUFFIX` removes the need for any escape
+  while also dissolving the `K` vs `K.meta/…` collision (the §7.2 `KeyPrefixConflict`).
 
 ---
 

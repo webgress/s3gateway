@@ -26,7 +26,7 @@ use super::filesystem::{
     ListObjectsOutput, MultipartUpload, ObjectInfo, PartInfo, StorageError, MAX_UPLOADS_CAP,
 };
 use super::manifest::{
-    self, Manifest, ManifestPartRef, ARRIVING_DIR, CURRENT_DIR, DELETED_DIR, META_SUFFIX,
+    self, Manifest, ManifestPartRef, ARRIVING_DIR, CURRENT_DIR, DELETED_DIR, MANIFEST_SUFFIX,
 };
 use super::metadata::ObjectMetadata;
 use super::reader::{parse_range, ByteRange, MultipartReader, PlainFileReader};
@@ -343,24 +343,20 @@ impl CasStore {
         let bucket_root = self.bucket_root(bucket);
         let k = manifest::manifest_path(&current_root, key);
 
-        // ---- step 0: detect the manifest-path-vs-directory collision (D1). ----
-        // The CAS key-tree gives `a` (`current/a.meta`, a FILE) and `a/b`
-        // (`current/a/b.meta`, under dir `current/a/`) DIFFERENT paths, so they
-        // coexist (REDESIGN §7.2). But a key `K` and a key `K.meta/…` DO collide:
-        //   - key `a`        -> manifest FILE      current/a.meta
-        //   - key `a.meta/b` -> needs DIRECTORY    current/a.meta/  (for b.meta)
-        // If `a` exists, `create_dir_all(current/a.meta)` for `a.meta/b` would hit a
-        // FILE (ENOTDIR); if `a.meta/b` exists, `rename(staged -> current/a.meta)`
-        // for `a` would hit a DIRECTORY (EISDIR/ENOTEMPTY). Either raw io error maps
-        // to a 500. Detect both up front and return KeyPrefixConflict (409) instead,
-        // BEFORE staging anything (so a rejected publish leaves no arriving orphan).
-        if let Some(conflict) = detect_prefix_conflict(&current_root, &k) {
-            return Err(conflict);
-        }
+        // No runtime key/prefix collision check is needed under the CAS encode v2
+        // reserved-suffix scheme. The only structural collision — a key `a` (FILE
+        // `current/a.s3gw-live.meta`) vs a key `a.s3gw-live.meta/b` (which would need
+        // DIRECTORY `current/a.s3gw-live.meta/`) — is IMPOSSIBLE because any key with
+        // a `/`-segment ending in `MANIFEST_SUFFIX` is rejected up front by
+        // `validate_object_path`. So `a` + `a/b` and `a` + `a.meta/b` freely coexist
+        // at distinct paths; the old `detect_prefix_conflict`/`KeyPrefixConflict`/409
+        // machinery is gone (the conflict can no longer occur at runtime).
 
         // ---- step 1: stage the new manifest in arriving/ ----
+        // Staged manifests are uuid-named (`arriving/{uuid}.manifest`), NOT key-
+        // derived, so they do NOT use MANIFEST_SUFFIX.
         let staged_id = Uuid::new_v4().to_string();
-        let staged = self.arriving_root(bucket).join(format!("{staged_id}{META_SUFFIX}"));
+        let staged = self.arriving_root(bucket).join(format!("{staged_id}.manifest"));
         manifest::write_manifest_temp(&staged, new_manifest, self.fsync)?;
         let mut staged_guard = FileGuard::new(staged.clone());
         #[cfg(test)]
@@ -456,14 +452,11 @@ impl CasStore {
 
         let _guard = self.lock_key(bucket, key);
 
-        // D1: if the manifest path for this key is actually a DIRECTORY (because a
-        // `K.meta/…` key made `current/K.meta/` a dir), `read_manifest(k)` returns
-        // `IsADirectory`/`InvalidData` and `remove_file(k)` would `EISDIR` -> 500.
-        // Surface the same KeyPrefixConflict (409) the publish path returns. The
-        // `K.meta/…` objects remain addressable (they live under that directory).
-        if let Some(conflict) = detect_prefix_conflict(&current_root, &k) {
-            return Err(conflict);
-        }
+        // No prefix-conflict check needed (CAS encode v2): the reserved-suffix
+        // rejection in `validate_object_path` makes a key whose manifest path is a
+        // DIRECTORY impossible (that would require a sibling key with a segment
+        // ending in `MANIFEST_SUFFIX`, which is rejected up front). `read_manifest`/
+        // `remove_file` therefore always see a FILE-or-absent manifest path here.
 
         // K absent -> idempotent success (after head_bucket above, mirrors C7).
         let old = match manifest::read_manifest(&k) {
@@ -723,9 +716,12 @@ impl CasStore {
         Ok(stats)
     }
 
-    /// Remove an uncommitted staged manifest in `arriving/` (REDESIGN §6.1). The
-    /// per-upload blob orphan it may reference is reclaimed by the fallback GC (a
-    /// later phase) — for a single PUT the pre-commit rollback already deleted it.
+    /// Remove an uncommitted staged manifest in `arriving/` (REDESIGN §6.1). Staged
+    /// manifests are uuid-named `arriving/{uuid}.manifest` (NOT key-derived, so they
+    /// do not use `MANIFEST_SUFFIX`); only the FILE entries are reaped, the `{uuid}/`
+    /// multipart working DIRS are kept. The per-upload blob orphan a staged manifest
+    /// may reference is reclaimed by the fallback GC — for a single PUT the
+    /// pre-commit rollback already deleted it.
     pub fn cleanup_arriving(&self, bucket: &str) -> Result<usize> {
         let arriving = self.arriving_root(bucket);
         let rd = match std::fs::read_dir(&arriving) {
@@ -738,7 +734,7 @@ impl CasStore {
             let entry = entry?;
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if name.ends_with(META_SUFFIX) && std::fs::remove_file(entry.path()).is_ok() {
+            if name.ends_with(".manifest") && std::fs::remove_file(entry.path()).is_ok() {
                 removed += 1;
             }
         }
@@ -873,7 +869,7 @@ impl CasStore {
         let current_root = self.current_root(bucket);
         walk_dir_files(&current_root, &mut |path: &Path| -> io::Result<()> {
             let fname = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-            if !fname.ends_with(META_SUFFIX) || fname.contains(".tmp.") {
+            if !fname.ends_with(MANIFEST_SUFFIX) || fname.contains(".tmp.") {
                 return Ok(());
             }
             // A corrupt manifest cannot be trusted to enumerate its blobs; to stay on
@@ -945,12 +941,21 @@ impl CasStore {
         Ok(())
     }
 
-    /// Reject keys with `..`, NUL, absolute paths, or whose final segment collides
-    /// with the only structural reservation left in the CAS layout: the `.meta`
-    /// manifest suffix. (The escape in `manifest.rs` makes a literal `.meta` key
-    /// storable, but we still reject keys that would directly NAME a manifest with
-    /// our internal escape bytes — impossible since NUL is rejected here.) Then
-    /// assert lexical containment within the data root.
+    /// Reject keys with `..`, NUL, absolute paths, empty segments, or — the single
+    /// structural reservation of the CAS encode v2 layout — ANY `/`-split segment
+    /// ending in `MANIFEST_SUFFIX`. Then assert lexical containment within the data
+    /// root.
+    ///
+    /// **Reserved-suffix rejection (load-bearing).** The manifest for key `K` is the
+    /// FILE `{leaf}{MANIFEST_SUFFIX}` under `current/`, and every NON-leaf segment of
+    /// `K` becomes a raw DIRECTORY name. If any segment (leaf OR ancestor) ended in
+    /// `MANIFEST_SUFFIX`, a raw directory or a sibling manifest file could collide
+    /// (e.g. key `a.s3gw-live.meta/b` would need `current/a.s3gw-live.meta/` as a dir
+    /// while key `a` stores a FILE at exactly that path). Rejecting ALL such segments
+    /// up front makes the key↔path map collision-free by construction, which is why
+    /// no runtime `KeyPrefixConflict`/409 check is needed anymore. Maps to 400
+    /// InvalidArgument (`PathTraversal`). KNOWN LIMITATION: an object key may not
+    /// contain a `/`-segment ending in `MANIFEST_SUFFIX`.
     fn validate_object_path(&self, bucket: &str, key: &str) -> Result<()> {
         self.validate_bucket_component(bucket)?;
         if key.is_empty() {
@@ -975,11 +980,19 @@ impl CasStore {
         if key.split('/').any(|s| s.is_empty()) {
             return Err(StorageError::PathTraversal);
         }
-        // The four infra dir names are under the bucket root and never collide
-        // with a key (keys live under current/), so no key-segment reservation is
-        // needed for them. The `.meta` suffix IS handled by escaping, so a key
-        // ending in `.meta` is ALLOWED (and round-trips). We only reject the
-        // impossible NUL-escape collision, already covered by the NUL check above.
+        // [RESERVED SUFFIX — load-bearing] Reject any key with a `/`-segment ending
+        // in `MANIFEST_SUFFIX`. Not just the leaf: a non-leaf segment becomes a raw
+        // directory, and a raw dir ending in the suffix would collide with a manifest
+        // file. This single rejection is what makes the key↔path encoding collision-
+        // free (replacing the old `.meta`-double-suffix + `KeyPrefixConflict`/409
+        // scheme). An ordinary `.meta` key is fine: `report.meta` ->
+        // `current/report.meta.s3gw-live.meta`.
+        if key.split('/').any(|s| s.ends_with(MANIFEST_SUFFIX)) {
+            return Err(StorageError::PathTraversal);
+        }
+        // The four infra dir names are under the bucket root and never collide with a
+        // key (keys live under current/), so no key-segment reservation is needed for
+        // them.
         let bucket_path = self.bucket_root(bucket);
         let current = bucket_path.join(CURRENT_DIR);
         let full = manifest::manifest_path(&current, key);
@@ -1392,8 +1405,8 @@ impl CasStore {
         let mut out = Vec::new();
         for entry in rd {
             let entry = entry?;
-            // Only `{uuid}/` working dirs are uploads; staged `{uuid}.meta` manifests
-            // (single-PUT/Complete temps) are not.
+            // Only `{uuid}/` working dirs are uploads; staged `{uuid}.manifest`
+            // files (single-PUT/Complete temps) are not.
             if !entry.file_type()?.is_dir() {
                 continue;
             }
@@ -1459,10 +1472,10 @@ impl CasStore {
 
         walk_dir_files(&walk_root, &mut |path: &Path| -> io::Result<()> {
             let file_name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-            // Under current/ the only files are committed `.meta` manifests; defensively
+            // Under current/ the only files are committed manifests; defensively
             // skip anything that is not a manifest or that looks like a staged temp (a
             // temp never lives here, but be robust).
-            if !file_name.ends_with(META_SUFFIX) || file_name.contains(".tmp.") {
+            if !file_name.ends_with(MANIFEST_SUFFIX) || file_name.contains(".tmp.") {
                 return Ok(());
             }
             // Decode the path (relative to current/) back to the object key — the
@@ -1754,65 +1767,6 @@ fn mtime_unix(md: &std::fs::Metadata) -> i64 {
         .unwrap_or(0)
 }
 
-/// D1: detect the `K` vs `K.meta/…` manifest-path-vs-directory collision for a
-/// manifest path `k` under `current_root`, returning
-/// [`StorageError::KeyPrefixConflict`] when present (else `None`).
-///
-/// Two collision shapes, mirroring the two raw io errors the commit/delete path
-/// would otherwise hit:
-///
-///  1. **manifest file path is a DIRECTORY.** `k` itself already exists as a
-///     directory (a `K.meta/…` key made `current/K.meta/` a dir). A commit's
-///     `rename(staged -> k)` would `EISDIR`/`ENOTEMPTY`; a delete's
-///     `remove_file(k)` would `EISDIR`. -> conflict.
-///
-///  2. **a needed ancestor directory already exists as a FILE.** Some ancestor of
-///     `k` between `current_root` (exclusive) and `k` (exclusive) — i.e. a
-///     directory `create_dir_all(k.parent())` must create/traverse — already
-///     exists as a non-directory (key `K` made `current/K.meta` a file, and we
-///     are publishing `K.meta/…`). `create_dir_all` would `ENOTDIR`. -> conflict.
-///
-/// Symlink-aware (`symlink_metadata`): a symlinked entry at any of these paths is
-/// not a directory, so it also trips the conflict rather than being followed.
-///
-/// KNOWN LIMITATION (documented): a filesystem-backed manifest tree cannot host a
-/// key `K` and a key `K.meta/…` simultaneously — the first stores a FILE at
-/// `current/K.meta` and the second needs `current/K.meta/` to be a DIRECTORY, and
-/// no POSIX path can be both. Whichever is written first wins; the second is
-/// rejected with 409 KeyPrefixConflict (it is not a silent overwrite/orphaning).
-/// This is a narrow corner (a key plus a key formed by appending `.meta/<suffix>`
-/// to it) and does not affect ordinary nested keys (`a`, `a/b`, `a/b/c` all
-/// coexist — their manifest paths never collide).
-fn detect_prefix_conflict(current_root: &Path, k: &Path) -> Option<StorageError> {
-    // Shape 1: the manifest path itself is an existing directory.
-    if let Ok(meta) = std::fs::symlink_metadata(k) {
-        if meta.file_type().is_dir() {
-            return Some(StorageError::KeyPrefixConflict);
-        }
-    }
-
-    // Shape 2: walk each ancestor strictly between current_root and k. Any that
-    // exists as a NON-directory (a file/symlink) blocks `create_dir_all` of k's
-    // parent. We collect the chain from k's parent down to (but not including)
-    // current_root, then test each existing entry.
-    let mut ancestor = k.parent();
-    while let Some(dir) = ancestor {
-        if dir == current_root {
-            break;
-        }
-        match std::fs::symlink_metadata(dir) {
-            Ok(meta) if !meta.file_type().is_dir() => {
-                return Some(StorageError::KeyPrefixConflict);
-            }
-            // A directory (fine) or a missing ancestor (create_dir_all will make
-            // it) — keep walking up.
-            _ => {}
-        }
-        ancestor = dir.parent();
-    }
-    None
-}
-
 /// Pure lexical path normalization (no fs access), resolving `.`/`..`.
 fn normalize(p: &Path) -> PathBuf {
     let mut out = PathBuf::new();
@@ -2028,52 +1982,37 @@ mod tests {
         assert_eq!(read_all(res.body), b"meta-keyed object");
     }
 
-    // ---- D1: the `K` vs `K.meta/…` manifest-path-vs-directory collision. ----
+    // ---- CAS encode v2: `a` + `a.meta/b` coexist; reserved suffix rejected. ----
 
     #[test]
-    fn key_then_meta_suffix_child_is_prefix_conflict_not_500() {
-        // LOAD-BEARING (D1). PUT `a` (file current/a.meta) then PUT `a.meta/b`
-        // (needs dir current/a.meta/). The second must return KeyPrefixConflict (409)
-        // — NOT a raw Io(NotADirectory)/500 — and `a` must remain GETtable.
-        //
-        // FAIL-WITHOUT-FIX: removing the `detect_prefix_conflict` call in publish()
-        // makes `create_dir_all(current/a.meta)` hit a FILE -> Io(NotADirectory) ->
-        // 500 (StorageError::Io, not KeyPrefixConflict) and this assert fails.
+    fn key_and_a_meta_slash_b_coexist() {
+        // LOAD-BEARING (encode v2). Under the OLD `.meta` suffix, PUT `a` then PUT
+        // `a.meta/b` collided on `current/a.meta` and raised KeyPrefixConflict/409.
+        // Under the reserved-suffix scheme `a` -> current/a.s3gw-live.meta (FILE) and
+        // `a.meta/b` -> current/a.meta/b.s3gw-live.meta (raw dir a.meta/) are DISTINCT
+        // paths, so BOTH succeed and BOTH round-trip — no error, no overwrite.
         let (_dir, fs) = store();
         fs.put_object("bkt", "a", &b"i am a"[..], "", BTreeMap::new())
             .unwrap();
-        let err = fs
-            .put_object("bkt", "a.meta/b", &b"child under a.meta dir"[..], "", BTreeMap::new())
-            .unwrap_err();
-        assert!(
-            matches!(err, StorageError::KeyPrefixConflict),
-            "expected KeyPrefixConflict (409), got {err:?}"
-        );
-        // `a` is untouched and still readable.
+        fs.put_object("bkt", "a.meta/b", &b"child under a.meta dir"[..], "", BTreeMap::new())
+            .unwrap();
         assert_eq!(read_all(fs.get_object("bkt", "a", None).unwrap().body), b"i am a");
+        assert_eq!(
+            read_all(fs.get_object("bkt", "a.meta/b", None).unwrap().body),
+            b"child under a.meta dir"
+        );
     }
 
     #[test]
-    fn meta_suffix_child_then_key_is_prefix_conflict_not_500() {
-        // LOAD-BEARING (D1, reverse order). PUT `a.meta/b` (dir current/a.meta/ with
-        // b.meta inside) then PUT `a` (wants to rename a file over current/a.meta,
-        // which is now a DIRECTORY). The second must return KeyPrefixConflict (409)
-        // — NOT a raw Io(IsADirectory)/500 — and `a.meta/b` must remain GETtable.
-        //
-        // FAIL-WITHOUT-FIX: removing the detection makes `rename(staged ->
-        // current/a.meta)` hit a DIRECTORY -> Io(IsADirectory/DirectoryNotEmpty) ->
-        // 500 and this assert fails.
+    fn a_meta_slash_b_then_key_coexist_either_order() {
+        // The reverse order also coexists (no KeyPrefixConflict): PUT `a.meta/b`
+        // first, then PUT `a`. Both readable.
         let (_dir, fs) = store();
         fs.put_object("bkt", "a.meta/b", &b"child first"[..], "", BTreeMap::new())
             .unwrap();
-        let err = fs
-            .put_object("bkt", "a", &b"impostor a"[..], "", BTreeMap::new())
-            .unwrap_err();
-        assert!(
-            matches!(err, StorageError::KeyPrefixConflict),
-            "expected KeyPrefixConflict (409), got {err:?}"
-        );
-        // `a.meta/b` is untouched and still readable.
+        fs.put_object("bkt", "a", &b"now a too"[..], "", BTreeMap::new())
+            .unwrap();
+        assert_eq!(read_all(fs.get_object("bkt", "a", None).unwrap().body), b"now a too");
         assert_eq!(
             read_all(fs.get_object("bkt", "a.meta/b", None).unwrap().body),
             b"child first"
@@ -2081,30 +2020,28 @@ mod tests {
     }
 
     #[test]
-    fn complete_multipart_over_meta_prefix_is_conflict_not_500() {
-        // D1 also covers the multipart Complete publish path: PUT `a.meta/b` makes
-        // current/a.meta/ a dir; a multipart Complete targeting key `a` must reject
-        // with KeyPrefixConflict, and the upload's parts survive (retryable / not
-        // silently consumed).
+    fn complete_multipart_over_a_meta_prefix_succeeds() {
+        // The multipart Complete publish path also coexists: PUT `a.meta/b`, then a
+        // multipart Complete targeting key `a` SUCCEEDS (distinct paths), and both
+        // objects are readable.
         let (dir, fs) = store();
         let bk = dir.path().join("bkt");
         fs.put_object("bkt", "a.meta/b", &b"child first"[..], "", BTreeMap::new())
             .unwrap();
-        let (upload_id, _parts, etags) = upload_3_parts(&fs, "bkt", "a");
+        let (upload_id, parts, etags) = upload_3_parts(&fs, "bkt", "a");
         let complete: Vec<CompletePart> = (0..3)
             .map(|i| CompletePart { part_number: (i + 1) as i32, etag: etags[i].clone() })
             .collect();
-        let err = fs
-            .complete_multipart_upload("bkt", "a", &upload_id, &complete)
-            .unwrap_err();
-        assert!(
-            matches!(err, StorageError::KeyPrefixConflict),
-            "expected KeyPrefixConflict, got {err:?}"
-        );
-        // Upload dir + part blobs survive (publish failed pre-commit, E2 retryable).
-        assert!(bk.join("arriving").join(&upload_id).exists());
-        assert_eq!(fs.list_parts("bkt", "a", &upload_id).unwrap().len(), 3);
-        // The child object is intact.
+        fs.complete_multipart_upload("bkt", "a", &upload_id, &complete)
+            .unwrap();
+        // Upload dir consumed by the successful Complete.
+        assert!(!bk.join("arriving").join(&upload_id).exists());
+        // Both objects intact.
+        let mut want = Vec::new();
+        for p in &parts {
+            want.extend_from_slice(p);
+        }
+        assert_eq!(md5_hex(&read_all(fs.get_object("bkt", "a", None).unwrap().body)), md5_hex(&want));
         assert_eq!(
             read_all(fs.get_object("bkt", "a.meta/b", None).unwrap().body),
             b"child first"
@@ -2112,19 +2049,15 @@ mod tests {
     }
 
     #[test]
-    fn delete_key_shadowed_by_meta_dir_is_conflict_not_500() {
-        // D1 delete path: with current/a.meta/ a directory (from `a.meta/b`), a
-        // DELETE of key `a` (whose manifest path is that directory) must return
-        // KeyPrefixConflict rather than a raw EISDIR/500, and must NOT remove the
-        // `a.meta/b` child.
+    fn delete_key_while_a_meta_dir_exists_is_idempotent() {
+        // With current/a.meta/ a raw directory (from `a.meta/b`), key `a` simply does
+        // not exist (its manifest is current/a.s3gw-live.meta, a FILE that was never
+        // written), so DELETE `a` is an idempotent no-op success and must NOT remove
+        // the `a.meta/b` child.
         let (_dir, fs) = store();
         fs.put_object("bkt", "a.meta/b", &b"keep me"[..], "", BTreeMap::new())
             .unwrap();
-        let err = fs.delete_object("bkt", "a").unwrap_err();
-        assert!(
-            matches!(err, StorageError::KeyPrefixConflict),
-            "expected KeyPrefixConflict, got {err:?}"
-        );
+        fs.delete_object("bkt", "a").unwrap();
         assert_eq!(
             read_all(fs.get_object("bkt", "a.meta/b", None).unwrap().body),
             b"keep me"
@@ -2132,9 +2065,42 @@ mod tests {
     }
 
     #[test]
+    fn reserved_manifest_suffix_key_is_rejected() {
+        // LOAD-BEARING (reserved suffix). A key with ANY `/`-segment ending in
+        // MANIFEST_SUFFIX (`.s3gw-live.meta`) is rejected with 400 InvalidArgument
+        // (StorageError::PathTraversal) — leaf OR ancestor segment. This is what
+        // makes the key↔path encoding collision-free (it prevents the only residual
+        // `K` vs `K.s3gw-live.meta/...` clash). FAIL-WITHOUT-FIX: removing the
+        // reserved-suffix check in `validate_object_path` lets these through and a
+        // raw dir/file collision (Io/500) or silent clash can occur.
+        let (_dir, fs) = store();
+        for bad in [
+            "report.s3gw-live.meta",        // leaf segment ends in the suffix
+            "dir/report.s3gw-live.meta",    // nested leaf
+            "a.s3gw-live.meta/b",           // ANCESTOR segment ends in the suffix
+            "x/a.s3gw-live.meta/y",         // deep ancestor segment
+        ] {
+            let err = fs
+                .put_object("bkt", bad, &b"x"[..], "", BTreeMap::new())
+                .unwrap_err();
+            assert!(
+                matches!(err, StorageError::PathTraversal),
+                "reserved-suffix key {bad:?} must be rejected, got {err:?}"
+            );
+        }
+        // An ordinary `.meta` key is NOT reserved and round-trips fine.
+        fs.put_object("bkt", "report.meta", &b"ordinary meta key"[..], "", BTreeMap::new())
+            .unwrap();
+        assert_eq!(
+            read_all(fs.get_object("bkt", "report.meta", None).unwrap().body),
+            b"ordinary meta key"
+        );
+    }
+
+    #[test]
     fn normal_nested_keys_coexist_not_rejected() {
-        // The D1 detection must NOT reject ordinary nested keys: `a`, `a/b`, `a/b/c`
-        // and the `a` + `a/b` pair all coexist (their manifest paths never collide).
+        // Ordinary nested keys all coexist: `a`, `a/b`, `a/b/c` and the `a` + `a/b`
+        // pair (their manifest paths never collide).
         let (_dir, fs) = store();
         for k in ["a", "a/b", "a/b/c"] {
             fs.put_object("bkt", k, format!("body-{k}").as_bytes(), "", BTreeMap::new())
@@ -3324,8 +3290,10 @@ mod tests {
 
     #[test]
     fn list_key_ending_in_meta_round_trips_through_listing() {
-        // The double-suffix encoding (report.meta -> report.meta.meta) must DECODE
-        // back to `report.meta` during listing, not `report` and not `report.meta.meta`.
+        // An ordinary `.meta` key (report.meta -> current/report.meta.s3gw-live.meta)
+        // must DECODE back to `report.meta` during listing, not `report` and not the
+        // on-disk filename. (Keys with a segment ending in MANIFEST_SUFFIX itself are
+        // rejected upstream, so they never reach listing.)
         let (_dir, fs) = store();
         for k in ["report.meta", "a.meta.meta", "a.meta/b", "normal.txt"] {
             put(&fs, k);
@@ -3440,18 +3408,21 @@ mod tests {
 
     #[test]
     fn listing_decode_is_exact_inverse_of_manifest_path() {
+        // encode∘decode == identity over tricky (but ACCEPTED) keys. A key with a
+        // segment ending in MANIFEST_SUFFIX (e.g. `report.s3gw-live.meta`) is rejected
+        // by `validate_object_path` and never stored, so it is not round-tripped here.
         let cur = Path::new("/data/bk/current");
         for key in [
             "a",
             "a/b",
             "report.meta",
             "a.meta.meta",
-            "a.meta/b",
+            "a.meta/b", // coexists with `a` (distinct paths)
             "deeply/nested/path/to/object.bin",
             "café/résumé.txt",
             "emoji/😀/file",
             "trailing.dot.",
-            "x.metameta",
+            "x.s3gw-live.metameta", // does NOT end in the suffix -> accepted
         ] {
             let p = manifest::manifest_path(cur, key);
             let rel = p.strip_prefix(cur).unwrap();

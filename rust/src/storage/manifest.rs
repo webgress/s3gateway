@@ -27,21 +27,33 @@ pub const CURRENT_DIR: &str = "current";
 pub const ARRIVING_DIR: &str = "arriving";
 /// Reclaim-journal markers within a bucket.
 pub const DELETED_DIR: &str = "deleted";
-/// Manifest filename suffix. The manifest for key `K` is `{K}.meta`. Because the
-/// ONLY files under `current/` are manifests (blobs live in `blobs/`, staged temps
-/// in `arriving/`), the mapping `key K -> file {K}.meta` is an unambiguous
-/// bijection: decode strips exactly one trailing `.meta`. A literal object key
-/// ending in `.meta` (e.g. `report.meta`) therefore round-trips for free — its
-/// manifest is `report.meta.meta` and stripping one `.meta` recovers `report.meta`
-/// — with no special escape needed.
+/// Manifest filename suffix (CAS encode v2 — RESERVED-SUFFIX scheme). The live
+/// manifest for key `K` is the file `{leaf}{MANIFEST_SUFFIX}` under `current/`,
+/// where `{leaf}` is `K`'s final `/`-segment and the earlier segments are RAW
+/// directory names (no transform). Because the ONLY files under `current/` are
+/// manifests (blobs live in `blobs/`, staged temps in `arriving/`), and because
+/// any key whose `/`-split contains a segment ending in `MANIFEST_SUFFIX` is
+/// REJECTED up front (`CasStore::validate_object_path`), the mapping
+/// `key K -> file {leaf}{MANIFEST_SUFFIX}` is a collision-free bijection: decode
+/// strips exactly one trailing `MANIFEST_SUFFIX` from the file's name and joins it
+/// with the raw ancestor dir names.
 ///
-/// NOTE (REDESIGN §7.3 deviation): the doc proposed a `\x00m` escape marker for
-/// `.meta`-suffixed keys, but a literal NUL byte is REJECTED by the OS in an
-/// on-disk filename (EINVAL), so it is unusable as a real filename byte. The
-/// double-suffix + strip-one-`.meta` scheme above is collision-free (every
-/// `current/` file is exactly `{key}.meta`) and valid on disk, so it supersedes
-/// the doc's escape. See `escape_key_to_relpath` / `decode_relpath_to_key`.
-pub const META_SUFFIX: &str = ".meta";
+/// This SUPERSEDES the old `.meta`-double-suffix scheme (`report.meta` ->
+/// `report.meta.meta`) and its companion `KeyPrefixConflict`/409 runtime check.
+/// The longer, distinctive suffix means an ordinary key ending in `.meta` (e.g.
+/// `report.meta` -> `report.meta.s3gw-live.meta`) needs no special casing, and the
+/// only structural collision — a key `a` (FILE `current/a.s3gw-live.meta`) vs a key
+/// `a.s3gw-live.meta/b` (which would need DIRECTORY `current/a.s3gw-live.meta/`) —
+/// is impossible because the latter has a segment ending in `MANIFEST_SUFFIX` and
+/// is rejected. Thus `a` and `a.meta/b` (and `a` and `a/b`) freely COEXIST, which
+/// is also more S3-faithful.
+///
+/// KNOWN LIMITATION (reserved suffix): an object key may NOT contain any
+/// `/`-segment ending in `MANIFEST_SUFFIX`. This is the single, easily-changed
+/// reservation the on-disk manifest tree requires; such keys are rejected with 400
+/// InvalidArgument. See `escape_key_to_relpath` / `decode_relpath_to_key` and
+/// `CasStore::validate_object_path`.
+pub const MANIFEST_SUFFIX: &str = ".s3gw-live.meta";
 
 /// One stored part of an object, referenced by immutable blob id (REDESIGN §2).
 /// This is the CAS analog of the old [`PartRef`] (which carried a `path`); here a
@@ -135,14 +147,16 @@ impl Manifest {
 }
 
 /// Map an object key to its RELATIVE filesystem path under `current/` (one path
-/// component per `/`-segment). The `.meta` suffix is NOT part of this relpath; it
-/// is appended to the final segment by [`manifest_path`]. No segment escaping is
-/// performed — see [`META_SUFFIX`] for why the double-suffix scheme is
-/// collision-free.
+/// component per `/`-segment). The `MANIFEST_SUFFIX` is NOT part of this relpath; it
+/// is appended to the final segment by [`manifest_path`]. Every segment EXCEPT the
+/// last is a RAW directory name (no transform). No escaping is performed — the
+/// reserved-suffix rejection in `CasStore::validate_object_path` guarantees no key
+/// segment can end in `MANIFEST_SUFFIX`, so no escape is needed (see
+/// [`MANIFEST_SUFFIX`]).
 ///
-/// A key like `a.meta/b` makes `current/a.meta/` a DIRECTORY and the manifest is
-/// `current/a.meta/b.meta`, which never collides with the `current/a.meta.meta`
-/// MANIFEST of key `a.meta` — coexistence is intentional (REDESIGN §7.2).
+/// A key like `a.meta/b` makes `current/a.meta/` a raw DIRECTORY and the manifest
+/// is `current/a.meta/b.s3gw-live.meta`, which never collides with the FILE
+/// `current/a.s3gw-live.meta` (the manifest of key `a`) — coexistence is intentional.
 pub fn escape_key_to_relpath(key: &str) -> PathBuf {
     let mut path = PathBuf::new();
     for seg in key.split('/') {
@@ -152,22 +166,23 @@ pub fn escape_key_to_relpath(key: &str) -> PathBuf {
 }
 
 /// Absolute manifest path for `key` under a bucket's `current/` tree:
-/// `{current_root}/{escaped-key}.meta`. The `.meta` suffix is appended to the
-/// FINAL (escaped) segment only.
+/// `{current_root}/{raw-ancestor-dirs}/{leaf}{MANIFEST_SUFFIX}`. The
+/// `MANIFEST_SUFFIX` is appended to the FINAL segment only; ancestor segments are
+/// raw directory names.
 pub fn manifest_path(current_root: &Path, key: &str) -> PathBuf {
     let rel = escape_key_to_relpath(key);
     let comps: Vec<&OsStr> = rel.iter().collect();
     let mut full = current_root.to_path_buf();
     if comps.is_empty() {
-        // Empty key: degenerate; place a `.meta` file at the root (rejected by
-        // key validation upstream, but keep total-function behavior).
-        full.push(META_SUFFIX);
+        // Empty key: degenerate; place a bare `MANIFEST_SUFFIX` file at the root
+        // (rejected by key validation upstream, but keep total-function behavior).
+        full.push(MANIFEST_SUFFIX);
         return full;
     }
     for (i, c) in comps.iter().enumerate() {
         if i + 1 == comps.len() {
             let mut leaf = c.to_os_string();
-            leaf.push(META_SUFFIX);
+            leaf.push(MANIFEST_SUFFIX);
             full.push(leaf);
         } else {
             full.push(c);
@@ -177,9 +192,12 @@ pub fn manifest_path(current_root: &Path, key: &str) -> PathBuf {
 }
 
 /// Recover the object key from a manifest path RELATIVE to `current/` (with the
-/// trailing `.meta`). Strips exactly one trailing `.meta` from the final segment
-/// and rejoins segments with `/`. Returns `None` if the final segment does not end
-/// in `.meta` (i.e. it is not a manifest, e.g. a staged temp).
+/// trailing `MANIFEST_SUFFIX`). Strips exactly one trailing `MANIFEST_SUFFIX` from
+/// the final segment and rejoins the raw ancestor segments with `/`. This is the
+/// exact inverse of [`manifest_path`]. Returns `None` if the final segment does not
+/// end in `MANIFEST_SUFFIX` (i.e. it is not a live manifest filename — e.g. a staged
+/// temp). NOTE: callers (listing) only invoke this on FILE entries; a DIRECTORY
+/// under `current/` is a raw key-prefix ancestor and is never decoded here.
 pub fn decode_relpath_to_key(rel: &Path) -> Option<String> {
     let comps: Vec<String> = rel
         .iter()
@@ -192,9 +210,9 @@ pub fn decode_relpath_to_key(rel: &Path) -> Option<String> {
     let last = comps.len() - 1;
     for (i, c) in comps.iter().enumerate() {
         if i == last {
-            // Strip exactly one manifest `.meta` suffix to recover the key's final
-            // segment (the bijection of META_SUFFIX).
-            let stem = c.strip_suffix(META_SUFFIX)?;
+            // Strip exactly one manifest suffix to recover the key's final segment
+            // (the bijection of MANIFEST_SUFFIX).
+            let stem = c.strip_suffix(MANIFEST_SUFFIX)?;
             out_segs.push(stem.to_string());
         } else {
             out_segs.push(c.clone());
@@ -316,22 +334,23 @@ mod tests {
         let cur = Path::new("/data/bk/current");
         assert_eq!(
             manifest_path(cur, "photo.jpg"),
-            Path::new("/data/bk/current/photo.jpg.meta")
+            Path::new("/data/bk/current/photo.jpg.s3gw-live.meta")
         );
         assert_eq!(
             manifest_path(cur, "a/b/c"),
-            Path::new("/data/bk/current/a/b/c.meta")
+            Path::new("/data/bk/current/a/b/c.s3gw-live.meta")
         );
     }
 
     #[test]
-    fn key_ending_in_meta_round_trips_via_double_suffix() {
+    fn key_ending_in_meta_round_trips() {
         let cur = Path::new("/data/bk/current");
-        // report.meta -> report.meta.meta (double suffix; valid on disk, no NUL).
+        // report.meta -> report.meta.s3gw-live.meta (ordinary .meta keys are now
+        // fine — no double-suffix special-casing).
         let p = manifest_path(cur, "report.meta");
         let fname = p.file_name().unwrap().to_string_lossy();
-        assert_eq!(fname, "report.meta.meta");
-        // Decode strips exactly one .meta.
+        assert_eq!(fname, "report.meta.s3gw-live.meta");
+        // Decode strips exactly one MANIFEST_SUFFIX.
         let rel = p.strip_prefix(cur).unwrap();
         assert_eq!(decode_relpath_to_key(rel).unwrap(), "report.meta");
     }
@@ -339,14 +358,14 @@ mod tests {
     #[test]
     fn nested_key_ending_in_meta_round_trips() {
         let cur = Path::new("/data/bk/current");
-        // a/b.meta -> a/b.meta.meta ; intermediate "a" untouched.
+        // a/b.meta -> a/b.meta.s3gw-live.meta ; intermediate "a" untouched.
         let p = manifest_path(cur, "a/b.meta");
-        assert_eq!(p, Path::new("/data/bk/current/a/b.meta.meta"));
+        assert_eq!(p, Path::new("/data/bk/current/a/b.meta.s3gw-live.meta"));
         let rel = p.strip_prefix(cur).unwrap();
         assert_eq!(decode_relpath_to_key(rel).unwrap(), "a/b.meta");
-        // a.meta/b -> a.meta/b.meta ; intermediate a.meta is a plain dir segment.
+        // a.meta/b -> a.meta/b.s3gw-live.meta ; intermediate a.meta is a raw dir.
         let p2 = manifest_path(cur, "a.meta/b");
-        assert_eq!(p2, Path::new("/data/bk/current/a.meta/b.meta"));
+        assert_eq!(p2, Path::new("/data/bk/current/a.meta/b.s3gw-live.meta"));
         let rel2 = p2.strip_prefix(cur).unwrap();
         assert_eq!(decode_relpath_to_key(rel2).unwrap(), "a.meta/b");
     }
@@ -356,16 +375,57 @@ mod tests {
         let cur = Path::new("/data/bk/current");
         let pa = manifest_path(cur, "a");
         let pab = manifest_path(cur, "a/b");
-        // "a" -> current/a.meta (a FILE); "a/b" -> current/a/b.meta (under dir a/).
-        assert_eq!(pa, Path::new("/data/bk/current/a.meta"));
-        assert_eq!(pab, Path::new("/data/bk/current/a/b.meta"));
+        // "a" -> current/a.s3gw-live.meta (FILE); "a/b" -> current/a/b.s3gw-live.meta.
+        assert_eq!(pa, Path::new("/data/bk/current/a.s3gw-live.meta"));
+        assert_eq!(pab, Path::new("/data/bk/current/a/b.s3gw-live.meta"));
         assert_ne!(pa.parent(), Some(pab.parent().unwrap()));
+    }
+
+    #[test]
+    fn coexist_a_and_a_meta_slash_b_paths_differ() {
+        // The collision the OLD `.meta` suffix + KeyPrefixConflict guarded against is
+        // gone: key `a` (FILE current/a.s3gw-live.meta) and key `a.meta/b` (raw dir
+        // current/a.meta/, file b.s3gw-live.meta) map to DIFFERENT, non-nested paths.
+        let cur = Path::new("/data/bk/current");
+        let pa = manifest_path(cur, "a");
+        let pab = manifest_path(cur, "a.meta/b");
+        assert_eq!(pa, Path::new("/data/bk/current/a.s3gw-live.meta"));
+        assert_eq!(pab, Path::new("/data/bk/current/a.meta/b.s3gw-live.meta"));
+        // `a`'s manifest FILE is not an ancestor dir of `a.meta/b`'s manifest.
+        assert!(!pab.starts_with(&pa));
     }
 
     #[test]
     fn decode_rejects_non_manifest() {
         assert!(decode_relpath_to_key(Path::new("foo.tmp.123")).is_none());
         assert!(decode_relpath_to_key(Path::new("staged")).is_none());
+        // A plain `.meta`-suffixed name is NOT a manifest under the new scheme.
+        assert!(decode_relpath_to_key(Path::new("report.meta")).is_none());
+    }
+
+    #[test]
+    fn key_to_path_decode_round_trip_tricky() {
+        // encode∘decode == identity over tricky keys (the reserved-suffix key
+        // `report.s3gw-live.meta` is rejected upstream, so it is not round-tripped
+        // here — see `CasStore::validate_object_path` tests).
+        let cur = Path::new("/data/bk/current");
+        for key in [
+            "a",
+            "a/b",
+            "a.meta",
+            "a.meta/b",
+            "deeply/nested/path/to/object.bin",
+            "café/résumé.txt",
+            "emoji/😀/file",
+            "trailing.dot.",
+            "x.s3gw-live.metameta",
+        ] {
+            let p = manifest_path(cur, key);
+            let rel = p.strip_prefix(cur).unwrap();
+            let decoded = decode_relpath_to_key(rel)
+                .unwrap_or_else(|| panic!("decode failed for key {key:?}"));
+            assert_eq!(decoded, key, "round-trip mismatch for key {key:?}");
+        }
     }
 
     #[test]

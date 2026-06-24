@@ -31,5 +31,5 @@ pub use blob::{blob_path, is_valid_blob_id, open_blob, reclaim_blob, write_blob,
 pub use cas::{CasStore, Journal, JournalMode, PartRefFile, ReclaimStats, RecoveryStats};
 pub use manifest::{
     decode_relpath_to_key, escape_key_to_relpath, manifest_path, read_manifest,
-    write_manifest_temp, Manifest, ManifestPartRef,
+    write_manifest_temp, Manifest, ManifestPartRef, MANIFEST_SUFFIX,
 };
