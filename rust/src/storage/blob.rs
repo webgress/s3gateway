@@ -150,8 +150,23 @@ pub fn open_blob(bucket_root: &Path, blob_id: &str) -> io::Result<DioFile> {
 }
 
 /// Delete a blob by id (idempotent: a missing blob is a no-op). Used by the
-/// reclaim step of the commit/delete journal.
+/// reclaim step of the commit/delete journal, and by recover()/GC.
+///
+/// A4 [HIGH — validate blob_id before unlink]: the id is validated with
+/// [`is_valid_blob_id`] BEFORE it is resolved to a path. Reclaim ids can originate
+/// from an ON-DISK journal/manifest/ref (replayed by `recover()`/`apply_journal`),
+/// which a corrupt or PLANTED file could populate with a `..`-laden or absolute
+/// "blob_id". `blob_path` does a fixed 2×2 fanout of the FIRST FOUR chars and then
+/// `join`s the WHOLE id, so an id like `../../../etc/cron.d/x` would resolve OUTSIDE
+/// the bucket and unlink an arbitrary host file during recovery. A non-uuid id is
+/// therefore SKIPPED (treated as a no-op) — it can never name a blob this store
+/// wrote (every blob id is a fresh v4 uuid), so skipping it loses nothing while
+/// closing the planted-journal arbitrary-unlink hole. This single chokepoint guards
+/// EVERY reclaim-by-id site (publish, delete, apply_journal, gc_abandoned, abort).
 pub fn reclaim_blob(bucket_root: &Path, blob_id: &str) -> io::Result<()> {
+    if !is_valid_blob_id(blob_id) {
+        return Ok(());
+    }
     let path = blob_path(bucket_root, blob_id);
     match std::fs::remove_file(&path) {
         Ok(()) => Ok(()),

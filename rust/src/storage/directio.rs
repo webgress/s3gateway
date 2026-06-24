@@ -178,6 +178,56 @@ pub fn fsync_dir(dir: &Path) -> io::Result<()> {
     rustix::fs::fsync(fd.as_fd()).map_err(io::Error::from)
 }
 
+/// A5 (read-path symlink hardening): VERIFY that `rel` (a path RELATIVE to
+/// `root_dir`) resolves entirely BENEATH `root_dir` with NO symlink anywhere in the
+/// chain — including intermediate directory components, which plain `O_NOFOLLOW` (a
+/// final-component-only guard) does not cover.
+///
+/// It uses `openat2(root_fd, rel, O_PATH, RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)`:
+///   * `RESOLVE_NO_SYMLINKS` rejects a symlink at ANY component (`ELOOP`);
+///   * `RESOLVE_BENEATH` rejects any `..`/absolute escape above `root_dir` (`EXDEV`);
+///   * `O_PATH` opens only for path resolution (no read perms / no I/O), so this is a
+///     single cheap syscall on the read hot path — the actual streaming open is left
+///     to the existing `O_NOFOLLOW` `DioFile`/`read_manifest` path unchanged.
+///
+/// Graceful fallback: on a kernel without `openat2` (`ENOSYS`) or that rejects these
+/// resolve flags (`EOPNOTSUPP`/`EINVAL`), it returns `Ok(())` — the caller then relies
+/// on the existing `O_NOFOLLOW` leaf guard + lexical containment, exactly as before
+/// this hardening. A genuine containment violation surfaces as `Err`
+/// (`PermissionDenied`), which the caller maps to a not-found/denied read.
+pub fn verify_beneath_no_symlinks(root_dir: &Path, rel: &Path) -> io::Result<()> {
+    use rustix::fs::{openat2, ResolveFlags};
+    let root = match rustix::fs::open(root_dir, OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty()) {
+        Ok(fd) => fd,
+        // A missing bucket root is not an A5 violation — let the normal open report it.
+        Err(e) if e == rustix::io::Errno::NOENT => return Ok(()),
+        Err(e) => return Err(io::Error::from(e)),
+    };
+    match openat2(
+        root.as_fd(),
+        rel,
+        OFlags::PATH | OFlags::CLOEXEC,
+        Mode::empty(),
+        ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS,
+    ) {
+        Ok(_fd) => Ok(()), // resolved cleanly, beneath root, no symlinks anywhere.
+        // openat2 unavailable / resolve flags unsupported -> graceful fallback.
+        Err(e)
+            if e == rustix::io::Errno::NOSYS
+                || e == rustix::io::Errno::OPNOTSUPP
+                || e == rustix::io::Errno::INVAL =>
+        {
+            Ok(())
+        }
+        // A symlink in the chain (ELOOP) or an escape above root (EXDEV / others) is a
+        // real containment failure. Surface it as a denied read.
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "read path failed openat2 BENEATH|NO_SYMLINKS containment",
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
