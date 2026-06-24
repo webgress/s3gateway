@@ -22,8 +22,8 @@ use uuid::Uuid;
 
 use super::blob;
 use super::filesystem::{
-    validate_bucket_name, CompletePart, GetObjectResult, MultipartUpload, PartInfo, StorageError,
-    MAX_UPLOADS_CAP,
+    validate_bucket_name, BucketInfo, CompletePart, GetObjectResult, ListObjectsInput,
+    ListObjectsOutput, MultipartUpload, ObjectInfo, PartInfo, StorageError, MAX_UPLOADS_CAP,
 };
 use super::manifest::{
     self, Manifest, ManifestPartRef, ARRIVING_DIR, CURRENT_DIR, DELETED_DIR, META_SUFFIX,
@@ -1190,6 +1190,237 @@ impl CasStore {
         }
         Ok((out, is_truncated))
     }
+
+    // ---- listing (REDESIGN §7 — the manifest key-tree) ----
+
+    /// ListObjectsV2 over the CAS manifest tree. Walk `current/`; for each `.meta`
+    /// FILE, decode its path back to the object key (the exact inverse of
+    /// `manifest_path`: strip exactly one trailing `.meta` from the final segment,
+    /// rejoin `/`-separated). Then apply S3 ListObjectsV2 semantics — `prefix`
+    /// (with subtree pruning), `delimiter`→CommonPrefixes, `start-after`,
+    /// `continuation-token`, `max-keys` — in lexicographic key order. Per-object
+    /// Size/ETag/LastModified are read from each EMITTED key's manifest only (after
+    /// pagination), so manifests outside the page are never read.
+    ///
+    /// The walk-and-buffer-then-paginate approach has the same memory profile as the
+    /// old `filesystem.rs` impl (listing memory scales with bucket size). The
+    /// flat-bucket caveat (millions of keys with no `/` → one giant `current/` dir)
+    /// is an accepted documented non-goal for the single-machine target (REDESIGN
+    /// §7.2).
+    ///
+    /// Signature identical to `Filesystem::list_objects`.
+    pub fn list_objects(&self, input: &ListObjectsInput) -> Result<ListObjectsOutput> {
+        self.head_bucket(&input.bucket)?;
+        let current_root = self.current_root(&input.bucket);
+
+        // F14: absent max-keys defaults to 1000; an EXPLICIT Some(0) means an empty
+        // page (IsTruncated=true if anything matches). Negatives clamp to 0.
+        let max_keys = match input.max_keys {
+            None => 1000,
+            Some(n) => n.max(0),
+        };
+
+        // Prune the walk to the relevant subtree where the prefix names a directory
+        // boundary. A prefix like `a/b/` is wholly within `current/a/b/`, so we can
+        // root the walk there and skip unrelated siblings. Any prefix WITHOUT a
+        // trailing `/` may still match keys across multiple files/dirs at the parent
+        // level (e.g. prefix `a/b` matches both `a/bcd.meta` and `a/b/…`), so we root
+        // at the deepest fully-`/`-terminated ancestor and keep the per-key
+        // `starts_with(prefix)` filter below for the partial-segment tail.
+        let (walk_root, walk_prefix_strip) = self.prefix_walk_root(&current_root, &input.prefix);
+
+        // Phase 1: walk the tree, collect matching KEYS (no manifest reads yet) and
+        // group delimiter-collapsed keys into CommonPrefixes.
+        let mut keys: Vec<String> = Vec::new();
+        let mut prefix_set: BTreeMap<String, ()> = BTreeMap::new();
+
+        walk_dir_files(&walk_root, &mut |path: &Path| -> io::Result<()> {
+            let file_name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            // Under current/ the only files are committed `.meta` manifests; defensively
+            // skip anything that is not a manifest or that looks like a staged temp (a
+            // temp never lives here, but be robust).
+            if !file_name.ends_with(META_SUFFIX) || file_name.contains(".tmp.") {
+                return Ok(());
+            }
+            // Decode the path (relative to current/) back to the object key — the
+            // exact inverse of `manifest_path`.
+            let rel = match path.strip_prefix(&walk_prefix_strip) {
+                Ok(r) => r,
+                Err(_) => return Ok(()),
+            };
+            let key = match manifest::decode_relpath_to_key(rel) {
+                Some(k) => k,
+                None => return Ok(()), // not a manifest filename (no trailing .meta)
+            };
+
+            if !input.prefix.is_empty() && !key.starts_with(&input.prefix) {
+                return Ok(());
+            }
+            // Delimiter grouping: collapse keys that have the delimiter AFTER the
+            // prefix into a CommonPrefix up to (and including) the first delimiter.
+            if !input.delimiter.is_empty() {
+                let after = &key[input.prefix.len()..];
+                if let Some(idx) = after.find(&input.delimiter) {
+                    let cp = format!("{}{}", input.prefix, &after[..idx + input.delimiter.len()]);
+                    prefix_set.insert(cp, ());
+                    return Ok(());
+                }
+            }
+            keys.push(key);
+            Ok(())
+        })?;
+
+        keys.sort();
+        let mut common_prefixes: Vec<String> = prefix_set.into_keys().collect();
+        common_prefixes.sort();
+
+        // start-after / continuation-token (token wins). Both apply to the merged
+        // object-key + common-prefix space (REDESIGN C6).
+        let start_after = if !input.continuation_token.is_empty() {
+            input.continuation_token.as_str()
+        } else {
+            input.start_after.as_str()
+        };
+        if !start_after.is_empty() {
+            keys.retain(|k| k.as_str() > start_after);
+            common_prefixes.retain(|p| p.as_str() > start_after);
+        }
+
+        // Phase 2: merge-paginate object keys + common-prefixes, both counting
+        // against max_keys, in lexicographic order. The C6 continuation token is the
+        // LAST item EMITTED (an object KEY or a CommonPrefix STRING, whichever was
+        // pushed last) — never derived from `objects.last()`, which would be wrong
+        // when the final emitted item was a CommonPrefix (the next page would
+        // duplicate that prefix and/or skip objects sorting between it and the last
+        // emitted object).
+        let mut emitted_keys: Vec<String> = Vec::new();
+        let mut out = ListObjectsOutput::default();
+        let mut count = 0i32;
+        let mut oi = 0;
+        let mut pi = 0;
+        let mut last_emitted: Option<String> = None;
+        while count < max_keys && (oi < keys.len() || pi < common_prefixes.len()) {
+            let use_obj = if oi < keys.len() && pi < common_prefixes.len() {
+                keys[oi] <= common_prefixes[pi]
+            } else {
+                oi < keys.len()
+            };
+            if use_obj {
+                last_emitted = Some(keys[oi].clone());
+                emitted_keys.push(keys[oi].clone());
+                oi += 1;
+            } else {
+                last_emitted = Some(common_prefixes[pi].clone());
+                out.common_prefixes.push(common_prefixes[pi].clone());
+                pi += 1;
+            }
+            count += 1;
+        }
+
+        let more = oi < keys.len() || pi < common_prefixes.len();
+        if more {
+            out.is_truncated = true;
+            if let Some(tok) = last_emitted {
+                out.next_continuation_token = tok;
+            }
+        }
+
+        // Phase 3: read the manifest for EACH EMITTED object key (only the page) to
+        // fill Size/ETag/LastModified. A key with an unreadable/corrupt manifest is
+        // SKIPPED (it raced a concurrent DELETE, or is a corrupt sidecar) rather than
+        // failing the whole listing — the same fail-soft posture as the old impl's E1
+        // sidecar check. (In CAS a manifest IS the object, so there is no phantom-
+        // sidecarless entry; a skip here only happens on a genuine concurrent
+        // delete/corruption.)
+        for key in emitted_keys {
+            let mp = manifest::manifest_path(&current_root, &key);
+            match manifest::read_manifest(&mp) {
+                Ok(m) => out.objects.push(ObjectInfo {
+                    key,
+                    size: m.content_length as i64,
+                    etag: m.etag,
+                    last_modified_unix: m.last_modified,
+                }),
+                Err(_) => continue,
+            }
+        }
+
+        Ok(out)
+    }
+
+    /// Compute the deepest existing directory to root the listing walk at, given a
+    /// `prefix`, plus the path the relpath-decode must strip (always `current_root`,
+    /// since `decode_relpath_to_key` expects a path relative to `current/`). We root
+    /// the walk at `current/{prefix-up-to-last-slash}` when that directory exists —
+    /// e.g. prefix `a/b/c` walks `current/a/b/` — pruning unrelated subtrees. If that
+    /// dir does not exist we still root at `current_root` (the walk simply finds
+    /// nothing). The returned strip base is ALWAYS `current_root` so the decode sees
+    /// the full key-relative path.
+    fn prefix_walk_root(&self, current_root: &Path, prefix: &str) -> (PathBuf, PathBuf) {
+        if prefix.is_empty() {
+            return (current_root.to_path_buf(), current_root.to_path_buf());
+        }
+        // Root at current/{dir-portion-of-prefix} where the dir portion is the prefix
+        // up to and including its last `/`. The tail after the last `/` is a partial
+        // file/dir-name match handled by the per-key `starts_with` filter.
+        let dir_portion = match prefix.rfind('/') {
+            Some(idx) => &prefix[..idx], // segments before the last slash
+            None => "",
+        };
+        let mut root = current_root.to_path_buf();
+        if !dir_portion.is_empty() {
+            for seg in dir_portion.split('/') {
+                root.push(seg);
+            }
+        }
+        // Only prune to the subtree if it actually exists as a directory; otherwise
+        // fall back to current_root (avoids a NotFound that would still be handled,
+        // but keeps the walk well-rooted).
+        if root.is_dir() {
+            (root, current_root.to_path_buf())
+        } else {
+            (current_root.to_path_buf(), current_root.to_path_buf())
+        }
+    }
+
+    /// ListBuckets: the top-level bucket directories under the data root, sorted by
+    /// name. Uses `DirEntry::metadata()` which does NOT follow symlinks (F4/E8), so a
+    /// SYMLINKED entry under the data root is reported as a symlink and skipped — it
+    /// is never listed as a bucket. Creation date is the dir's mtime.
+    /// Signature identical to `Filesystem::list_buckets`.
+    pub fn list_buckets(&self) -> Result<Vec<BucketInfo>> {
+        let mut out = Vec::new();
+        let rd = match std::fs::read_dir(&self.root) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(out),
+            Err(e) => return Err(e.into()),
+        };
+        for entry in rd {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            // Skip hidden/infra-ish entries defensively.
+            if name.starts_with('.') {
+                continue;
+            }
+            // `DirEntry::metadata()` does NOT traverse a symlink (it stats the link
+            // itself), so a symlinked bucket entry has `is_dir() == false` here and is
+            // skipped — the load-bearing F4/E8 correctness. (Using `fs::metadata(path)`
+            // here would follow the link and WRONGLY list a symlinked dir as a bucket.)
+            let md = match entry.metadata() {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if md.file_type().is_symlink() || !md.is_dir() {
+                continue;
+            }
+            out.push(BucketInfo {
+                name,
+                creation_unix: mtime_unix(&md),
+            });
+        }
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(out)
+    }
 }
 
 /// RAII cleanup for a temp file (arriving staged manifest): remove on drop unless
@@ -1261,6 +1492,43 @@ fn write_nofollow(path: &Path, data: &[u8], durable: bool) -> io::Result<()> {
         f.sync_all()?;
     }
     Ok(())
+}
+
+/// Recursively walk `dir`, invoking `cb` for every regular FILE found. Under a
+/// bucket's `current/` tree the only files are committed `.meta` manifests and the
+/// only subdirectories are object-key path components, so — unlike the old
+/// `filesystem.rs::walk_dir` — there is NO `.parts`/`.multipart` skip-set: blobs,
+/// arriving uploads, and journals all live in SEPARATE sibling dirs (`blobs/`,
+/// `arriving/`, `deleted/`) that are never under `current/`. Symlinked entries are
+/// not followed (`entry.file_type()` does not traverse). A missing root is `Ok` (an
+/// empty / freshly-created bucket).
+fn walk_dir_files(dir: &Path, cb: &mut dyn FnMut(&Path) -> io::Result<()>) -> io::Result<()> {
+    let rd = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    for entry in rd {
+        let entry = entry?;
+        let ft = entry.file_type()?;
+        if ft.is_dir() {
+            walk_dir_files(&entry.path(), cb)?;
+        } else if ft.is_file() {
+            cb(&entry.path())?;
+        }
+        // symlinks and other types: ignored (never created under current/).
+    }
+    Ok(())
+}
+
+/// Dir mtime as Unix seconds (best-effort; 0 if unavailable). Mirrors
+/// `filesystem::mtime_unix`.
+fn mtime_unix(md: &std::fs::Metadata) -> i64 {
+    md.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// Pure lexical path normalization (no fs access), resolving `.`/`..`.
@@ -2165,5 +2433,393 @@ mod tests {
         }
         let got = read_all(fs.get_object("bkt", key, None).unwrap().body);
         assert_eq!(got, want);
+    }
+
+    // ---- PART 3: ListObjectsV2 + ListBuckets over the manifest key-tree ----
+
+    use super::super::filesystem::ListObjectsInput;
+
+    fn li(bucket: &str) -> ListObjectsInput {
+        ListObjectsInput {
+            bucket: bucket.to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn put(fs: &CasStore, key: &str) {
+        fs.put_object("bkt", key, format!("body-of-{key}").as_bytes(), "", BTreeMap::new())
+            .unwrap();
+    }
+
+    fn keys_of(out: &ListObjectsOutput) -> Vec<String> {
+        out.objects.iter().map(|o| o.key.clone()).collect()
+    }
+
+    #[test]
+    fn list_ten_objects_sorted() {
+        let (_dir, fs) = store();
+        let mut want: Vec<String> = (0..10).map(|i| format!("obj-{i:02}")).collect();
+        // Insert out of order to prove the impl sorts.
+        for k in want.iter().rev() {
+            put(&fs, k);
+        }
+        want.sort();
+        let out = fs.list_objects(&li("bkt")).unwrap();
+        assert_eq!(keys_of(&out), want);
+        assert!(!out.is_truncated);
+        assert!(out.common_prefixes.is_empty());
+        // Per-object size/etag are real (from each manifest).
+        for o in &out.objects {
+            let expected_etag = {
+                use md5::{Digest, Md5};
+                format!("\"{}\"", hex::encode(Md5::digest(format!("body-of-{}", o.key).as_bytes())))
+            };
+            assert_eq!(o.etag, expected_etag);
+            assert_eq!(o.size, format!("body-of-{}", o.key).len() as i64);
+        }
+    }
+
+    #[test]
+    fn list_empty_bucket() {
+        let (_dir, fs) = store();
+        let out = fs.list_objects(&li("bkt")).unwrap();
+        assert!(out.objects.is_empty());
+        assert!(out.common_prefixes.is_empty());
+        assert!(!out.is_truncated);
+        assert!(out.next_continuation_token.is_empty());
+    }
+
+    #[test]
+    fn list_missing_bucket_is_no_such_bucket() {
+        let (_dir, fs) = store();
+        assert!(matches!(
+            fs.list_objects(&li("nope")).unwrap_err(),
+            StorageError::BucketNotFound
+        ));
+    }
+
+    #[test]
+    fn list_prefix_filter() {
+        let (_dir, fs) = store();
+        for k in ["alpha/1", "alpha/2", "beta/1", "gamma", "alphabet"] {
+            put(&fs, k);
+        }
+        let mut input = li("bkt");
+        input.prefix = "alpha".into();
+        let out = fs.list_objects(&input).unwrap();
+        // prefix `alpha` matches alpha/1, alpha/2, alphabet — NOT beta/gamma.
+        assert_eq!(keys_of(&out), vec!["alpha/1", "alpha/2", "alphabet"]);
+
+        // A directory-boundary prefix prunes to the subtree.
+        let mut input2 = li("bkt");
+        input2.prefix = "alpha/".into();
+        let out2 = fs.list_objects(&input2).unwrap();
+        assert_eq!(keys_of(&out2), vec!["alpha/1", "alpha/2"]);
+    }
+
+    #[test]
+    fn list_delimiter_grouping_with_f1_coexistence() {
+        // F1: object `a` (file a.meta) AND objects under `a/` must BOTH list. With
+        // delimiter `/`, `a` is a KEY and `a/` is a CommonPrefix — both appear.
+        let (_dir, fs) = store();
+        for k in ["a", "a/b", "a/c", "d", "e/f"] {
+            put(&fs, k);
+        }
+        let mut input = li("bkt");
+        input.delimiter = "/".into();
+        let out = fs.list_objects(&input).unwrap();
+        // Top-level keys with no `/`: `a`, `d`. CommonPrefixes: `a/`, `e/`.
+        assert_eq!(keys_of(&out), vec!["a", "d"]);
+        assert_eq!(out.common_prefixes, vec!["a/".to_string(), "e/".to_string()]);
+        assert!(!out.is_truncated);
+    }
+
+    #[test]
+    fn list_delimiter_with_prefix() {
+        let (_dir, fs) = store();
+        for k in ["docs/2023/a", "docs/2023/b", "docs/2024/c", "docs/readme"] {
+            put(&fs, k);
+        }
+        let mut input = li("bkt");
+        input.prefix = "docs/".into();
+        input.delimiter = "/".into();
+        let out = fs.list_objects(&input).unwrap();
+        // Under docs/: key `docs/readme`; CommonPrefixes `docs/2023/`, `docs/2024/`.
+        assert_eq!(keys_of(&out), vec!["docs/readme"]);
+        assert_eq!(
+            out.common_prefixes,
+            vec!["docs/2023/".to_string(), "docs/2024/".to_string()]
+        );
+    }
+
+    #[test]
+    fn list_start_after() {
+        let (_dir, fs) = store();
+        for k in ["a", "b", "c", "d"] {
+            put(&fs, k);
+        }
+        let mut input = li("bkt");
+        input.start_after = "b".into();
+        let out = fs.list_objects(&input).unwrap();
+        assert_eq!(keys_of(&out), vec!["c", "d"]);
+    }
+
+    #[test]
+    fn list_max_keys_zero_empty_page_truncated() {
+        let (_dir, fs) = store();
+        put(&fs, "only");
+        let mut input = li("bkt");
+        input.max_keys = Some(0);
+        let out = fs.list_objects(&input).unwrap();
+        assert!(out.objects.is_empty());
+        assert!(out.is_truncated, "Some(0) with more objects => IsTruncated");
+
+        // Some(0) on an EMPTY bucket => not truncated.
+        let (_d2, fs2) = store();
+        let mut input2 = li("bkt");
+        input2.max_keys = Some(0);
+        let out2 = fs2.list_objects(&input2).unwrap();
+        assert!(!out2.is_truncated);
+        let _ = fs2;
+    }
+
+    #[test]
+    fn list_pagination_no_dupes_no_skips() {
+        // Page through with max-keys=3; concatenated pages must equal the full sorted
+        // key set exactly once (no dupes, no skips).
+        let (_dir, fs) = store();
+        let mut want: Vec<String> = (0..10).map(|i| format!("k{i:02}")).collect();
+        for k in &want {
+            put(&fs, k);
+        }
+        want.sort();
+
+        let mut seen: Vec<String> = Vec::new();
+        let mut token = String::new();
+        loop {
+            let mut input = li("bkt");
+            input.max_keys = Some(3);
+            input.continuation_token = token.clone();
+            let out = fs.list_objects(&input).unwrap();
+            assert!(out.objects.len() <= 3);
+            for o in &out.objects {
+                seen.push(o.key.clone());
+            }
+            if !out.is_truncated {
+                break;
+            }
+            token = out.next_continuation_token.clone();
+            assert!(!token.is_empty(), "truncated page must yield a token");
+        }
+        assert_eq!(seen, want);
+    }
+
+    #[test]
+    fn list_c6_pagination_objects_and_prefixes_sharing_a_page() {
+        // The old C6 case: keys a,b,p/1,p/2,z with delimiter `/` and max-keys=3.
+        // Listable items in sorted order are: a, b, p/ (CommonPrefix), z. With
+        // max-keys=3 the first page is [a, b, p/] and the LAST EMITTED item is the
+        // CommonPrefix `p/`. The token MUST be `p/` so the next page yields only `z`
+        // — never re-emitting `p/` and never skipping `z`.
+        let (_dir, fs) = store();
+        for k in ["a", "b", "p/1", "p/2", "z"] {
+            put(&fs, k);
+        }
+        let mut input = li("bkt");
+        input.delimiter = "/".into();
+        input.max_keys = Some(3);
+        let page1 = fs.list_objects(&input).unwrap();
+        assert_eq!(keys_of(&page1), vec!["a", "b"]);
+        assert_eq!(page1.common_prefixes, vec!["p/".to_string()]);
+        assert!(page1.is_truncated);
+        // C6: token is the LAST EMITTED item = the CommonPrefix `p/`, NOT the last
+        // object `b`. (If it were derived from objects.last() == "b", the next page
+        // would re-emit `p/` and the test below would see a duplicate.)
+        assert_eq!(page1.next_continuation_token, "p/");
+
+        let mut input2 = li("bkt");
+        input2.delimiter = "/".into();
+        input2.max_keys = Some(3);
+        input2.continuation_token = page1.next_continuation_token.clone();
+        let page2 = fs.list_objects(&input2).unwrap();
+        assert_eq!(keys_of(&page2), vec!["z"]);
+        assert!(page2.common_prefixes.is_empty(), "p/ must not be re-emitted");
+        assert!(!page2.is_truncated);
+
+        // Concatenation across pages: a, b, p/ (prefix), z — each exactly once.
+        let mut all_keys: Vec<String> = keys_of(&page1);
+        all_keys.extend(keys_of(&page2));
+        assert_eq!(all_keys, vec!["a", "b", "z"]);
+        let mut all_prefixes: Vec<String> = page1.common_prefixes.clone();
+        all_prefixes.extend(page2.common_prefixes.clone());
+        assert_eq!(all_prefixes, vec!["p/".to_string()]);
+    }
+
+    #[test]
+    fn list_deep_and_unicode_keys() {
+        let (_dir, fs) = store();
+        for k in [
+            "deeply/nested/path/to/the/object.bin",
+            "café/résumé.txt",
+            "emoji/😀/file",
+            "plain",
+        ] {
+            put(&fs, k);
+        }
+        let out = fs.list_objects(&li("bkt")).unwrap();
+        let mut want = vec![
+            "café/résumé.txt".to_string(),
+            "deeply/nested/path/to/the/object.bin".to_string(),
+            "emoji/😀/file".to_string(),
+            "plain".to_string(),
+        ];
+        want.sort();
+        assert_eq!(keys_of(&out), want);
+        // The deep key GETs back correctly (round-trip through the tree).
+        let got = read_all(
+            fs.get_object("bkt", "deeply/nested/path/to/the/object.bin", None)
+                .unwrap()
+                .body,
+        );
+        assert_eq!(got, b"body-of-deeply/nested/path/to/the/object.bin");
+    }
+
+    #[test]
+    fn list_key_ending_in_meta_round_trips_through_listing() {
+        // The double-suffix encoding (report.meta -> report.meta.meta) must DECODE
+        // back to `report.meta` during listing, not `report` and not `report.meta.meta`.
+        let (_dir, fs) = store();
+        for k in ["report.meta", "a.meta.meta", "a.meta/b", "normal.txt"] {
+            put(&fs, k);
+        }
+        let out = fs.list_objects(&li("bkt")).unwrap();
+        let mut want = vec![
+            "a.meta.meta".to_string(),
+            "a.meta/b".to_string(),
+            "normal.txt".to_string(),
+            "report.meta".to_string(),
+        ];
+        want.sort();
+        assert_eq!(keys_of(&out), want);
+    }
+
+    #[test]
+    fn list_multipart_object_has_composite_etag_and_real_size() {
+        let (_dir, fs) = store();
+        let key = "mp/big";
+        let (upload_id, parts, etags) = upload_3_parts(&fs, "bkt", key);
+        let complete: Vec<CompletePart> = (0..3)
+            .map(|i| CompletePart { part_number: (i + 1) as i32, etag: etags[i].clone() })
+            .collect();
+        let composite = fs.complete_multipart_upload("bkt", key, &upload_id, &complete).unwrap();
+        let total: u64 = parts.iter().map(|p| p.len() as u64).sum();
+
+        // Also a plain object, to confirm listing mixes both.
+        put(&fs, "plain");
+
+        let out = fs.list_objects(&li("bkt")).unwrap();
+        let mp = out.objects.iter().find(|o| o.key == key).unwrap();
+        assert_eq!(mp.etag, composite);
+        assert!(mp.etag.ends_with("-3\""));
+        assert_eq!(mp.size, total as i64);
+        // The plain object is also listed with its real (single-part) etag/size.
+        let pl = out.objects.iter().find(|o| o.key == "plain").unwrap();
+        assert_eq!(pl.size, "body-of-plain".len() as i64);
+    }
+
+    #[test]
+    fn list_skips_corrupt_manifest_for_emitted_key() {
+        // A key whose manifest is corrupt (e.g. raced a partial write) is SKIPPED in
+        // the output rather than failing the whole listing.
+        let (dir, fs) = store();
+        let bk = dir.path().join("bkt");
+        put(&fs, "good");
+        put(&fs, "bad");
+        // Corrupt `bad`'s manifest in place.
+        let mp = manifest::manifest_path(&bk.join("current"), "bad");
+        std::fs::write(&mp, b"{ this is not valid json").unwrap();
+        let out = fs.list_objects(&li("bkt")).unwrap();
+        // `good` listed; `bad` skipped (unreadable manifest).
+        assert_eq!(keys_of(&out), vec!["good"]);
+    }
+
+    // ---- ListBuckets ----
+
+    #[test]
+    fn list_buckets_sorted() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = CasStore::new(dir.path());
+        for b in ["zeta", "alpha", "mid-bucket"] {
+            fs.create_bucket(b).unwrap();
+        }
+        let buckets = fs.list_buckets().unwrap();
+        let names: Vec<String> = buckets.iter().map(|b| b.name.clone()).collect();
+        assert_eq!(names, vec!["alpha", "mid-bucket", "zeta"]);
+    }
+
+    #[test]
+    fn list_buckets_empty_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = CasStore::new(dir.path());
+        assert!(fs.list_buckets().unwrap().is_empty());
+    }
+
+    #[test]
+    fn list_buckets_skips_symlinked_entry() {
+        // LOAD-BEARING (F4/E8): a symlink under the data root that POINTS AT a real
+        // directory must NOT be listed as a bucket. This relies on
+        // `DirEntry::metadata()` NOT following the symlink. If the impl used
+        // `fs::metadata(path)` (which follows links), the symlink would resolve to a
+        // dir and be WRONGLY listed — this test would then fail.
+        let dir = tempfile::tempdir().unwrap();
+        let fs = CasStore::new(dir.path());
+        fs.create_bucket("real-bucket").unwrap();
+
+        // Create a real directory OUTSIDE the data root, then symlink to it from
+        // inside the data root with a bucket-like name.
+        let external = dir.path().join("external-target-dir");
+        std::fs::create_dir(&external).unwrap();
+        // Put a file inside so the target is unambiguously a non-empty real dir.
+        std::fs::write(external.join("x"), b"y").unwrap();
+        // external-target-dir is a sibling of the symlink under root; both are under
+        // the data root, but the symlink ITSELF must be skipped.
+        let link = dir.path().join("aaa-symlinked-bucket");
+        std::os::unix::fs::symlink(&external, &link).unwrap();
+
+        let buckets = fs.list_buckets().unwrap();
+        let names: Vec<String> = buckets.iter().map(|b| b.name.clone()).collect();
+        // The symlink (aaa-symlinked-bucket) must NOT appear despite sorting first.
+        assert!(
+            !names.contains(&"aaa-symlinked-bucket".to_string()),
+            "symlinked entry was wrongly listed: {names:?}"
+        );
+        // The real bucket and the (real, non-symlink) external target dir ARE listed.
+        assert!(names.contains(&"real-bucket".to_string()));
+        assert!(names.contains(&"external-target-dir".to_string()));
+    }
+
+    // ---- key <-> path round-trip for the listing decode over tricky keys ----
+
+    #[test]
+    fn listing_decode_is_exact_inverse_of_manifest_path() {
+        let cur = Path::new("/data/bk/current");
+        for key in [
+            "a",
+            "a/b",
+            "report.meta",
+            "a.meta.meta",
+            "a.meta/b",
+            "deeply/nested/path/to/object.bin",
+            "café/résumé.txt",
+            "emoji/😀/file",
+            "trailing.dot.",
+            "x.metameta",
+        ] {
+            let p = manifest::manifest_path(cur, key);
+            let rel = p.strip_prefix(cur).unwrap();
+            let decoded = manifest::decode_relpath_to_key(rel)
+                .unwrap_or_else(|| panic!("decode failed for key {key:?}"));
+            assert_eq!(decoded, key, "round-trip mismatch for key {key:?}");
+        }
     }
 }
