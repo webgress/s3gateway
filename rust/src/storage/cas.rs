@@ -145,6 +145,21 @@ pub(crate) fn set_force_parts_fsync_fail(v: bool) {
     FORCE_PARTS_FSYNC_FAIL.with(|c| c.set(v));
 }
 
+// C6 test hook: when armed, `write_journal`'s `deleted/`-dir fsync (under --fsync) is
+// forced to fail, so a test can prove the error is PROPAGATED (not swallowed). The
+// `deleted/` dir is a real directory and the journal FILE write succeeds — only the
+// dir-fsync fails — isolating exactly the C6 path. Thread-local; compiles out in
+// non-test builds.
+#[cfg(test)]
+thread_local! {
+    static FORCE_JOURNAL_DIR_FSYNC_FAIL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_force_journal_dir_fsync_fail(v: bool) {
+    FORCE_JOURNAL_DIR_FSYNC_FAIL.with(|c| c.set(v));
+}
+
 /// Test-only, DETERMINISTIC injection points that let a test reproduce the exact
 /// two-writer interleaving the per-key publish lock (`lock_key`) exists to
 /// prevent — without any sleeps or timing races. Ported from the (removed)
@@ -318,6 +333,125 @@ mod publish_pause {
 fn publish_window_pause(_bucket: &str, _key: &str) {
     #[cfg(test)]
     publish_pause::pause(_bucket, _key);
+}
+
+/// C2 deterministic test hook: a single-barrier handshake that lets a test prove the
+/// single-part GET opens its blob fd UNDER the per-key READ lock. [`pause`] is called
+/// inside `get_object` AFTER the manifest snapshot read but BEFORE `open_body` — STILL
+/// HOLDING the read lock. A test arms it for one `{bucket}/{key}`, parks the GET there
+/// (read lock held), starts a concurrent overwrite (which must block on the per-key
+/// WRITE lock, so it cannot reclaim the old blob yet), then releases the GET; the GET
+/// opens the still-present old blob under the lock, drops the lock, and streams the old
+/// bytes from the pinned fd even after the overwrite reclaims the old blob.
+/// Compiled out entirely in non-test builds.
+#[inline(always)]
+fn get_open_pause(_bucket: &str, _key: &str) {
+    #[cfg(test)]
+    get_pause::pause(_bucket, _key);
+}
+
+#[cfg(test)]
+mod get_pause {
+    use std::sync::{Condvar, Mutex, OnceLock};
+
+    pub(super) struct Hook {
+        pub key: String,
+        state: Mutex<State>,
+        cv: Condvar,
+    }
+    #[derive(Default)]
+    struct State {
+        arrived: bool,
+        released: bool,
+        /// A concurrent writer hit the per-key WRITE lock while the GET held the READ
+        /// lock — proof the GET's open is happening under the read lock (the C2 fix).
+        writer_contended: bool,
+    }
+
+    static HOOK: OnceLock<Mutex<Option<&'static Hook>>> = OnceLock::new();
+    static SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn slot() -> &'static Mutex<Option<&'static Hook>> {
+        HOOK.get_or_init(|| Mutex::new(None))
+    }
+
+    pub(super) fn serialize_test() -> std::sync::MutexGuard<'static, ()> {
+        SERIAL.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    impl Hook {
+        pub(super) fn arm(key: &str) -> &'static Hook {
+            let h = Box::leak(Box::new(Hook {
+                key: key.to_string(),
+                state: Mutex::new(State::default()),
+                cv: Condvar::new(),
+            }));
+            *slot().lock().unwrap() = Some(h);
+            h
+        }
+        pub(super) fn disarm() {
+            *slot().lock().unwrap() = None;
+        }
+        pub(super) fn wait_arrived(&self) {
+            let mut st = self.state.lock().unwrap();
+            while !st.arrived {
+                st = self.cv.wait(st).unwrap();
+            }
+        }
+        /// Wait up to `timeout` for a concurrent writer to register WRITE-lock
+        /// contention. Returns true iff contention fired (C2 fix in effect: the GET
+        /// holds the read lock, so the overwrite blocks). A timeout (false) means the
+        /// overwrite ran lock-free — the pre-C2 shape where the open is NOT under the
+        /// read lock.
+        pub(super) fn wait_writer_contended_timeout(&self, timeout: std::time::Duration) -> bool {
+            let mut st = self.state.lock().unwrap();
+            let deadline = std::time::Instant::now() + timeout;
+            while !st.writer_contended {
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    return st.writer_contended;
+                }
+                let (g, to) = self.cv.wait_timeout(st, deadline - now).unwrap();
+                st = g;
+                if to.timed_out() {
+                    return st.writer_contended;
+                }
+            }
+            true
+        }
+        pub(super) fn release(&self) {
+            let mut st = self.state.lock().unwrap();
+            st.released = true;
+            self.cv.notify_all();
+        }
+    }
+
+    /// Called from `lock_key` when a writer is about to block on the per-key WRITE
+    /// lock; records contention so the C2 test can confirm the GET holds the READ lock.
+    pub(super) fn note_lock_contention(bucket: &str, key: &str) {
+        let hook = { *slot().lock().unwrap() };
+        let Some(hook) = hook else { return };
+        if hook.key != format!("{bucket}/{key}") {
+            return;
+        }
+        let mut st = hook.state.lock().unwrap();
+        st.writer_contended = true;
+        hook.cv.notify_all();
+    }
+
+    pub(super) fn pause(bucket: &str, key: &str) {
+        let hook = { *slot().lock().unwrap() };
+        let Some(hook) = hook else { return };
+        if hook.key != format!("{bucket}/{key}") {
+            return;
+        }
+        let mut st = hook.state.lock().unwrap();
+        st.arrived = true;
+        hook.cv.notify_all();
+        while !st.released {
+            st = hook.cv.wait(st).unwrap();
+        }
+    }
 }
 
 /// A3 deterministic test hook: a second, independent Condvar handshake (separate
@@ -540,6 +674,7 @@ impl CasStore {
         {
             if self.key_locks[idx].try_write().is_err() {
                 publish_pause::note_lock_contention(bucket, key);
+                get_pause::note_lock_contention(bucket, key);
             }
         }
         self.key_locks[idx]
@@ -769,6 +904,13 @@ impl CasStore {
         // Stream the body to a blob (lock-free; one-pass MD5; fsync). This is the
         // big work and runs BEFORE the per-key publish lock is taken.
         let info = blob::write_blob(&bucket_root, body).map_err(body_or_io)?;
+        // C1 [HIGH — durability]: under --fsync, make the blob's fanout DIRENT durable
+        // (write_blob fsyncs only the file) BEFORE the manifest that references it is
+        // committed by publish() below — otherwise a crash could leave a durable
+        // manifest pointing at a blob whose dirent was lost (a dangling live object).
+        if self.fsync {
+            blob::fsync_blob_dir(&bucket_root, &info.blob_id).map_err(StorageError::Io)?;
+        }
 
         let etag = format!("\"{}\"", info.md5_hex);
         let ct = if content_type.is_empty() {
@@ -1049,34 +1191,46 @@ impl CasStore {
         // current/ (no-op on kernels lacking openat2).
         self.verify_read_beneath(bucket, &k)?;
 
-        // Belt-and-suspenders: hold the read lock for the single manifest read
-        // (atomic rename + immutable blobs already guarantee a consistent
-        // snapshot; this is NOT required for correctness — REDESIGN §9). The lock
-        // is dropped before the body streams.
-        let manifest = {
+        let bucket_root = self.bucket_root(bucket);
+
+        // C2 [hardening]: read the manifest AND open the body UNDER the per-key READ
+        // lock, then drop the lock before streaming. For a SINGLE-PART object this pins
+        // the blob's inode (its fd is opened by `open_body` while the lock is held), so
+        // a concurrent overwrite/delete — which must take the per-key WRITE lock to
+        // reclaim — cannot unlink the blob between our manifest snapshot and our open
+        // and produce a spurious ObjectNotFound. The open fd keeps the inode alive for
+        // the whole stream (POSIX), so the body still streams correctly after the lock
+        // drops. Multipart parts are opened LAZILY by MultipartReader and are NOT pinned
+        // here — that remains the accepted §5 fail-on-change behavior (C3, documented),
+        // and pinning up to 10k part fds is rejected (fd exhaustion).
+        let (manifest, resolved_range, body) = {
             let _snap = self.rlock_key(bucket, key);
-            match manifest::read_manifest(&k) {
+            let manifest = match manifest::read_manifest(&k) {
                 Ok(m) => m,
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    drop(_snap);
                     self.head_bucket(bucket)?;
                     return Err(StorageError::ObjectNotFound);
                 }
                 Err(e) => return Err(e.into()),
-            }
+            };
+            let total = manifest.content_length;
+            let resolved_range = match range_header {
+                Some(h) => match parse_range(h, total) {
+                    Ok(r) => r,
+                    Err(()) => return Err(StorageError::RangeNotSatisfiable { size: total }),
+                },
+                None => None,
+            };
+            // C2 deterministic test hook: park here (read lock STILL HELD) so a test can
+            // prove the open below happens under the read lock. No-op in production.
+            get_open_pause(bucket, key);
+            let body = self.open_body(&bucket_root, &manifest, resolved_range)?;
+            (manifest, resolved_range, body)
         };
 
         let total = manifest.content_length;
-        let resolved_range = match range_header {
-            Some(h) => match parse_range(h, total) {
-                Ok(r) => r,
-                Err(()) => return Err(StorageError::RangeNotSatisfiable { size: total }),
-            },
-            None => None,
-        };
-
-        let bucket_root = self.bucket_root(bucket);
         let metadata = manifest.to_object_metadata();
-        let body = self.open_body(&bucket_root, &manifest, resolved_range)?;
         Ok(GetObjectResult {
             metadata,
             body,
@@ -1152,6 +1306,17 @@ impl CasStore {
             // Multipart: build PartRef list pointing at blob paths so the existing
             // MultipartReader streams them back-to-back. (Phase A never WRITES a
             // multipart manifest, but the read path is kept compatible.)
+            //
+            // C3 [BY DESIGN — accepted fail-on-change, REDESIGN §5.1]: MultipartReader
+            // opens these part blobs LAZILY (one fd at a time), so the part fds are NOT
+            // pinned here the way the single-part C2 path pins its one fd under the read
+            // lock. If a concurrent reclaim deletes a later, not-yet-opened part blob
+            // mid-stream, that part's open fails ENOENT and the stream TRUNCATES at the
+            // part boundary — a clean fail-fast short-read, never mixed bytes (each part
+            // blob is an immutable uuid that is only unlinked, never overwritten).
+            // Pinning all part fds up front is REJECTED: a multipart object can have up
+            // to 10k parts, so holding 10k fds for the whole (possibly long) stream would
+            // risk fd exhaustion under concurrent large GETs.
             let parts = manifest
                 .parts
                 .iter()
@@ -1183,9 +1348,17 @@ impl CasStore {
         f.write_all(&data)?;
         if self.fsync {
             f.sync_all()?;
-            // fsync the deleted/ dir so the new journal entry is durable.
+            // C6 [LOW — durability]: fsync the deleted/ dir so the new journal's DIRENT
+            // is durable, and PROPAGATE the error (consistent with C1's posture) rather
+            // than swallowing it. A lost journal dirent means recover() never replays the
+            // reclaim and the superseded blobs leak; an overwrite/delete that cannot
+            // durably journal its reclaim must FAIL rather than ack a non-durable commit.
             if let Some(parent) = path.parent() {
-                let _ = super::directio::fsync_dir(parent);
+                #[cfg(test)]
+                if FORCE_JOURNAL_DIR_FSYNC_FAIL.with(|c| c.get()) {
+                    return Err(io::Error::other("forced deleted/ dir fsync failure (test)"));
+                }
+                super::directio::fsync_dir(parent)?;
             }
         }
         Ok(())
@@ -1816,6 +1989,13 @@ impl CasStore {
         bucket: &str,
         key: &str,
     ) -> Result<MultipartUpload> {
+        // C5: a `completed` marker means a successful Complete already finalized this
+        // upload (and its best-effort rmdir failed or has not run yet). Reject any
+        // further UploadPart/Complete/ListParts/Abort with NoSuchUpload — the uploadId
+        // is no longer addressable even though its dir survives.
+        if upload_dir.join("completed").exists() {
+            return Err(StorageError::NoSuchUpload);
+        }
         let raw = match read_nofollow(&upload_dir.join("upload.json")) {
             Ok(d) => d,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(StorageError::NoSuchUpload),
@@ -1927,12 +2107,17 @@ impl CasStore {
         let _guard = self.lock_key(&upload.bucket, &upload.key);
 
         // Atomically install the part ref. If a previous ref for this number existed,
-        // capture its blob_id so we can reclaim the now-orphaned old blob.
+        // capture its FULL bytes + blob_id: the bytes so a failed re-upload can RESTORE
+        // the prior ref (C4), the blob_id so a SUCCESSFUL overwrite can reclaim the now-
+        // orphaned old blob.
         let ref_path = upload_dir.join("parts").join(format!("{part_number:05}.ref"));
-        let prev_blob = match read_nofollow(&ref_path) {
-            Ok(d) => serde_json::from_slice::<PartRefFile>(&d).ok().map(|p| p.blob_id),
+        let prev_ref: Option<(Vec<u8>, String)> = match read_nofollow(&ref_path) {
+            Ok(d) => serde_json::from_slice::<PartRefFile>(&d)
+                .ok()
+                .map(|p| (d, p.blob_id)),
             Err(_) => None,
         };
+        let prev_blob = prev_ref.as_ref().map(|(_, id)| id.clone());
         let pref = PartRefFile {
             part_number: part_number as u32,
             blob_id: info.blob_id.clone(),
@@ -1975,8 +2160,23 @@ impl CasStore {
                 super::directio::fsync_dir(&upload_dir.join("parts"))
             };
             if let Err(e) = fsync_res {
-                let _ = std::fs::remove_file(&ref_path);
-                let _ = blob::reclaim_blob(&bucket_root, &info.blob_id);
+                // C4 [MED]: roll back to EXACTLY the pre-upload state. The rename above
+                // already replaced any previous `.ref`, so removing the new ref + new
+                // blob is not enough on an OVERWRITE — it would lose the PREVIOUS part.
+                match &prev_ref {
+                    Some((prev_bytes, _)) => {
+                        // Restore the previous ref's bytes in place (overwrite the new
+                        // ref), then reclaim ONLY the new blob — the previous blob is
+                        // referenced again by the restored ref, so it must survive.
+                        let _ = write_nofollow(&ref_path, prev_bytes, self.fsync);
+                        let _ = blob::reclaim_blob(&bucket_root, &info.blob_id);
+                    }
+                    None => {
+                        // Fresh part (no previous ref): just remove the new ref + blob.
+                        let _ = std::fs::remove_file(&ref_path);
+                        let _ = blob::reclaim_blob(&bucket_root, &info.blob_id);
+                    }
+                }
                 return Err(e.into());
             }
         }
@@ -2166,6 +2366,17 @@ impl CasStore {
                 }
             };
             moved.push((new_id.clone(), stored_ref.blob_id.clone()));
+            // C1 [HIGH — durability]: under --fsync, make the moved blob's NEW fanout
+            // DIRENT durable (move_blob_to_new_id renames into a possibly-fresh fanout
+            // dir without fsyncing it) BEFORE publish() commits the manifest that
+            // references this new id — same ordering rule as the single-PUT path. On
+            // failure roll the moves back so the upload stays retryable (E2).
+            if self.fsync {
+                if let Err(e) = blob::fsync_blob_dir(&bucket_root, &new_id) {
+                    rollback_moves(&moved);
+                    return Err(StorageError::Io(e));
+                }
+            }
 
             let raw = hex::decode(&stored_ref.md5_hex)
                 .map_err(|_| StorageError::InvalidPart)?;
@@ -2214,6 +2425,15 @@ impl CasStore {
             rollback_moves(&moved);
             return Err(e);
         }
+
+        // C5 [S3 fidelity]: mark the upload COMPLETED before tearing it down. The rmdir
+        // below is best-effort, so a surviving uploadId would otherwise stay addressable
+        // (re-UploadPart/Complete/ListParts would still find a live-looking dir). Write a
+        // `completed` marker FIRST: `assert_upload_matches` rejects any subsequent
+        // mutation/list on a marked upload with `NoSuchUpload` even if the rmdir fails.
+        // The marker is durable under --fsync so it survives a crash between marking and
+        // a (failed/interrupted) rmdir.
+        let _ = write_nofollow(&upload_dir.join("completed"), b"1", self.fsync);
 
         // Success: remove the upload working dir. This is now SAFE as best-effort — the
         // upload's `.ref`s point at the moved-away (ENOENT) original ids, so even if the
@@ -2331,6 +2551,11 @@ impl CasStore {
             if scanned > scan_cap {
                 scan_capped = true;
                 break;
+            }
+            // C5: a completed-but-not-yet-removed upload dir is no longer addressable;
+            // do not list it (consistent with assert_upload_matches' NoSuchUpload).
+            if entry.path().join("completed").exists() {
+                continue;
             }
             let meta_path = entry.path().join("upload.json");
             let data = match read_nofollow(&meta_path) {
@@ -4884,6 +5109,319 @@ mod tests {
         );
         // The HEAD etag is unchanged (still the composite from the first Complete).
         assert_eq!(fs.head_object("bkt", key).unwrap().etag, composite);
+    }
+
+    #[test]
+    fn c2_single_part_get_pins_blob_under_read_lock_vs_overwrite() {
+        // C2 [hardening], LOAD-BEARING. A single-part GET opens the blob fd UNDER the
+        // per-key READ lock; a concurrent overwrite must take the per-key WRITE lock to
+        // reclaim the old blob, so it cannot unlink between the GET's manifest snapshot
+        // and its open. The open fd then pins the inode for the whole post-lock stream,
+        // so the GET returns the consistent OLD bytes — NOT a spurious ObjectNotFound.
+        //
+        // Deterministic drive (no sleeps): the GET parks (read lock held) just before
+        // open_body; we launch the overwrite (it blocks on the per-key WRITE lock); we
+        // release the GET — it opens the still-present old blob under the lock, drops the
+        // lock, and the overwrite then proceeds to reclaim the old blob. The GET streams
+        // the OLD bytes from its pinned fd.
+        //
+        // Fail-without-fix: move open_body back OUTSIDE the locked block (the pre-C2
+        // shape). Then the read lock drops BEFORE the open; the released overwrite
+        // reclaims the old blob; the GET's open ENOENTs -> ObjectNotFound. This test then
+        // FAILS (the body read errors / bytes mismatch).
+        use std::sync::Arc;
+        let _serial = get_pause::serialize_test();
+        let dir = tempfile::tempdir().unwrap();
+        let fs = Arc::new(CasStore::with_fsync(dir.path(), false));
+        fs.create_bucket("bkt").unwrap();
+        let bk = dir.path().join("bkt");
+        let key = "c2/hot";
+
+        let old_bytes = vec![0xABu8; 64 * 1024];
+        fs.put_object("bkt", key, &old_bytes[..], "application/octet-stream", BTreeMap::new())
+            .unwrap();
+        assert_eq!(count_blobs(&bk), 1);
+
+        let hook = get_pause::Hook::arm(&format!("bkt/{key}"));
+
+        // Reader: GET parks at get_open_pause. With the C2 fix that pause is UNDER the
+        // read lock (before open_body); pre-C2 it is AFTER the lock dropped.
+        let fr = Arc::clone(&fs);
+        let r = std::thread::spawn(move || {
+            // ObjectNotFound would surface here in the broken (pre-C2) shape; capture it.
+            fr.get_object("bkt", key, None).map(|res| read_all(res.body))
+        });
+        hook.wait_arrived(); // GET is parked.
+
+        // Overwrite: a second PUT of NEW bytes. It must take the per-key WRITE lock to
+        // commit + reclaim the old blob.
+        let fw = Arc::clone(&fs);
+        let new_bytes = vec![0xCDu8; 32 * 1024];
+        let nb = new_bytes.clone();
+        let mut w = Some(std::thread::spawn(move || {
+            fw.put_object("bkt", key, &nb[..], "application/octet-stream", BTreeMap::new())
+                .unwrap();
+        }));
+
+        // Distinguisher: does the overwrite BLOCK on the per-key WRITE lock?
+        //  * C2 fix: the GET holds the READ lock at the pause -> the overwrite's
+        //    lock_key contends -> note_lock_contention fires (true). Releasing the GET
+        //    then lets it open the still-present old blob under the lock (pinned fd).
+        //  * pre-C2: the GET already dropped the lock before the pause -> the overwrite
+        //    runs LOCK-FREE to completion (reclaims the old blob). We JOIN it first so
+        //    the old blob is gone, THEN release the GET -> its open ENOENTs.
+        let contended =
+            hook.wait_writer_contended_timeout(std::time::Duration::from_secs(5));
+        if !contended {
+            // Broken shape: let the overwrite finish reclaiming, then unpause the GET.
+            w.take().unwrap().join().unwrap();
+        }
+        hook.release();
+        let got = r.join().unwrap();
+        if let Some(w) = w.take() {
+            w.join().unwrap();
+        }
+        get_pause::Hook::disarm();
+
+        // LOAD-BEARING: with the C2 fix the writer contended and the GET returned the
+        // consistent OLD bytes from its pinned fd. Pre-C2 the GET ENOENTs (Err) -> this
+        // asserts FAIL.
+        assert!(
+            contended,
+            "C2: the overwrite must block on the per-key WRITE lock, proving the GET \
+             opens its blob under the READ lock"
+        );
+        let got = got.expect("C2: single-part GET must not spuriously fail with ObjectNotFound");
+        assert_eq!(got, old_bytes, "C2: single-part GET must return the consistent OLD bytes");
+        // After both, the live object is the NEW version, with exactly one blob.
+        let now = read_all(fs.get_object("bkt", key, None).unwrap().body);
+        assert_eq!(now, new_bytes, "the overwrite is now live");
+        assert_eq!(count_blobs(&bk), 1, "only the new version's blob remains");
+    }
+
+    #[test]
+    fn c1_put_fsyncs_blob_fanout_dir_before_commit_and_round_trips() {
+        // C1 [HIGH — durability], LOAD-BEARING under --fsync. A single-part PUT must
+        // fsync the blob's fanout PARENT dir (so the blob's DIRENT — not just its file
+        // bytes — is durable) BEFORE publish() commits the manifest that references it.
+        // We assert (a) the fanout-dir fsync RAN (the C1 counter incremented) and (b)
+        // the object round-trips. Fail-without-fix: drop the `fsync_blob_dir` call in
+        // put_object and the counter stays 0 -> this asserts FAIL.
+        let dir = tempfile::tempdir().unwrap();
+        let fs = CasStore::with_fsync(dir.path(), true); // --fsync ON
+        fs.create_bucket("bkt").unwrap();
+
+        let _ = blob::take_fsync_dir_calls(); // reset on this thread
+        let body = vec![7u8; 100_000];
+        fs.put_object(
+            "bkt",
+            "c1/put/object.bin",
+            &body[..],
+            "application/octet-stream",
+            BTreeMap::new(),
+        )
+        .unwrap();
+        assert!(
+            blob::take_fsync_dir_calls() >= 1,
+            "PUT under --fsync must fsync the blob fanout dir (C1)"
+        );
+        let got = read_all(fs.get_object("bkt", "c1/put/object.bin", None).unwrap().body);
+        assert_eq!(got, body, "C1 PUT must round-trip");
+
+        // Sanity: with --fsync OFF the path is NOT taken (no fanout-dir fsync), but the
+        // object still round-trips.
+        let dir2 = tempfile::tempdir().unwrap();
+        let fs2 = CasStore::with_fsync(dir2.path(), false);
+        fs2.create_bucket("bkt").unwrap();
+        let _ = blob::take_fsync_dir_calls();
+        fs2.put_object("bkt", "k", &body[..], "", BTreeMap::new()).unwrap();
+        assert_eq!(
+            blob::take_fsync_dir_calls(),
+            0,
+            "no blob fanout-dir fsync should run without --fsync"
+        );
+        assert_eq!(read_all(fs2.get_object("bkt", "k", None).unwrap().body), body);
+    }
+
+    #[test]
+    fn c1_complete_fsyncs_moved_blob_fanout_dir_before_commit_and_round_trips() {
+        // C1 [HIGH — durability], LOAD-BEARING under --fsync. CompleteMultipartUpload
+        // MOVES each part blob to a fresh manifest-owned id (rename into a possibly-new
+        // fanout dir) and must fsync each moved blob's NEW fanout dir BEFORE publish()
+        // commits the manifest. Assert (a) the fanout-dir fsync ran at least once per
+        // moved part and (b) the assembled object round-trips bit-for-bit.
+        let dir = tempfile::tempdir().unwrap();
+        let fs = CasStore::with_fsync(dir.path(), true); // --fsync ON
+        fs.create_bucket("bkt").unwrap();
+        let key = "c1/mp/object.bin";
+        let (upload_id, parts, etags) = upload_3_parts(&fs, "bkt", key);
+
+        let _ = blob::take_fsync_dir_calls(); // reset right before Complete
+        let complete: Vec<CompletePart> = (0..3)
+            .map(|i| CompletePart { part_number: (i + 1) as i32, etag: etags[i].clone() })
+            .collect();
+        fs.complete_multipart_upload("bkt", key, &upload_id, &complete).unwrap();
+        assert!(
+            blob::take_fsync_dir_calls() >= 3,
+            "Complete under --fsync must fsync the fanout dir of each moved part blob (C1)"
+        );
+
+        let mut want = Vec::new();
+        for p in &parts {
+            want.extend_from_slice(p);
+        }
+        let got = read_all(fs.get_object("bkt", key, None).unwrap().body);
+        assert_eq!(got, want, "C1 Complete must round-trip the assembled object");
+        assert_object_consistent(&fs, "bkt", key).unwrap();
+    }
+
+    #[test]
+    fn c4_failed_part_reupload_leaves_previous_part_intact() {
+        // C4 [MED], LOAD-BEARING. A forced parts/-dir fsync failure during a re-upload of
+        // an EXISTING part must leave the upload EXACTLY as before: the OLD part's ref +
+        // blob survive (and the object is GETtable on Complete with the OLD bytes), and
+        // the NEW (failed) blob is reclaimed. Fail-without-fix: the old rollback only
+        // removed the NEW ref + blob without restoring the PREVIOUS ref, so the part
+        // would be LOST (Complete would then fail / the old bytes vanish).
+        let dir = tempfile::tempdir().unwrap();
+        let fs = CasStore::with_fsync(dir.path(), true); // --fsync ON (fsync rollback path)
+        fs.create_bucket("bkt").unwrap();
+        let bk = dir.path().join("bkt");
+        let key = "c4/reupload";
+        let upload_id = fs
+            .create_multipart_upload("bkt", key, "application/octet-stream", BTreeMap::new())
+            .unwrap();
+
+        // First (good) upload of part 1.
+        let old_bytes = vec![1u8; 8192];
+        let old_etag = fs.upload_part("bkt", key, &upload_id, 1, &old_bytes[..]).unwrap();
+        assert_eq!(count_blobs(&bk), 1);
+        // Snapshot the ref bytes so we can prove they are restored unchanged.
+        let ref_path = bk.join("arriving").join(&upload_id).join("parts").join("00001.ref");
+        let ref_before = std::fs::read(&ref_path).unwrap();
+
+        // Re-upload part 1 with DIFFERENT bytes, with the parts/-dir fsync forced to fail.
+        let new_bytes = vec![2u8; 4096];
+        set_force_parts_fsync_fail(true);
+        let res = fs.upload_part("bkt", key, &upload_id, 1, &new_bytes[..]);
+        set_force_parts_fsync_fail(false);
+        assert!(
+            matches!(res, Err(StorageError::Io(_))),
+            "re-upload must fail on the forced parts/ fsync error, got {res:?}"
+        );
+
+        // The PREVIOUS ref is restored byte-for-byte; the NEW blob is reclaimed so only
+        // the OLD part blob remains.
+        let ref_after = std::fs::read(&ref_path).unwrap();
+        assert_eq!(ref_after, ref_before, "C4: the previous part ref must be restored unchanged");
+        assert_eq!(
+            count_blobs(&bk),
+            1,
+            "C4: the new (failed) blob must be reclaimed, leaving only the old part blob"
+        );
+
+        // ListParts still shows exactly the OLD part (etag), and Complete yields the OLD
+        // bytes — the failed re-upload did not mutate the upload.
+        let listed = fs.list_parts("bkt", key, &upload_id).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].etag, old_etag);
+        let complete = vec![CompletePart { part_number: 1, etag: old_etag.clone() }];
+        fs.complete_multipart_upload("bkt", key, &upload_id, &complete).unwrap();
+        let got = read_all(fs.get_object("bkt", key, None).unwrap().body);
+        assert_eq!(got, old_bytes, "C4: Complete must yield the OLD part bytes");
+    }
+
+    #[test]
+    fn c5_completed_upload_rejects_further_ops_even_if_dir_survives() {
+        // C5 [S3 fidelity], LOAD-BEARING for the reject. After a successful Complete, a
+        // second UploadPart/Complete/ListParts on the same uploadId must fail
+        // NoSuchUpload — even when the upload dir SURVIVES (simulating a failed
+        // best-effort rmdir) — because the `completed` marker backstops it.
+        let (dir, fs) = store();
+        let bk = dir.path().join("bkt");
+        let key = "c5/object";
+        let (upload_id, _parts, etags) = upload_3_parts(&fs, "bkt", key);
+        let complete: Vec<CompletePart> = (0..3)
+            .map(|i| CompletePart { part_number: (i + 1) as i32, etag: etags[i].clone() })
+            .collect();
+        fs.complete_multipart_upload("bkt", key, &upload_id, &complete).unwrap();
+
+        // Simulate the rmdir having failed: re-create the upload dir with its upload.json
+        // and the `completed` marker present (the marker is the backstop the C5 fix
+        // writes BEFORE the rmdir).
+        let upload_dir = bk.join("arriving").join(&upload_id);
+        std::fs::create_dir_all(upload_dir.join("parts")).unwrap();
+        std::fs::write(
+            upload_dir.join("upload.json"),
+            serde_json::to_vec(&MultipartUpload {
+                upload_id: upload_id.clone(),
+                bucket: "bkt".into(),
+                key: key.into(),
+                initiated_unix: now_unix(),
+                content_type: "application/octet-stream".into(),
+                user_metadata: BTreeMap::new(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(upload_dir.join("completed"), b"1").unwrap();
+
+        // Every further op on the completed (but surviving) uploadId is NoSuchUpload.
+        assert!(matches!(
+            fs.upload_part("bkt", key, &upload_id, 1, &b"x"[..]),
+            Err(StorageError::NoSuchUpload)
+        ));
+        assert!(matches!(
+            fs.complete_multipart_upload("bkt", key, &upload_id, &complete),
+            Err(StorageError::NoSuchUpload)
+        ));
+        assert!(matches!(
+            fs.list_parts("bkt", key, &upload_id),
+            Err(StorageError::NoSuchUpload)
+        ));
+        // And it is no longer listed among in-flight uploads.
+        let (uploads, _) = fs.list_multipart_uploads("bkt", 1000).unwrap();
+        assert!(
+            !uploads.iter().any(|u| u.upload_id == upload_id),
+            "a completed upload must not appear in ListMultipartUploads"
+        );
+    }
+
+    #[test]
+    fn c6_write_journal_propagates_deleted_dir_fsync_error() {
+        // C6 [LOW — durability], LOAD-BEARING. write_journal must PROPAGATE a deleted/-dir
+        // fsync error under --fsync (not swallow it): a lost journal dirent means
+        // recover() never replays the reclaim and superseded blobs leak, so an
+        // overwrite/delete that cannot durably journal its reclaim must FAIL rather than
+        // ack. The hook forces ONLY the deleted/-dir fsync to fail (the journal FILE
+        // write still succeeds), isolating the C6 path.
+        //
+        // Fail-without-fix: revert the `?` to `let _ = fsync_dir(...)` and these ops
+        // return Ok -> the asserts FAIL.
+        let dir = tempfile::tempdir().unwrap();
+        let fs = CasStore::with_fsync(dir.path(), true); // --fsync ON
+        fs.create_bucket("bkt").unwrap();
+
+        // First PUT creates the object (no journal: no prior version, so it succeeds even
+        // with the hook armed — write_journal is not called on a first PUT).
+        set_force_journal_dir_fsync_fail(true);
+        fs.put_object("bkt", "k", &b"v1"[..], "", BTreeMap::new())
+            .expect("first PUT writes no journal, so the hook does not fire");
+
+        // The OVERWRITE must journal the old blob; the deleted/-dir fsync now fails and
+        // the error must PROPAGATE out of publish() -> put_object.
+        let res = fs.put_object("bkt", "k", &b"v2"[..], "", BTreeMap::new());
+        // A DELETE also journals; it too must propagate.
+        let res_del = fs.delete_object("bkt", "k");
+        set_force_journal_dir_fsync_fail(false);
+        assert!(
+            matches!(res, Err(StorageError::Io(_))),
+            "C6: an overwrite that cannot durably journal its reclaim must fail, got {res:?}"
+        );
+        assert!(
+            matches!(res_del, Err(StorageError::Io(_))),
+            "C6: a delete that cannot durably journal its reclaim must fail, got {res_del:?}"
+        );
     }
 
     #[test]

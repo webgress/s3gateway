@@ -375,7 +375,30 @@ it provably cannot need to): a uuid blob name is never reused, so a path that op
 successfully *is* the snapshot's blob — there is no silent-swap possibility to detect.
 
 (For single-part objects this is even simpler: one blob, one open. ENOENT → truncate;
-otherwise the full body. The fd pins the inode for the whole stream once opened.)
+otherwise the full body. The fd pins the inode for the whole stream once opened.
+**C2:** the single-part blob fd is opened *under the per-key READ lock* — before the
+lock is dropped — so a concurrent overwrite/delete (which must take the per-key WRITE
+lock to reclaim) cannot unlink the blob between the manifest snapshot and the open and
+produce a spurious `ObjectNotFound`. The open fd then keeps the inode alive for the
+whole post-lock stream.)
+
+### 5.1 Multipart GET: accepted fail-on-change (C3 — BY DESIGN)
+
+A multipart GET opens its part blobs **lazily** (`MultipartReader` keeps one fd at a
+time, opening each part as it reaches it). It does **not** pin all part fds up front.
+Therefore, if a concurrent reclaim (an overwrite/delete of the same key, or a GC)
+deletes a *later, not-yet-opened* part blob mid-stream, that part's lazy `open()` fails
+`ENOENT` and the stream **truncates at the part boundary** — a clean fail-fast
+short-read, **never a mix of bytes from two versions** (confirmed: each part blob is an
+immutable uuid that is never overwritten, only unlinked, so an open either yields the
+snapshot's exact bytes or `ENOENT`).
+
+This is the **accepted fail-on-change behavior** for multipart objects. Pinning every
+part fd under the read lock is **rejected**: a multipart object can have up to 10 000
+parts, so pinning all part fds for the duration of a (possibly very long) stream would
+risk file-descriptor exhaustion under concurrent large GETs. The consistency contract
+above still holds — a multipart GET returns one consistent version or it fails; it
+never returns mixed bytes. (Single-part GETs *are* pinned; see §5 / C2.)
 
 ---
 

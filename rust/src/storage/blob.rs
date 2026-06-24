@@ -178,6 +178,46 @@ pub fn move_blob_back(bucket_root: &Path, from_id: &str, to_id: &str) -> io::Res
     super::directio::rename(&from, &to)
 }
 
+// Test-only counter of `fsync_blob_dir` calls, so a load-bearing test can assert
+// the C1 fanout-dir fsync actually runs on the durable path (and is ORDERED before
+// the manifest commit). Compiles out entirely in non-test builds.
+#[cfg(test)]
+thread_local! {
+    static FSYNC_DIR_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Test-only: read-and-reset the `fsync_blob_dir` call counter.
+#[cfg(test)]
+pub(crate) fn take_fsync_dir_calls() -> usize {
+    FSYNC_DIR_CALLS.with(|c| {
+        let n = c.get();
+        c.set(0);
+        n
+    })
+}
+
+/// C1 [HIGH — durability]: fsync a blob's fanout PARENT dir (`blobs/{ab}/{cd}/`) so
+/// the blob's DIRENT — not just its file bytes — is durable. `write_blob` /
+/// `move_blob_to_new_id` fsync the blob FILE (and create its two fanout dirs), but a
+/// crash can still lose the just-created DIRENT in the fanout parent. The caller MUST
+/// invoke this (under `--fsync`) AFTER writing/moving the blob and BEFORE committing
+/// the manifest that references it (`publish`), so the blob is reachable on disk
+/// before the manifest points at it — otherwise a durable manifest can reference a
+/// blob whose dirent was lost (a dangling live object).
+///
+/// Best-effort on the missing-parent case (the parent always exists post-write); a
+/// genuine fsync error is propagated so the caller fails BEFORE the commit rather
+/// than acking a non-durable blob.
+pub fn fsync_blob_dir(bucket_root: &Path, blob_id: &str) -> io::Result<()> {
+    #[cfg(test)]
+    FSYNC_DIR_CALLS.with(|c| c.set(c.get() + 1));
+    let path = blob_path(bucket_root, blob_id);
+    if let Some(parent) = path.parent() {
+        super::directio::fsync_dir(parent)?;
+    }
+    Ok(())
+}
+
 /// Open a blob for streaming reads by id (Direct-IO, O_NOFOLLOW). A missing blob
 /// surfaces as an `io::Error` (`NotFound`) — the reader treats this as fail-fast
 /// truncation (REDESIGN §5).
