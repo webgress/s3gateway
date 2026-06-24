@@ -145,6 +145,22 @@ pub(crate) fn set_force_parts_fsync_fail(v: bool) {
     FORCE_PARTS_FSYNC_FAIL.with(|c| c.set(v));
 }
 
+// D-2 test hook: when armed, force the previous-`.ref` RESTORE (inside the C4
+// UploadPart-overwrite rollback) to fail, so a test can prove the restore-FAILS branch
+// leaves the part referencing the VALID new blob (consistent) and does NOT reclaim it
+// (no dangling/truncated ref). Independent of FORCE_PARTS_FSYNC_FAIL (which TRIGGERS the
+// rollback); both are armed together so the rollback runs AND its restore then fails.
+// Thread-local; compiles out in non-test builds.
+#[cfg(test)]
+thread_local! {
+    static FORCE_PARTS_RESTORE_FAIL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_force_parts_restore_fail(v: bool) {
+    FORCE_PARTS_RESTORE_FAIL.with(|c| c.set(v));
+}
+
 // C6 test hook: when armed, `write_journal`'s `deleted/`-dir fsync (under --fsync) is
 // forced to fail, so a test can prove the error is PROPAGATED (not swallowed). The
 // `deleted/` dir is a real directory and the journal FILE write succeeds — only the
@@ -158,6 +174,22 @@ thread_local! {
 #[cfg(test)]
 pub(crate) fn set_force_journal_dir_fsync_fail(v: bool) {
     FORCE_JOURNAL_DIR_FSYNC_FAIL.with(|c| c.set(v));
+}
+
+// C1-residual test hook: when armed, `put_object`'s pre-publish `fsync_blob_dir` (under
+// --fsync) is forced to fail, so a test can prove the just-written blob is RECLAIMED
+// (not leaked as an orphan) before the error is propagated. This fsync runs BEFORE the
+// per-key lock + publish, so its error never reaches publish's rollback arm — the
+// explicit reclaim in put_object is what prevents the orphan. Thread-local; compiles out
+// in non-test builds.
+#[cfg(test)]
+thread_local! {
+    static FORCE_PUT_BLOB_DIR_FSYNC_FAIL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_force_put_blob_dir_fsync_fail(v: bool) {
+    FORCE_PUT_BLOB_DIR_FSYNC_FAIL.with(|c| c.set(v));
 }
 
 /// Test-only, DETERMINISTIC injection points that let a test reproduce the exact
@@ -909,7 +941,26 @@ impl CasStore {
         // committed by publish() below — otherwise a crash could leave a durable
         // manifest pointing at a blob whose dirent was lost (a dangling live object).
         if self.fsync {
-            blob::fsync_blob_dir(&bucket_root, &info.blob_id).map_err(StorageError::Io)?;
+            // C1-residual [LOW — orphan leak]: this fsync runs BEFORE the per-key lock
+            // + publish below, so its error returns WITHOUT reaching publish's rollback
+            // arm — leaving the just-written blob as an orphan. Reclaim it (best-effort)
+            // before propagating, matching the pre-commit rollback posture, so no orphan
+            // is left. (It would otherwise be gc_orphan_blobs-reclaimable, but the
+            // explicit reclaim avoids relying on the manual GC backstop.)
+            let fsync_res = {
+                #[cfg(test)]
+                if FORCE_PUT_BLOB_DIR_FSYNC_FAIL.with(|c| c.get()) {
+                    Err(io::Error::other("forced put blob-dir fsync failure (test)"))
+                } else {
+                    blob::fsync_blob_dir(&bucket_root, &info.blob_id)
+                }
+                #[cfg(not(test))]
+                blob::fsync_blob_dir(&bucket_root, &info.blob_id)
+            };
+            if let Err(e) = fsync_res {
+                let _ = blob::reclaim_blob(&bucket_root, &info.blob_id);
+                return Err(StorageError::Io(e));
+            }
         }
 
         let etag = format!("\"{}\"", info.md5_hex);
@@ -1338,16 +1389,29 @@ impl CasStore {
     fn write_journal(&self, path: &Path, journal: &Journal) -> io::Result<()> {
         use std::io::Write as _;
         use std::os::unix::fs::OpenOptionsExt as _;
+        // D-1 [MED — atomicity]: write the journal via temp+fsync+rename, matching the
+        // manifest/blob atomic-write pattern. Writing directly to the final
+        // `deleted/{uuid}.journal` path means a crash mid-write leaves a truncated /
+        // half-serialized journal on disk; `apply_journal` would then read garbage. The
+        // rename is atomic, so recover() only ever observes a journal that was fully
+        // serialized (or no journal at all) — never a torn one.
         let data = serde_json::to_vec(journal).map_err(io::Error::other)?;
+        let tmp = path.with_extension(format!("journal.tmp.{}", Uuid::new_v4()));
+        // Clean up the temp on any error before the rename publishes it.
+        let mut tmp_guard = FileGuard::new(tmp.clone());
         let mut f = std::fs::OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .custom_flags(libc::O_NOFOLLOW)
-            .open(path)?;
+            .open(&tmp)?;
         f.write_all(&data)?;
         if self.fsync {
             f.sync_all()?;
+        }
+        drop(f);
+        super::directio::rename(&tmp, path)?;
+        tmp_guard.disarm(); // renamed into place; no longer ours to clean.
+        if self.fsync {
             // C6 [LOW — durability]: fsync the deleted/ dir so the new journal's DIRENT
             // is durable, and PROPAGATE the error (consistent with C1's posture) rather
             // than swallowing it. A lost journal dirent means recover() never replays the
@@ -1391,7 +1455,24 @@ impl CasStore {
         let journal = match Self::read_journal(journal_path) {
             Ok(j) => j,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(ReclaimStats::default()),
-            Err(e) => return Err(e.into()),
+            // D-1 [MED — resilience]: a corrupt/unreadable journal (truncated bytes from
+            // a pre-D-1 crash mid-write, or planted garbage) must NOT abort recover().
+            // SKIP it with a warning and leave it on disk; the superseded blobs it would
+            // have reclaimed simply remain as orphans, recoverable by the fallback
+            // `gc_orphan_blobs` backstop. Aborting recover() here would wedge startup
+            // until a human cleaned the file by hand — a far worse failure mode than a
+            // leaked-blob residual. `InvalidData` is the JSON-parse error from
+            // `read_journal`; any other Io error (EIO, etc.) is also treated as
+            // skip-and-warn for the same reason.
+            Err(e) => {
+                tracing::warn!(
+                    journal = %journal_path.display(),
+                    error = %e,
+                    "skipping unreadable/corrupt reclaim journal during recover; \
+                     superseded blobs (if any) remain gc_orphan_blobs-reclaimable"
+                );
+                return Ok(ReclaimStats::default());
+            }
         };
         let bucket_root = self.bucket_root(bucket);
         let k = manifest::manifest_path(&self.current_root(bucket), &journal.supersedes_key);
@@ -2106,6 +2187,20 @@ impl CasStore {
         // stream above; only the tiny ref-file critical section is serialized.
         let _guard = self.lock_key(&upload.bucket, &upload.key);
 
+        // D-3 [LOW]: RE-CHECK the upload under the per-key lock before installing the
+        // ref. We validated `assert_upload_matches` BEFORE streaming the body (lock-free,
+        // for the big I/O); a concurrent Complete/Abort could have removed the upload dir
+        // (or planted the `completed` marker) in the window between that check and now.
+        // Without this re-check the ref install would fail with a raw Io error (ENOENT on
+        // the missing parts/ dir) -> 500, instead of a clean NoSuchUpload (404). The
+        // re-check runs under the SAME per-key lock Complete/Abort serialize on, so once
+        // it passes the dir cannot disappear under us for the rest of this critical
+        // section. Roll back the just-written (now-orphan) blob before returning.
+        if let Err(e) = self.assert_upload_matches(&upload_dir, bucket, key) {
+            let _ = blob::reclaim_blob(&bucket_root, &info.blob_id);
+            return Err(e);
+        }
+
         // Atomically install the part ref. If a previous ref for this number existed,
         // capture its FULL bytes + blob_id: the bytes so a failed re-upload can RESTORE
         // the prior ref (C4), the blob_id so a SUCCESSFUL overwrite can reclaim the now-
@@ -2165,11 +2260,53 @@ impl CasStore {
                 // blob is not enough on an OVERWRITE — it would lose the PREVIOUS part.
                 match &prev_ref {
                     Some((prev_bytes, _)) => {
-                        // Restore the previous ref's bytes in place (overwrite the new
-                        // ref), then reclaim ONLY the new blob — the previous blob is
-                        // referenced again by the restored ref, so it must survive.
-                        let _ = write_nofollow(&ref_path, prev_bytes, self.fsync);
-                        let _ = blob::reclaim_blob(&bucket_root, &info.blob_id);
+                        // D-2 [MED — consistency]: restore the previous ref ATOMICALLY
+                        // (temp + rename), and reclaim the NEW blob ONLY AFTER the restore
+                        // lands. The old code wrote `prev_bytes` to `ref_path` IN PLACE
+                        // (best-effort, ignoring the result) and then reclaimed the new
+                        // blob unconditionally — so if that in-place write was torn or
+                        // failed, the part could end up truncated OR referencing the
+                        // already-reclaimed new blob (a dangling ref that breaks Complete).
+                        // The invariant: a failed overwrite leaves the part CONSISTENT —
+                        // either the old part (restored) or the new part — never a torn /
+                        // dangling ref.
+                        let restore_tmp = upload_dir
+                            .join("parts")
+                            .join(format!("{part_number:05}.ref.tmp.{}", Uuid::new_v4()));
+                        let mut restore_guard = FileGuard::new(restore_tmp.clone());
+                        let restored = {
+                            #[cfg(test)]
+                            if FORCE_PARTS_RESTORE_FAIL.with(|c| c.get()) {
+                                Err(io::Error::other("forced restore failure (test)"))
+                            } else {
+                                write_nofollow(&restore_tmp, prev_bytes, self.fsync)
+                                    .and_then(|()| super::directio::rename(&restore_tmp, &ref_path))
+                            }
+                            #[cfg(not(test))]
+                            write_nofollow(&restore_tmp, prev_bytes, self.fsync)
+                                .and_then(|()| super::directio::rename(&restore_tmp, &ref_path))
+                        };
+                        if restored.is_ok() {
+                            restore_guard.disarm();
+                            // Old blob is referenced again by the restored ref; reclaim
+                            // ONLY the new blob, which is now unreferenced.
+                            let _ = blob::reclaim_blob(&bucket_root, &info.blob_id);
+                        } else {
+                            // Restore FAILED. Do NOT reclaim the new blob: the part still
+                            // references it via the (valid) new ref installed by the
+                            // earlier rename, so leaving it keeps the part consistent
+                            // (the NEW part) rather than dangling. The previous blob may
+                            // leak as an orphan (gc_orphan_blobs-reclaimable). Surface the
+                            // original fsync error so the caller knows the part is not
+                            // durability-confirmed and can retry.
+                            tracing::warn!(
+                                upload_id = %upload_id,
+                                part_number = part_number,
+                                "UploadPart overwrite rollback could not restore the previous \
+                                 ref; leaving the part referencing the new blob (consistent) \
+                                 and keeping the new blob"
+                            );
+                        }
                     }
                     None => {
                         // Fresh part (no previous ref): just remove the new ref + blob.
@@ -2433,14 +2570,39 @@ impl CasStore {
         // mutation/list on a marked upload with `NoSuchUpload` even if the rmdir fails.
         // The marker is durable under --fsync so it survives a crash between marking and
         // a (failed/interrupted) rmdir.
-        let _ = write_nofollow(&upload_dir.join("completed"), b"1", self.fsync);
+        //
+        // D-4 [LOW — hygiene]: the marker is the DURABLE backstop that makes a surviving
+        // uploadId non-addressable, so its write failure must at least be LOGGED (the old
+        // `let _ =` swallowed it silently). This is written POST-commit — the object is
+        // already live — so we do NOT fail the Complete response if only the marker (or
+        // rmdir) fails. Residual: if BOTH the marker write AND the rmdir fail, the
+        // uploadId stays addressable until GC/recover cleans the dir; that is a GC/hygiene
+        // residual (NOT corruption — the moved-away part blobs make any retry-reclaim a
+        // harmless no-op), so it is acceptable as a LOW.
+        if let Err(e) = write_nofollow(&upload_dir.join("completed"), b"1", self.fsync) {
+            tracing::warn!(
+                upload_id = %upload_id,
+                error = %e,
+                "could not write the multipart `completed` marker after a committed Complete; \
+                 the uploadId may stay addressable until GC removes its dir (object is live)"
+            );
+        }
 
         // Success: remove the upload working dir. This is now SAFE as best-effort — the
         // upload's `.ref`s point at the moved-away (ENOENT) original ids, so even if the
         // rmdir fails (or a crash hits here) any later abort/gc/Complete-RETRY reclaim
         // through those dangling refs is a harmless no-op that can never touch the live
         // object's freshly-id'd blobs.
-        let _ = std::fs::remove_dir_all(&upload_dir);
+        if let Err(e) = std::fs::remove_dir_all(&upload_dir) {
+            if e.kind() != io::ErrorKind::NotFound {
+                tracing::warn!(
+                    upload_id = %upload_id,
+                    error = %e,
+                    "best-effort rmdir of the completed upload dir failed; the `completed` \
+                     marker keeps the uploadId non-addressable, dir is GC-reclaimable"
+                );
+            }
+        }
         Ok(etag)
     }
 
@@ -5332,6 +5494,315 @@ mod tests {
     }
 
     #[test]
+    fn d3_upload_part_rechecks_upload_under_lock_concurrent_abort() {
+        // D-3 [LOW], LOAD-BEARING for the re-check. upload_part validates the upload
+        // (assert_upload_matches) BEFORE streaming the body, then takes the per-key lock
+        // for the ref install. A concurrent Complete/Abort that removes the upload dir in
+        // that window would otherwise make the ref install fail with a raw Io error ->
+        // 500. The D-3 fix RE-CHECKS the upload under the per-key lock before installing
+        // the ref and returns a clean NoSuchUpload (404) instead.
+        //
+        // We make this deterministic with a body reader that REMOVES the upload dir
+        // mid-stream — i.e. exactly while upload_part is between its first check and the
+        // post-lock re-check — modelling a concurrent Abort that landed in the window.
+        //
+        // Fail-without-fix: drop the post-lock `assert_upload_matches` re-check and the
+        // ref-install rename fails with `Err(StorageError::Io(_))` (ENOENT on the gone
+        // parts/ dir) -> this test's NoSuchUpload assertion FAILS.
+        struct AbortMidStream {
+            upload_dir: PathBuf,
+            data: std::io::Cursor<Vec<u8>>,
+            fired: bool,
+        }
+        impl Read for AbortMidStream {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if !self.fired {
+                    // Simulate a concurrent Abort completing: remove the whole upload dir.
+                    let _ = std::fs::remove_dir_all(&self.upload_dir);
+                    self.fired = true;
+                }
+                self.data.read(buf)
+            }
+        }
+
+        let (dir, fs) = store();
+        let bk = dir.path().join("bkt");
+        let key = "d3/object";
+        let upload_id = fs
+            .create_multipart_upload("bkt", key, "application/octet-stream", BTreeMap::new())
+            .unwrap();
+        let upload_dir = bk.join("arriving").join(&upload_id);
+
+        let body = AbortMidStream {
+            upload_dir: upload_dir.clone(),
+            data: std::io::Cursor::new(vec![3u8; 4096]),
+            fired: false,
+        };
+        let res = fs.upload_part("bkt", key, &upload_id, 1, body);
+        assert!(
+            matches!(res, Err(StorageError::NoSuchUpload)),
+            "a concurrent Abort during upload_part must surface NoSuchUpload, not Io/500, got {res:?}"
+        );
+
+        // The orphan blob the rolled-back upload_part wrote must have been reclaimed by
+        // the re-check's cleanup (no leaked blob).
+        assert_eq!(
+            count_blobs(&bk),
+            0,
+            "the part blob must be reclaimed when the post-lock re-check rejects the upload"
+        );
+    }
+
+    #[test]
+    fn d4_complete_writes_marker_before_rmdir() {
+        // D-4 [LOW — hygiene], LOAD-BEARING for the marker-before-rmdir order. The
+        // `completed` marker is the durable backstop that makes a surviving uploadId
+        // non-addressable; complete() must write it BEFORE the best-effort rmdir. A normal
+        // Complete removes the dir entirely (marker gone with it), so to OBSERVE the order
+        // we BLOCK the rmdir by making the upload's `parts/` subdir read-only:
+        // remove_dir_all(upload_dir) then fails (it cannot unlink the read-only parts/'s
+        // children) and the upload dir SURVIVES — and the `completed` marker (written into
+        // the still-writable upload dir) must be present, proving it was written first.
+        // Complete itself must still SUCCEED: the object is committed (and publish stages
+        // into the writable `arriving/` dir) before the marker/rmdir.
+        //
+        // Fail-without-fix: move the marker write AFTER the rmdir (or drop it) and the
+        // surviving dir would have NO marker -> the marker assertion (and the C5 reject
+        // assertions below) FAIL.
+        let (dir, fs) = store();
+        let bk = dir.path().join("bkt");
+        let key = "d4/object";
+        let (upload_id, parts, etags) = upload_3_parts(&fs, "bkt", key);
+        let complete: Vec<CompletePart> = (0..3)
+            .map(|i| CompletePart { part_number: (i + 1) as i32, etag: etags[i].clone() })
+            .collect();
+
+        // Make the upload's `parts/` subdir read-only so complete()'s best-effort
+        // remove_dir_all FAILS on its children — the upload dir SURVIVES with the
+        // `completed` marker that must have been written FIRST. (Complete itself still
+        // succeeds: the object is committed and publish stages into the writable arriving/.)
+        use std::os::unix::fs::PermissionsExt as _;
+        let parts_dir = bk.join("arriving").join(&upload_id).join("parts");
+        let orig = std::fs::metadata(&parts_dir).unwrap().permissions();
+        std::fs::set_permissions(&parts_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let etag = fs.complete_multipart_upload("bkt", key, &upload_id, &complete);
+        std::fs::set_permissions(&parts_dir, orig).unwrap();
+        etag.expect("Complete must succeed even if the marker/rmdir cannot run (object committed)");
+
+        // The dir SURVIVED (rmdir blocked) and the `completed` marker WAS written before
+        // the rmdir attempt — so it is present, making the uploadId non-addressable.
+        let upload_dir = bk.join("arriving").join(&upload_id);
+        assert!(upload_dir.exists(), "the rmdir was blocked, so the upload dir survives");
+        assert!(
+            upload_dir.join("completed").exists(),
+            "the `completed` marker must be written BEFORE the (failed) rmdir"
+        );
+
+        // C5 invariant stays green: the marked, surviving uploadId rejects further ops.
+        assert!(matches!(
+            fs.upload_part("bkt", key, &upload_id, 1, &b"x"[..]),
+            Err(StorageError::NoSuchUpload)
+        ));
+        assert!(matches!(
+            fs.list_parts("bkt", key, &upload_id),
+            Err(StorageError::NoSuchUpload)
+        ));
+
+        // And the object is live + consistent.
+        let mut want = Vec::new();
+        for p in &parts {
+            want.extend_from_slice(p);
+        }
+        let got = read_all(fs.get_object("bkt", key, None).unwrap().body);
+        assert_eq!(got, want, "the committed object must round-trip after Complete");
+        assert_object_consistent(&fs, "bkt", key).unwrap();
+    }
+
+    #[test]
+    fn c1_residual_put_reclaims_blob_on_blob_dir_fsync_error() {
+        // C1-residual [LOW — orphan leak], LOAD-BEARING for the reclaim. In put_object the
+        // pre-publish `fsync_blob_dir` (under --fsync) runs BEFORE the per-key lock +
+        // publish, so its error returns WITHOUT reaching publish's rollback arm — leaking
+        // the just-written blob as an orphan. The fix reclaims that blob (best-effort)
+        // before propagating the error, so NO orphan is left.
+        //
+        // The FORCE_PUT_BLOB_DIR_FSYNC_FAIL hook forces ONLY that fsync to fail, so the
+        // blob FILE is written but its fanout-dir fsync errors — isolating exactly the
+        // C1-residual path.
+        //
+        // Fail-without-fix: revert to `blob::fsync_blob_dir(...)?` (no reclaim before the
+        // `?`) and the post-condition (no orphan blob) FAILS — count_blobs would be 1.
+        let dir = tempfile::tempdir().unwrap();
+        let fs = CasStore::with_fsync(dir.path(), true); // --fsync ON (the C1-residual path)
+        fs.create_bucket("bkt").unwrap();
+        let bk = dir.path().join("bkt");
+
+        set_force_put_blob_dir_fsync_fail(true);
+        let res = fs.put_object("bkt", "k", &b"orphan-on-fsync-error"[..], "", BTreeMap::new());
+        set_force_put_blob_dir_fsync_fail(false);
+
+        assert!(
+            matches!(res, Err(StorageError::Io(_))),
+            "the blob-dir fsync error must propagate from put_object, got {res:?}"
+        );
+        // The just-written blob was RECLAIMED before the error returned -> no orphan left.
+        assert_eq!(
+            count_blobs(&bk),
+            0,
+            "C1-residual: the orphan blob must be reclaimed on a blob-dir fsync error"
+        );
+        // No live object was committed (publish never ran).
+        assert!(matches!(
+            fs.get_object("bkt", "k", None),
+            Err(StorageError::ObjectNotFound)
+        ));
+
+        // A subsequent (un-armed) PUT succeeds and leaves exactly one blob.
+        fs.put_object("bkt", "k", &b"hello"[..], "", BTreeMap::new()).unwrap();
+        assert_eq!(count_blobs(&bk), 1);
+    }
+
+    #[test]
+    fn d2_failed_part_reupload_rollback_is_atomic_and_consistent() {
+        // D-2 [MED — consistency], LOAD-BEARING. The C4 rollback restores the PREVIOUS
+        // `.ref` on a failed re-upload. D-2 hardens that restore to be ATOMIC (temp +
+        // rename, not an in-place best-effort write) and to reclaim the NEW blob ONLY
+        // AFTER the restore lands. The net invariant: after a forced rollback the part is
+        // in a CONSISTENT state — Complete yields VALID bytes for that part, the ref is
+        // neither truncated nor dangling, and no orphan blob breaks Complete.
+        //
+        // This drives the rollback via the existing FORCE_PARTS_FSYNC_FAIL hook on a
+        // re-upload (the restore-succeeds branch, which now runs through the atomic
+        // temp+rename restore), and asserts: (1) NO `.ref.tmp.*` restore temp is left
+        // behind (atomic publish), (2) the restored ref re-reads as a VALID PartRefFile
+        // pointing at the OLD blob, (3) exactly the old part blob remains (new blob
+        // reclaimed AFTER the restore), and (4) Complete yields the OLD bytes intact.
+        //
+        // Fail-without-fix: revert to the in-place `write_nofollow(&ref_path, ...)` +
+        // unconditional new-blob reclaim and assertion (1) (no temp leftover via the new
+        // path) plus the atomic-publish guarantee no longer hold; more importantly a
+        // torn in-place write could leave a ref that fails (2)/(4).
+        let dir = tempfile::tempdir().unwrap();
+        let fs = CasStore::with_fsync(dir.path(), true); // --fsync ON (drives the rollback)
+        fs.create_bucket("bkt").unwrap();
+        let bk = dir.path().join("bkt");
+        let key = "d2/reupload";
+        let upload_id = fs
+            .create_multipart_upload("bkt", key, "application/octet-stream", BTreeMap::new())
+            .unwrap();
+
+        // Good first upload of part 1; remember its blob id and the exact ref bytes.
+        let old_bytes = vec![7u8; 8192];
+        let old_etag = fs.upload_part("bkt", key, &upload_id, 1, &old_bytes[..]).unwrap();
+        let parts_dir = bk.join("arriving").join(&upload_id).join("parts");
+        let ref_path = parts_dir.join("00001.ref");
+        let ref_before = std::fs::read(&ref_path).unwrap();
+        let old_blob = serde_json::from_slice::<PartRefFile>(&ref_before).unwrap().blob_id;
+        assert_eq!(count_blobs(&bk), 1);
+
+        // Re-upload part 1 with the parts/-dir fsync forced to fail -> rollback fires.
+        set_force_parts_fsync_fail(true);
+        let res = fs.upload_part("bkt", key, &upload_id, 1, &vec![8u8; 4096][..]);
+        set_force_parts_fsync_fail(false);
+        assert!(
+            matches!(res, Err(StorageError::Io(_))),
+            "re-upload must fail on the forced fsync error, got {res:?}"
+        );
+
+        // (1) The atomic restore left NO `.ref.tmp.*` temp behind.
+        let leftovers = list_dir(&parts_dir);
+        assert!(
+            leftovers.iter().all(|n| !n.contains(".tmp.")),
+            "no `.ref.tmp.*` temp may survive the atomic restore, saw {leftovers:?}"
+        );
+
+        // (2) The restored ref re-reads as a VALID PartRefFile pointing at the OLD blob
+        //     (not truncated, not dangling), byte-identical to before.
+        let ref_after = std::fs::read(&ref_path).unwrap();
+        assert_eq!(ref_after, ref_before, "the previous ref must be restored byte-for-byte");
+        let restored = serde_json::from_slice::<PartRefFile>(&ref_after)
+            .expect("restored ref must parse (not truncated/torn)");
+        assert_eq!(restored.blob_id, old_blob, "restored ref must point at the OLD blob");
+        assert!(
+            blob::blob_path(&bk, &restored.blob_id).exists(),
+            "the OLD blob the restored ref points at must still exist (no dangling ref)"
+        );
+
+        // (3) New blob reclaimed AFTER the restore -> exactly the old part blob remains.
+        assert_eq!(count_blobs(&bk), 1, "only the OLD part blob may remain (new blob reclaimed)");
+
+        // (4) Complete succeeds and yields the OLD bytes intact — no orphan/dangling ref
+        //     broke it.
+        let complete = vec![CompletePart { part_number: 1, etag: old_etag }];
+        fs.complete_multipart_upload("bkt", key, &upload_id, &complete).unwrap();
+        let got = read_all(fs.get_object("bkt", key, None).unwrap().body);
+        assert_eq!(got, old_bytes, "Complete must yield the OLD part bytes after the rollback");
+    }
+
+    #[test]
+    fn d2_rollback_restore_failure_leaves_part_referencing_new_blob_not_dangling() {
+        // D-2 [MED — consistency], LOAD-BEARING for the restore-FAILS branch (the part the
+        // old code got WRONG). When the C4 rollback's previous-`.ref` restore itself FAILS,
+        // the fix must NOT reclaim the new blob — the part still references the (valid) new
+        // blob via the ref the earlier rename installed, so it stays CONSISTENT (the NEW
+        // part) instead of dangling/truncated. We force BOTH the parts/-dir fsync (to
+        // TRIGGER the rollback) AND the restore (to make the restore branch fail).
+        //
+        // Fail-without-fix: the OLD rollback reclaimed the new blob UNCONDITIONALLY after a
+        // best-effort in-place restore — so a failed restore would leave the ref pointing
+        // at a RECLAIMED blob (dangling), and Complete with the new etag would fail
+        // (InvalidPart on the missing blob). This test asserts Complete SUCCEEDS with the
+        // NEW bytes, which only holds with the fix.
+        let dir = tempfile::tempdir().unwrap();
+        let fs = CasStore::with_fsync(dir.path(), true); // --fsync ON
+        fs.create_bucket("bkt").unwrap();
+        let bk = dir.path().join("bkt");
+        let key = "d2b/reupload";
+        let upload_id = fs
+            .create_multipart_upload("bkt", key, "application/octet-stream", BTreeMap::new())
+            .unwrap();
+
+        // Good first upload of part 1.
+        let old_bytes = vec![5u8; 8192];
+        fs.upload_part("bkt", key, &upload_id, 1, &old_bytes[..]).unwrap();
+        assert_eq!(count_blobs(&bk), 1);
+
+        // Re-upload part 1 with NEW bytes; fsync fails (triggers rollback) AND the restore
+        // is forced to fail (exercises the restore-FAILS branch).
+        let new_bytes = vec![6u8; 4096];
+        let new_etag = format!("\"{}\"", md5_hex(&new_bytes));
+        set_force_parts_fsync_fail(true);
+        set_force_parts_restore_fail(true);
+        let res = fs.upload_part("bkt", key, &upload_id, 1, &new_bytes[..]);
+        set_force_parts_restore_fail(false);
+        set_force_parts_fsync_fail(false);
+        assert!(
+            matches!(res, Err(StorageError::Io(_))),
+            "the re-upload must surface the error, got {res:?}"
+        );
+
+        // The installed ref points at the NEW blob (the earlier rename), and that blob was
+        // NOT reclaimed -> it still exists (no dangling ref). The OLD blob may now be an
+        // orphan (gc-reclaimable), which is acceptable.
+        let ref_path = bk.join("arriving").join(&upload_id).join("parts").join("00001.ref");
+        let cur = serde_json::from_slice::<PartRefFile>(&std::fs::read(&ref_path).unwrap())
+            .expect("the part ref must still parse (not truncated)");
+        assert_eq!(cur.md5_hex, md5_hex(&new_bytes), "ref records the NEW part");
+        assert!(
+            blob::blob_path(&bk, &cur.blob_id).exists(),
+            "the new blob the ref points at must NOT be reclaimed (no dangling ref)"
+        );
+
+        // Complete with the NEW etag SUCCEEDS and yields the NEW bytes — the part is the
+        // consistent NEW part, not a dangling reference.
+        let complete = vec![CompletePart { part_number: 1, etag: new_etag }];
+        fs.complete_multipart_upload("bkt", key, &upload_id, &complete)
+            .expect("Complete must succeed: the part references a valid (new) blob");
+        let got = read_all(fs.get_object("bkt", key, None).unwrap().body);
+        assert_eq!(got, new_bytes, "Complete yields the NEW part bytes (consistent state)");
+    }
+
+    #[test]
     fn c5_completed_upload_rejects_further_ops_even_if_dir_survives() {
         // C5 [S3 fidelity], LOAD-BEARING for the reject. After a successful Complete, a
         // second UploadPart/Complete/ListParts on the same uploadId must fail
@@ -5422,6 +5893,90 @@ mod tests {
             matches!(res_del, Err(StorageError::Io(_))),
             "C6: a delete that cannot durably journal its reclaim must fail, got {res_del:?}"
         );
+    }
+
+    #[test]
+    fn d1_recover_skips_corrupt_journal_and_applies_valid_one() {
+        // D-1 [MED — resilience], LOAD-BEARING. A corrupt/garbage `deleted/*.journal`
+        // (e.g. a truncated journal from a pre-D-1 crash mid-write, or planted bytes)
+        // must NOT make recover() FAIL: recover() must SKIP the unreadable journal
+        // (logging a warning, leaving it on disk) and still apply a VALID journal in the
+        // same bucket. Aborting recover() on a parse error would wedge startup until a
+        // human cleaned the file by hand.
+        //
+        // Fail-without-fix: revert apply_journal to `Err(e) => return Err(e.into())` on
+        // the read/parse error and recover() returns Err -> this test FAILS at the
+        // `recover().unwrap()`.
+        let (dir, fs) = store();
+        let bk = dir.path().join("bkt");
+
+        // (a) A CORRUPT journal: not valid JSON. recover() must skip it.
+        let corrupt = bk
+            .join("deleted")
+            .join(format!("{}.journal", Uuid::new_v4()));
+        std::fs::write(&corrupt, b"{ this is not valid journal json !!").unwrap();
+
+        // (b) A VALID delete journal for an absent key listing a real orphan blob, so we
+        // can prove the valid journal STILL applies (its blob is reclaimed) even though a
+        // corrupt journal sits beside it.
+        let orphan = blob::write_blob(&bk, &b"reclaim me via a valid journal"[..]).unwrap();
+        let valid = bk
+            .join("deleted")
+            .join(format!("{}.journal", Uuid::new_v4()));
+        let j = Journal {
+            mode: JournalMode::Delete,
+            supersedes_key: "gone".into(), // absent key -> delete journal EXECUTES
+            commit_nonce: String::new(),
+            expected_new_etag: String::new(),
+            blobs: vec![orphan.blob_id.clone()],
+        };
+        fs.write_journal(&valid, &j).unwrap();
+
+        // recover() must NOT fail despite the corrupt journal.
+        let stats = fs.recover().expect("recover() must tolerate a corrupt journal, not fail");
+
+        // The valid journal applied: its orphan blob is gone, the journal is removed.
+        assert!(
+            !blob::blob_path(&bk, &orphan.blob_id).exists(),
+            "the VALID journal must still apply (orphan blob reclaimed) despite the corrupt one"
+        );
+        assert!(!valid.exists(), "the valid journal is removed after it applies");
+        assert!(stats.journal_blobs_reclaimed >= 1, "valid journal reclaimed its blob");
+
+        // The corrupt journal is SKIPPED and left in place (not deleted, not fatal).
+        assert!(
+            corrupt.exists(),
+            "the corrupt journal is left on disk (skipped, not consumed)"
+        );
+    }
+
+    #[test]
+    fn d1_write_journal_is_atomic_no_torn_journal_on_disk() {
+        // D-1 [MED — atomicity]. write_journal must publish the journal via temp+rename,
+        // so the only `*.journal` file that ever lands in `deleted/` is fully serialized
+        // (a valid Journal), and no `*.journal.tmp.*` temp is left behind on success.
+        let (dir, fs) = store();
+        let bk = dir.path().join("bkt");
+        let jpath = bk
+            .join("deleted")
+            .join(format!("{}.journal", Uuid::new_v4()));
+        let j = Journal {
+            mode: JournalMode::Delete,
+            supersedes_key: "k".into(),
+            commit_nonce: String::new(),
+            expected_new_etag: String::new(),
+            blobs: vec![],
+        };
+        fs.write_journal(&jpath, &j).unwrap();
+
+        // No temp sibling survives, and the published file re-reads as a valid Journal.
+        let entries = list_dir(&bk.join("deleted"));
+        assert!(
+            entries.iter().all(|n| !n.contains(".tmp.")),
+            "no `.journal.tmp.*` temp may survive a successful write_journal, saw {entries:?}"
+        );
+        let round = CasStore::read_journal(&jpath).expect("published journal must parse");
+        assert_eq!(round.supersedes_key, "k");
     }
 
     #[test]
