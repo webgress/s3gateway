@@ -53,6 +53,7 @@ fn start_server() -> u16 {
         workers: 1,
         ktls: false,
         fsync: true,
+        abort_incomplete_uploads_after: None,
     };
     let fs = CasStore::new(&data_dir);
     std::fs::create_dir_all(fs.root()).unwrap();

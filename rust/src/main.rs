@@ -57,6 +57,25 @@ fn main() {
         "crash-recovery sweep complete"
     );
 
+    // Opt-in abandoned-multipart-upload reaper (S3's AbortIncompleteMultipartUpload).
+    // Runs ONLY when --abort-incomplete-uploads-after is set, at startup (after
+    // recovery, before the listener binds → no live traffic). recover() itself never
+    // touches in-flight uploads, so a normal restart keeps them resumable; this is the
+    // explicit, age-gated teardown of the abandoned ones.
+    if let Some(max_age) = cfg.abort_incomplete_uploads_after {
+        match fs.gc_abandoned_uploads(max_age) {
+            Ok(reaped) => tracing::info!(
+                uploads_reaped = reaped,
+                max_age_secs = max_age.as_secs(),
+                "abandoned multipart upload reaper complete"
+            ),
+            Err(e) => {
+                eprintln!("abandoned-upload reaper failed for {}: {e}", cfg.data_dir);
+                std::process::exit(1);
+            }
+        }
+    }
+
     tracing::info!(
         port = cfg.port,
         data_dir = %cfg.data_dir,

@@ -124,6 +124,181 @@ fn simulated_crash() -> StorageError {
     StorageError::Io(io::Error::other("simulated crash (test fault injection)"))
 }
 
+/// Test-only, DETERMINISTIC injection points that let a test reproduce the exact
+/// two-writer interleaving the per-key publish lock (`lock_key`) exists to
+/// prevent — without any sleeps or timing races. Ported from the (removed)
+/// `filesystem.rs` so the CAS publish lock keeps a load-bearing regression.
+///
+/// Two cooperating hooks, both armed for one specific `{bucket}/{key}`:
+///  * [`PauseHook::pause`] — called at the publish CRITICAL WINDOW (after the new
+///    manifest is staged + journaled, immediately BEFORE the commit rename). The
+///    FIRST matching writer to arrive (writer A) parks here and blocks until the
+///    test releases it. With the lock held, writer B cannot reach this window at
+///    all (it blocks on `lock_key` first).
+///  * [`PauseHook::note_lock_contention`] — called from `lock_key` when a thread is
+///    about to BLOCK on an already-held per-key lock. With the real lock, writer B
+///    hits this before ever reaching the window. With the lock removed/neutered, B
+///    feels no contention and instead reaches the window itself (a SECOND `pause`
+///    arrival, which passes straight through and records `second_window`).
+///
+/// The test waits for EXACTLY ONE of {B-blocked-on-lock, B-reached-window} to fire
+/// — that single event deterministically distinguishes a real lock from a neutered
+/// one, and tells the test how to drive the rest without deadlocking.
+///
+/// The whole mechanism is `#[cfg(test)]` only: in non-test builds both call sites
+/// (`publish_window_pause`, the probe in `lock_key`) compile out entirely, so there
+/// is ZERO effect on, and ZERO cost in, the production hot path.
+#[cfg(test)]
+mod publish_pause {
+    use std::sync::{Condvar, Mutex, OnceLock};
+
+    pub(super) struct PauseHook {
+        pub key: String,
+        state: Mutex<State>,
+        cv: Condvar,
+    }
+
+    #[derive(Default)]
+    struct State {
+        window_arrived: bool,
+        released: bool,
+        second_window: bool,
+        lock_contended: bool,
+    }
+
+    static HOOK: OnceLock<Mutex<Option<&'static PauseHook>>> = OnceLock::new();
+
+    fn slot() -> &'static Mutex<Option<&'static PauseHook>> {
+        HOOK.get_or_init(|| Mutex::new(None))
+    }
+
+    // There is a SINGLE global hook slot, so tests that arm it must not overlap (they
+    // would clobber each other's armed key). This process-wide guard serializes them.
+    static SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
+
+    /// Acquire the process-wide serialization guard for a hook-using test. Held for
+    /// the test's duration (poison-tolerant). Returns the guard; drop ends the
+    /// exclusive section.
+    pub(super) fn serialize_test() -> std::sync::MutexGuard<'static, ()> {
+        SERIAL
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+    }
+
+    impl PauseHook {
+        /// Arm a fresh hook for `key` (returns a leaked `'static` ref so the
+        /// publishing/locking threads can read it without lifetime gymnastics —
+        /// test-only, so the one-shot leak is harmless).
+        pub(super) fn arm(key: &str) -> &'static PauseHook {
+            let hook: &'static PauseHook = Box::leak(Box::new(PauseHook {
+                key: key.to_string(),
+                state: Mutex::new(State::default()),
+                cv: Condvar::new(),
+            }));
+            *slot().lock().unwrap() = Some(hook);
+            hook
+        }
+
+        pub(super) fn disarm() {
+            *slot().lock().unwrap() = None;
+        }
+
+        /// Block until writer A has parked at the critical window.
+        pub(super) fn wait_window_arrived(&self) {
+            let mut st = self.state.lock().unwrap();
+            while !st.window_arrived {
+                st = self.cv.wait(st).unwrap();
+            }
+        }
+
+        /// Block until EITHER writer B blocked on the real lock OR writer B reached
+        /// the window itself (no lock). `true` iff B blocked on the lock.
+        pub(super) fn wait_b_disposition(&self) -> bool {
+            let mut st = self.state.lock().unwrap();
+            while !st.lock_contended && !st.second_window {
+                st = self.cv.wait(st).unwrap();
+            }
+            st.lock_contended
+        }
+
+        /// Like [`wait_b_disposition`] but bounded by `timeout`. `Some(blocked_on_lock)`
+        /// if a disposition was observed, or `None` on timeout — used by the PUT-vs-
+        /// DELETE test (a DELETE never reaches the window, so a MISSING lock yields no
+        /// contention signal and would otherwise hang; a timeout surfaces it as a clean
+        /// assertion failure instead).
+        pub(super) fn wait_b_disposition_timeout(
+            &self,
+            timeout: std::time::Duration,
+        ) -> Option<bool> {
+            let deadline = std::time::Instant::now() + timeout;
+            let mut st = self.state.lock().unwrap();
+            while !st.lock_contended && !st.second_window {
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    return None;
+                }
+                let (g, res) = self.cv.wait_timeout(st, deadline - now).unwrap();
+                st = g;
+                if res.timed_out() && !st.lock_contended && !st.second_window {
+                    return None;
+                }
+            }
+            Some(st.lock_contended)
+        }
+
+        /// Release the parked writer (writer A).
+        pub(super) fn release(&self) {
+            let mut st = self.state.lock().unwrap();
+            st.released = true;
+            self.cv.notify_all();
+        }
+    }
+
+    /// Publish critical-window hook: the first matching writer parks and blocks
+    /// until released; a second matching writer (only reachable without the lock)
+    /// records `second_window` and passes straight through.
+    pub(super) fn pause(bucket: &str, key: &str) {
+        let hook = { *slot().lock().unwrap() };
+        let Some(hook) = hook else { return };
+        if hook.key != format!("{bucket}/{key}") {
+            return;
+        }
+        let mut st = hook.state.lock().unwrap();
+        if st.window_arrived {
+            st.second_window = true;
+            hook.cv.notify_all();
+            return;
+        }
+        st.window_arrived = true;
+        hook.cv.notify_all();
+        while !st.released {
+            st = hook.cv.wait(st).unwrap();
+        }
+    }
+
+    /// Lock-contention hook: record that a writer is about to block on the
+    /// already-held per-key lock for this key (proof the lock is serializing).
+    pub(super) fn note_lock_contention(bucket: &str, key: &str) {
+        let hook = { *slot().lock().unwrap() };
+        let Some(hook) = hook else { return };
+        if hook.key != format!("{bucket}/{key}") {
+            return;
+        }
+        let mut st = hook.state.lock().unwrap();
+        st.lock_contended = true;
+        hook.cv.notify_all();
+    }
+}
+
+/// Publish critical-window pause point (after stage+journal, before the commit
+/// rename). No-op outside tests; see [`publish_pause`] for the deterministic hook.
+#[inline(always)]
+fn publish_window_pause(_bucket: &str, _key: &str) {
+    #[cfg(test)]
+    publish_pause::pause(_bucket, _key);
+}
+
 /// Content-addressed store rooted at `root` (the data dir).
 #[derive(Debug, Clone)]
 pub struct CasStore {
@@ -196,6 +371,16 @@ impl CasStore {
 
     fn lock_key(&self, bucket: &str, key: &str) -> std::sync::RwLockWriteGuard<'_, ()> {
         let idx = Self::key_lock_shard(bucket, key);
+        // Test-only contention probe: if the shard is already held, record that this
+        // writer is about to BLOCK on the per-key lock (proof the lock is
+        // serializing) before we actually block. Compiled out in production — the
+        // real acquire below is unchanged.
+        #[cfg(test)]
+        {
+            if self.key_locks[idx].try_write().is_err() {
+                publish_pause::note_lock_contention(bucket, key);
+            }
+        }
         self.key_locks[idx]
             .write()
             .unwrap_or_else(|p| p.into_inner())
@@ -261,19 +446,24 @@ impl CasStore {
         }
     }
 
-    /// DeleteBucket: remove an EMPTY bucket. "Empty" means the `current/` manifest
-    /// tree holds no live object (the four infra dirs — `current/`, `arriving/`,
-    /// `blobs/`, `deleted/` — and any in-flight uploads/orphan blobs are NOT
-    /// objects and are torn down with the bucket). A bucket with at least one live
-    /// manifest is `BucketNotEmpty` (409). Symlink-aware existence check (mirrors
-    /// `head_bucket`), so a planted `data-dir/bucket -> /external` symlink is
-    /// rejected as `BucketNotFound` rather than having its contents scanned/removed.
+    /// DeleteBucket: remove an EMPTY bucket. "Empty" means BOTH (a) the `current/`
+    /// manifest tree holds no live object AND (b) there is no in-flight multipart
+    /// upload (`arriving/{uuid}/` working dir). This matches S3, which refuses to
+    /// delete a bucket that still has in-progress multipart uploads — they would
+    /// otherwise be silently torn down with the bucket. A bucket failing either
+    /// check is `BucketNotEmpty` (409). The infra dirs themselves (`current/`,
+    /// `arriving/`, `blobs/`, `deleted/`), orphan blobs, staged single-PUT/Complete
+    /// `{uuid}.manifest` temps, and spent journals are NOT objects and do not block
+    /// deletion. Symlink-aware existence check (mirrors `head_bucket`), so a planted
+    /// `data-dir/bucket -> /external` symlink is rejected as `BucketNotFound` rather
+    /// than having its contents scanned/removed (and `remove_dir_all` never traverses
+    /// the link target).
     pub fn delete_bucket(&self, name: &str) -> Result<()> {
         self.validate_bucket_component(name)?;
         self.head_bucket(name)?;
         let path = self.bucket_root(name);
 
-        // Empty iff the current/ tree contains no committed manifest.
+        // (a) Empty iff the current/ tree contains no committed manifest.
         let mut has_object = false;
         walk_dir_files(&self.current_root(name), &mut |p: &Path| -> io::Result<()> {
             let fname = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
@@ -286,10 +476,43 @@ impl CasStore {
             return Err(StorageError::BucketNotEmpty);
         }
 
-        // No live objects: tear down the whole bucket (infra dirs + any orphan
-        // blobs / in-flight uploads / spent journals included).
+        // (b) S3 fidelity: an in-flight multipart upload also makes the bucket
+        // non-empty. An upload is an `arriving/{uuid}/` DIRECTORY (the per-upload
+        // working dir created by CreateMultipartUpload); staged single-PUT/Complete
+        // temps are `arriving/{uuid}.manifest` FILES and do NOT count. Until the
+        // client calls CompleteMultipartUpload or AbortMultipartUpload, the upload is
+        // live and DeleteBucket must refuse with BucketNotEmpty.
+        if self.has_in_flight_upload(name)? {
+            return Err(StorageError::BucketNotEmpty);
+        }
+
+        // Empty: tear down the whole bucket (infra dirs + any orphan blobs / staged
+        // temps / spent journals included).
         std::fs::remove_dir_all(&path)?;
         Ok(())
+    }
+
+    /// True iff the bucket has at least one in-flight multipart upload — an
+    /// `arriving/{uuid}/` working DIRECTORY (validated by a readable `upload.json`).
+    /// Subdirectory entries that are NOT a live upload (no `upload.json`) are ignored
+    /// so a stray dir does not wedge DeleteBucket forever.
+    fn has_in_flight_upload(&self, bucket: &str) -> Result<bool> {
+        let arriving = self.arriving_root(bucket);
+        let rd = match std::fs::read_dir(&arriving) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e.into()),
+        };
+        for entry in rd {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue; // staged {uuid}.manifest temps are not uploads.
+            }
+            if read_nofollow(&entry.path().join("upload.json")).is_ok() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     // ---- object: PUT (single-part) ----
@@ -359,9 +582,9 @@ impl CasStore {
     /// to `blobs/`; the per-key WRITE lock is held by the caller.
     ///
     /// Steps (each gated by a test fault hook to simulate a crash BETWEEN steps):
-    ///   1. stage    arriving/{uuid}.meta  (fsync if --fsync)
+    ///   1. stage    arriving/{uuid}.manifest  (fsync if --fsync)
     ///   2. journal  deleted/{uuid}.journal listing OLD blobs (if K exists)
-    ///   3. COMMIT   rename(arriving -> current/K.meta) + best-effort parent fsync
+    ///   3. COMMIT   rename(arriving -> current/K.s3gw-live.meta) + best-effort parent fsync
     ///   4. reclaim  delete OLD blobs
     ///   5. cleanup  delete the journal
     ///
@@ -429,6 +652,14 @@ impl CasStore {
             staged_guard.disarm();
             return Err(simulated_crash());
         }
+
+        // Deterministic concurrency test hook: park the FIRST writer in the publish
+        // critical window (manifest staged + journaled, NOT yet committed) so a test
+        // can drive the exact two-writer interleaving the per-key lock prevents. The
+        // caller holds the per-key WRITE lock across this whole function, so under the
+        // real lock a second same-key writer can never reach this point concurrently.
+        // No-op in production.
+        publish_window_pause(bucket, key);
 
         // ---- step 3: COMMIT = atomic rename(arriving -> current/K.meta) ----
         if let Some(parent) = k.parent() {
@@ -550,7 +781,10 @@ impl CasStore {
         key: &str,
         range_header: Option<&str>,
     ) -> Result<GetObjectResult> {
-        self.validate_object_path(bucket, key)?;
+        // READ path: lexical-only validation (no per-request canonicalize). Symlink
+        // containment is upheld by O_NOFOLLOW on the manifest/blob opens + the lexical
+        // check (see `validate_object_path` rationale).
+        self.validate_object_path_lexical(bucket, key)?;
         let current_root = self.current_root(bucket);
         let k = manifest::manifest_path(&current_root, key);
 
@@ -593,7 +827,9 @@ impl CasStore {
     /// HeadObject: read the current manifest and return its header bundle.
     /// Signature identical to `Filesystem::head_object`.
     pub fn head_object(&self, bucket: &str, key: &str) -> Result<ObjectMetadata> {
-        self.validate_object_path(bucket, key)?;
+        // READ path: lexical-only validation (no per-request canonicalize), same
+        // rationale as `get_object`.
+        self.validate_object_path_lexical(bucket, key)?;
         let k = manifest::manifest_path(&self.current_root(bucket), key);
         match manifest::read_manifest(&k) {
             Ok(m) => Ok(m.to_object_metadata()),
@@ -778,7 +1014,7 @@ impl CasStore {
     /// §6). It makes crash cleanup deterministic and is **idempotent** — re-running
     /// it causes no harm. It performs, for every bucket:
     ///
-    ///  - **6.1 `arriving/` sweep.** Delete each staged `{uuid}.meta` — an
+    ///  - **6.1 `arriving/` sweep.** Delete each staged `{uuid}.manifest` — an
     ///    uncommitted single-PUT/Complete manifest. A committed object lives in
     ///    `current/`, so a manifest still sitting in `arriving/` is, by definition,
     ///    a publish that never committed and is always safe to delete on startup.
@@ -804,8 +1040,8 @@ impl CasStore {
     /// crashed-mid-Complete upload simply stays Completable/Abortable after restart
     /// (the part blobs are immutable and intact). Their part blobs are therefore
     /// treated as REFERENCED by [`gc_orphan_blobs`] so the full GC never reaps a
-    /// live upload's parts. (A staged single `{uuid}.meta` is unambiguous — it is a
-    /// failed publish — so 6.1 deletes those; only the `{uuid}/` dirs are kept.)
+    /// live upload's parts. (A staged single `{uuid}.manifest` is unambiguous — it is
+    /// a failed publish — so 6.1 deletes those; only the `{uuid}/` dirs are kept.)
     ///
     /// The full O(blobs) fallback GC (§6.3) is intentionally NOT run here — it is
     /// the opt-in [`gc_orphan_blobs`], called only on explicit request (decision
@@ -925,7 +1161,7 @@ impl CasStore {
                     Err(_) => continue,
                 };
                 if !ft.is_dir() {
-                    continue; // staged {uuid}.meta files reference no kept blob.
+                    continue; // staged {uuid}.manifest files reference no kept blob.
                 }
                 if let Ok(refs) = Self::read_part_refs(&entry.path()) {
                     for r in refs.values() {
@@ -956,6 +1192,111 @@ impl CasStore {
         Ok(reclaimed)
     }
 
+    /// AGE-BASED abandoned-multipart-upload reaper (S3's AbortIncompleteMultipartUpload
+    /// concept). Removes every in-flight upload working dir `arriving/{uuid}/` —
+    /// AND reclaims its part blobs — whose age exceeds `max_age`, across every
+    /// bucket. Returns the number of upload dirs reaped.
+    ///
+    /// This is OPT-IN: it is NOT run by [`recover`] (which deliberately KEEPS all
+    /// in-flight uploads so a normal restart never destroys a resumable upload), and
+    /// runs only when the operator enables it via `--abort-incomplete-uploads-after`.
+    ///
+    /// Age is measured from the upload dir's `upload.json` mtime (the create time;
+    /// UploadParts do not touch it), falling back to the dir's own mtime. An upload
+    /// YOUNGER than `max_age` is left strictly untouched. A subdir lacking a readable
+    /// `upload.json` is NOT a live upload and is skipped (left for `gc_orphan_blobs`
+    /// / `recover`), so a half-created or already-aborted dir is never mistaken for an
+    /// abandoned upload. Part blobs are reclaimed from the stored `.ref` files BEFORE
+    /// the dir is removed (the same teardown as AbortMultipartUpload).
+    ///
+    /// CONCURRENCY: like `gc_orphan_blobs`, intended for startup (no live traffic) or
+    /// an offline maintenance window. The `max_age` floor means it will not reap an
+    /// upload a client is actively writing to within the window.
+    pub fn gc_abandoned_uploads(&self, max_age: std::time::Duration) -> Result<usize> {
+        let now = std::time::SystemTime::now();
+        let mut reaped = 0usize;
+        let rd = match std::fs::read_dir(&self.root) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(e.into()),
+        };
+        for entry in rd {
+            let entry = entry?;
+            let md = match entry.metadata() {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            // Only real bucket dirs (skip symlinks/files/hidden infra).
+            if md.file_type().is_symlink() || !md.is_dir() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') {
+                continue;
+            }
+            reaped += self.gc_abandoned_uploads_bucket(&name, now, max_age)?;
+        }
+        Ok(reaped)
+    }
+
+    /// Reap abandoned upload dirs in ONE bucket (helper for [`gc_abandoned_uploads`]).
+    fn gc_abandoned_uploads_bucket(
+        &self,
+        bucket: &str,
+        now: std::time::SystemTime,
+        max_age: std::time::Duration,
+    ) -> Result<usize> {
+        let bucket_root = self.bucket_root(bucket);
+        let arriving = self.arriving_root(bucket);
+        let rd = match std::fs::read_dir(&arriving) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(e.into()),
+        };
+        let mut reaped = 0usize;
+        for entry in rd {
+            let entry = entry?;
+            // Only `{uuid}/` working dirs are uploads; staged `{uuid}.manifest` FILEs
+            // are crash debris handled by cleanup_arriving — leave them here.
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let upload_path = entry.path();
+            let upload_json = upload_path.join("upload.json");
+            // Require a readable upload.json — only a genuine in-flight upload is
+            // eligible (a half-created/aborted dir is not "abandoned"; skip it).
+            let json_md = match std::fs::metadata(&upload_json) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            // Age = now - (upload.json mtime, else the dir's own mtime). Skip if we
+            // cannot determine an mtime, or if it is younger than the threshold.
+            let mtime = json_md
+                .modified()
+                .or_else(|_| entry.metadata().and_then(|m| m.modified()));
+            let age = match mtime {
+                Ok(t) => match now.duration_since(t) {
+                    Ok(a) => a,
+                    Err(_) => continue, // mtime in the future -> treat as fresh.
+                },
+                Err(_) => continue,
+            };
+            if age < max_age {
+                continue; // younger than the threshold -> strictly untouched.
+            }
+            // Abandoned: reclaim its part blobs, then remove the dir (== Abort).
+            if let Ok(refs) = Self::read_part_refs(&upload_path) {
+                for r in refs.values() {
+                    let _ = blob::reclaim_blob(&bucket_root, &r.blob_id);
+                }
+            }
+            if std::fs::remove_dir_all(&upload_path).is_ok() {
+                reaped += 1;
+            }
+        }
+        Ok(reaped)
+    }
+
     // ---- validation (ported from filesystem.rs, with the .meta reserved rule) ----
 
     fn validate_bucket_component(&self, bucket: &str) -> Result<()> {
@@ -972,10 +1313,14 @@ impl CasStore {
         Ok(())
     }
 
-    /// Reject keys with `..`, NUL, absolute paths, empty segments, or — the single
-    /// structural reservation of the CAS encode v2 layout — ANY `/`-split segment
-    /// ending in `MANIFEST_SUFFIX`. Then assert lexical containment within the data
-    /// root.
+    /// PURELY LEXICAL key validation — NO filesystem syscalls. Rejects keys with
+    /// `..`, NUL, absolute paths, empty segments, or — the single structural
+    /// reservation of the CAS encode v2 layout — ANY `/`-split segment ending in
+    /// `MANIFEST_SUFFIX`, then asserts lexical containment of the computed manifest
+    /// path within the bucket's `current/` tree. This is the READ-path validator
+    /// (GET/HEAD/LIST): combined with O_NOFOLLOW on the manifest and blob opens it
+    /// upholds symlink-containment without a per-request `canonicalize` (see
+    /// [`validate_object_path`] for why this is sufficient for reads).
     ///
     /// **Reserved-suffix rejection (load-bearing).** The manifest for key `K` is the
     /// FILE `{leaf}{MANIFEST_SUFFIX}` under `current/`, and every NON-leaf segment of
@@ -987,7 +1332,7 @@ impl CasStore {
     /// no runtime `KeyPrefixConflict`/409 check is needed anymore. Maps to 400
     /// InvalidArgument (`PathTraversal`). KNOWN LIMITATION: an object key may not
     /// contain a `/`-segment ending in `MANIFEST_SUFFIX`.
-    fn validate_object_path(&self, bucket: &str, key: &str) -> Result<()> {
+    fn validate_object_path_lexical(&self, bucket: &str, key: &str) -> Result<()> {
         self.validate_bucket_component(bucket)?;
         if key.is_empty() {
             return Err(StorageError::PathTraversal);
@@ -1032,13 +1377,52 @@ impl CasStore {
         if !cleaned.starts_with(&base) {
             return Err(StorageError::PathTraversal);
         }
+        Ok(())
+    }
+
+    /// FULL key validation = the lexical checks PLUS the expensive `canonicalize`
+    /// containment of the deepest existing ancestor (`assert_real_parent_within_root`).
+    /// Reserved for paths that CREATE a new directory/file under `current/` (PUT,
+    /// CompleteMultipartUpload via the upload's stored key, CreateMultipartUpload):
+    /// those `create_dir_all`/rename a new path into the tree, so a symlinked
+    /// intermediate directory must be caught BEFORE the create can write through it.
+    ///
+    /// **Why reads use only the lexical check (PERF — the throughput goal).** The
+    /// old hot path ran one `canonicalize` (a readlink/stat per path component) on
+    /// EVERY GET/HEAD/LIST. For a max-throughput gateway that per-request syscall
+    /// storm is pure overhead, because reads never CREATE a path component — they
+    /// only OPEN an existing manifest/blob. Symlink-containment on the read path is
+    /// instead upheld by:
+    ///   1. the LEXICAL containment check ([`validate_object_path_lexical`]) — rejects
+    ///      `..`, absolute, and any escape that is visible without touching the fs; and
+    ///   2. **O_NOFOLLOW** on the actual opens: `read_manifest` opens
+    ///      `current/{…}.s3gw-live.meta` with O_NOFOLLOW (a symlinked manifest leaf →
+    ///      ELOOP), and `DioFile::open_read` opens each `blobs/xx/yy/{uuid}` blob with
+    ///      O_NOFOLLOW (a symlinked blob leaf → ELOOP). Blob ids are bare uuids resolved
+    ///      through a fixed 2×2 fanout, so a blob path has NO client-controlled
+    ///      intermediate component to symlink.
+    ///
+    /// The only residual a read does not canonicalize is a symlinked INTERMEDIATE
+    /// directory under `current/` (e.g. `current/a` → /external). But directories
+    /// under `current/` are created ONLY by the gateway's own WRITE path — which DOES
+    /// canonicalize — never by a client; a client cannot plant a symlink through the
+    /// S3 API. So such a symlink can only be introduced out-of-band on the host
+    /// filesystem, exactly the same trust boundary the write-path canonicalize
+    /// assumes. A read through it would land on a manifest/blob open that O_NOFOLLOW
+    /// guards at the leaf, and a relocated subtree still cannot escape the lexical
+    /// containment of the key. (F3/F5/D4/D5-class containment preserved.)
+    fn validate_object_path(&self, bucket: &str, key: &str) -> Result<()> {
+        self.validate_object_path_lexical(bucket, key)?;
+        let current = self.bucket_root(bucket).join(CURRENT_DIR);
+        let full = manifest::manifest_path(&current, key);
         self.assert_real_parent_within_root(&full)?;
         Ok(())
     }
 
     /// Canonicalize the deepest EXISTING ancestor of `target` (following symlinks)
     /// and assert it stays inside the canonical data root. Ported verbatim from
-    /// `filesystem.rs` (catches a symlinked intermediate dir escape).
+    /// `filesystem.rs` (catches a symlinked intermediate dir escape). Used ONLY by the
+    /// write/create paths now — see [`validate_object_path`].
     fn assert_real_parent_within_root(&self, target: &Path) -> Result<()> {
         let real_root = match std::fs::canonicalize(&self.root) {
             Ok(r) => r,
@@ -1177,12 +1561,23 @@ impl CasStore {
             return Err(StorageError::InvalidPart);
         }
         let upload_dir = self.upload_dir(bucket, upload_id)?;
-        self.assert_upload_matches(&upload_dir, bucket, key)?;
+        let upload = self.assert_upload_matches(&upload_dir, bucket, key)?;
 
         let bucket_root = self.bucket_root(bucket);
         // Stream the part to a fresh immutable blob (lock-free; one-pass MD5; fsync).
+        // The big I/O happens BEFORE the per-key lock is taken — no lock is ever held
+        // across a streaming body read.
         let info = blob::write_blob(&bucket_root, body).map_err(body_or_io)?;
         let etag = format!("\"{}\"", info.md5_hex);
+
+        // Take the per-key WRITE lock around the .ref install (read-prev + tmp-write
+        // + rename + reclaim), keyed by the upload's STORED bucket/key — the SAME key
+        // `complete_multipart_upload` locks on. This serializes a part's ref swap
+        // against a concurrent Complete's read_part_refs+commit so Complete never
+        // observes a half-swapped ref set (e.g. a number whose blob was just reclaimed
+        // but whose ref still pointed at it). The lock is NOT held across the body
+        // stream above; only the tiny ref-file critical section is serialized.
+        let _guard = self.lock_key(&upload.bucket, &upload.key);
 
         // Atomically install the part ref. If a previous ref for this number existed,
         // capture its blob_id so we can reclaim the now-orphaned old blob.
@@ -1225,6 +1620,14 @@ impl CasStore {
 
     /// Read all valid `parts/{NNNNN}.ref` entries in an upload dir, keyed by part
     /// number. Skips temp (`.ref.tmp.`) and unparseable entries.
+    ///
+    /// Defense-in-depth (item #6): cross-check that the `part_number` RECORDED inside
+    /// each `.ref` matches the number encoded in its FILENAME (`{NNNNN}.ref`). A
+    /// mismatch means a tampered/corrupt ref (its body claims a different part than
+    /// its name), so the entry is DROPPED — Complete then reports `InvalidPart` for
+    /// that claimed number rather than assembling a part under the wrong index. (Under
+    /// normal operation UploadPart always writes a ref whose body number == filename
+    /// number, so this never fires.)
     fn read_part_refs(upload_dir: &Path) -> io::Result<std::collections::BTreeMap<u32, PartRefFile>> {
         let mut out = std::collections::BTreeMap::new();
         let parts_dir = upload_dir.join("parts");
@@ -1240,11 +1643,20 @@ impl CasStore {
             if !name.ends_with(".ref") || name.contains(".tmp.") {
                 continue;
             }
+            // The filename's numeric stem (`{NNNNN}.ref` -> NNNNN).
+            let fname_num: Option<u32> = name
+                .strip_suffix(".ref")
+                .and_then(|stem| stem.parse::<u32>().ok());
             let data = match read_nofollow(&entry.path()) {
                 Ok(d) => d,
                 Err(_) => continue,
             };
             if let Ok(p) = serde_json::from_slice::<PartRefFile>(&data) {
+                // Cross-check filename number == recorded number. A mismatch (or an
+                // unparseable filename) is a tampered/foreign ref -> drop it.
+                if fname_num != Some(p.part_number) {
+                    continue;
+                }
                 out.insert(p.part_number, p);
             }
         }
@@ -1858,6 +2270,85 @@ mod tests {
         n
     }
 
+    /// Test helper: set a file's atime+mtime to `when` (for the abandoned-upload
+    /// reaper's age test). Uses `libc::utimes` directly (no extra crate).
+    fn set_mtime(path: &Path, when: std::time::SystemTime) {
+        use std::os::unix::ffi::OsStrExt as _;
+        let secs = when
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("mtime before epoch")
+            .as_secs() as libc::time_t;
+        let tv = libc::timeval { tv_sec: secs, tv_usec: 0 };
+        let times = [tv, tv];
+        let mut c = path.as_os_str().as_bytes().to_vec();
+        c.push(0);
+        let rc = unsafe { libc::utimes(c.as_ptr() as *const libc::c_char, times.as_ptr()) };
+        assert_eq!(rc, 0, "utimes failed for {path:?}");
+    }
+
+    /// Assert the LIVE object at `bucket/key` is internally consistent: its manifest
+    /// is readable, every referenced blob exists with the recorded size, the sum of
+    /// part sizes equals `content_length`, and the manifest ETag matches the actual
+    /// blob bytes (single-part: quoted md5 of the one blob; multipart: composite
+    /// `md5(concat raw digests)-N`). A torn / cross-paired publish (a manifest from
+    /// one writer paired with a blob that was reclaimed/replaced by another) trips
+    /// this — that is the load-bearing check the concurrency tests rely on.
+    fn assert_object_consistent(fs: &CasStore, bucket: &str, key: &str) -> std::result::Result<(), String> {
+        use md5::{Digest, Md5};
+        let bk = fs.root().join(bucket);
+        let mp = manifest::manifest_path(&bk.join("current"), key);
+        let m = manifest::read_manifest(&mp).map_err(|e| format!("manifest unreadable: {e}"))?;
+        let mut total = 0u64;
+        let mut concat: Vec<u8> = Vec::new();
+        for part in &m.parts {
+            let bp = blob::blob_path(&bk, &part.blob_id);
+            let bytes = std::fs::read(&bp)
+                .map_err(|e| format!("blob {} for part {} missing: {e}", part.blob_id, part.part_number))?;
+            if bytes.len() as u64 != part.size {
+                return Err(format!(
+                    "part {} size mismatch: manifest={} actual={}",
+                    part.part_number, part.size, bytes.len()
+                ));
+            }
+            let actual_md5 = hex::encode(Md5::digest(&bytes));
+            if actual_md5 != part.md5_hex {
+                return Err(format!(
+                    "part {} md5 mismatch: manifest={} actual={}",
+                    part.part_number, part.md5_hex, actual_md5
+                ));
+            }
+            total += part.size;
+            concat.extend_from_slice(&hex::decode(&part.md5_hex).map_err(|e| format!("bad md5 hex: {e}"))?);
+        }
+        if total != m.content_length {
+            return Err(format!(
+                "content_length mismatch: manifest={} sum(parts)={total}",
+                m.content_length
+            ));
+        }
+        let expected_etag = if m.parts.len() == 1 {
+            format!("\"{}\"", m.parts[0].md5_hex)
+        } else {
+            format!("\"{}-{}\"", hex::encode(Md5::digest(&concat)), m.parts.len())
+        };
+        if expected_etag != m.etag {
+            return Err(format!(
+                "etag mismatch (cross-pair): manifest.etag={} recomputed-from-blobs={expected_etag}",
+                m.etag
+            ));
+        }
+        // GET must stream exactly content_length bytes (no torn reader).
+        let got = read_all(fs.get_object(bucket, key, None).map_err(|e| format!("get failed: {e:?}"))?.body);
+        if got.len() as u64 != m.content_length {
+            return Err(format!(
+                "GET length mismatch: got={} manifest={}",
+                got.len(),
+                m.content_length
+            ));
+        }
+        Ok(())
+    }
+
     #[test]
     fn create_bucket_makes_infra_dirs() {
         let (dir, _fs) = store();
@@ -1866,6 +2357,135 @@ mod tests {
         assert!(bk.join("arriving").is_dir());
         assert!(bk.join("blobs").is_dir());
         assert!(bk.join("deleted").is_dir());
+    }
+
+    // ---- delete_bucket coverage (items #2 + #3) ----
+
+    #[test]
+    fn delete_bucket_empty_succeeds() {
+        let (dir, fs) = store();
+        let bk = dir.path().join("bkt");
+        // Freshly-created bucket has only the four infra dirs -> empty -> Ok.
+        fs.delete_bucket("bkt").unwrap();
+        assert!(!bk.exists(), "bucket dir should be removed");
+        // And it is gone from HeadBucket / ListBuckets.
+        assert!(matches!(
+            fs.head_bucket("bkt").unwrap_err(),
+            StorageError::BucketNotFound
+        ));
+    }
+
+    #[test]
+    fn delete_bucket_with_top_level_object_is_not_empty() {
+        // LOAD-BEARING: a bucket with a top-level object must be BucketNotEmpty. If a
+        // regression dropped the emptiness walk (and just `remove_dir_all`'d), this
+        // would WRONGLY succeed and silently destroy the object.
+        let (dir, fs) = store();
+        let bk = dir.path().join("bkt");
+        fs.put_object("bkt", "top.txt", &b"data"[..], "", BTreeMap::new())
+            .unwrap();
+        assert!(matches!(
+            fs.delete_bucket("bkt").unwrap_err(),
+            StorageError::BucketNotEmpty
+        ));
+        // The bucket and its object are untouched.
+        assert!(bk.exists());
+        assert_eq!(read_all(fs.get_object("bkt", "top.txt", None).unwrap().body), b"data");
+    }
+
+    #[test]
+    fn delete_bucket_with_nested_object_is_not_empty() {
+        // LOAD-BEARING: a NESTED object (`a/b/c`) lives several dirs deep under
+        // current/; the emptiness check must RECURSE (walk_dir_files) to find it. A
+        // shallow-only check would miss it and wrongly delete the bucket.
+        let (dir, fs) = store();
+        let bk = dir.path().join("bkt");
+        fs.put_object("bkt", "a/b/c", &b"nested"[..], "", BTreeMap::new())
+            .unwrap();
+        assert!(matches!(
+            fs.delete_bucket("bkt").unwrap_err(),
+            StorageError::BucketNotEmpty
+        ));
+        assert!(bk.exists());
+        assert_eq!(read_all(fs.get_object("bkt", "a/b/c", None).unwrap().body), b"nested");
+    }
+
+    #[test]
+    fn delete_bucket_absent_is_not_found() {
+        let (_dir, fs) = store();
+        assert!(matches!(
+            fs.delete_bucket("no-such-bucket").unwrap_err(),
+            StorageError::BucketNotFound
+        ));
+    }
+
+    #[test]
+    fn delete_bucket_symlinked_dir_is_not_found_and_target_untouched() {
+        // LOAD-BEARING (symlink containment): a `data-dir/{name}` entry that is a
+        // SYMLINK to an external directory must be rejected as BucketNotFound — never
+        // followed — and the external target must be untouched (no remove_dir_all
+        // traversal through the link). Relies on head_bucket's symlink_metadata check.
+        let dir = tempfile::tempdir().unwrap();
+        let fs = CasStore::new(dir.path());
+
+        // A real external dir OUTSIDE the data root, with a file inside.
+        let external = tempfile::tempdir().unwrap();
+        std::fs::write(external.path().join("secret"), b"keep me").unwrap();
+
+        // Plant a symlink inside the data root with a bucket-like name pointing at it.
+        let link = dir.path().join("evil-bucket");
+        std::os::unix::fs::symlink(external.path(), &link).unwrap();
+
+        match fs.delete_bucket("evil-bucket") {
+            Err(StorageError::BucketNotFound) => {}
+            other => panic!("expected BucketNotFound for symlinked bucket dir, got {other:?}"),
+        }
+        // The symlink and the external target+contents are intact.
+        assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read(external.path().join("secret")).unwrap(), b"keep me");
+    }
+
+    #[test]
+    fn delete_bucket_blocks_on_in_flight_multipart_then_allows_after_abort() {
+        // LOAD-BEARING (item #3, S3 fidelity): a bucket with an in-flight multipart
+        // upload is BucketNotEmpty. After the upload is aborted, delete succeeds. If
+        // the in-flight check were dropped, DeleteBucket would tear down the live
+        // upload (and its part blobs) — exactly what S3 forbids.
+        let (dir, fs) = store();
+        let bk = dir.path().join("bkt");
+        let upload_id = fs
+            .create_multipart_upload("bkt", "big.bin", "", BTreeMap::new())
+            .unwrap();
+        // Upload a part so the working dir is non-trivially live.
+        fs.upload_part("bkt", "big.bin", &upload_id, 1, &vec![7u8; 1024][..])
+            .unwrap();
+
+        assert!(matches!(
+            fs.delete_bucket("bkt").unwrap_err(),
+            StorageError::BucketNotEmpty
+        ));
+        assert!(bk.exists());
+
+        // Abort the upload -> bucket is now empty -> delete succeeds.
+        fs.abort_multipart_upload("bkt", "big.bin", &upload_id).unwrap();
+        fs.delete_bucket("bkt").unwrap();
+        assert!(!bk.exists());
+    }
+
+    #[test]
+    fn delete_bucket_ignores_staged_manifest_temps() {
+        // A staged single-PUT/Complete temp is an `arriving/{uuid}.manifest` FILE, not
+        // an upload dir; it must NOT block DeleteBucket (it is crash debris, not a live
+        // object/upload). Simulate one via a crash-in-publish, then delete.
+        let (dir, fs) = store();
+        let bk = dir.path().join("bkt");
+        set_fault(Some(FaultPoint::BeforeJournal));
+        let _ = fs.put_object("bkt", "k", &b"orphan attempt"[..], "", BTreeMap::new());
+        set_fault(None);
+        // An orphan staged manifest is present, but no live object/upload.
+        assert!(!list_dir(&bk.join("arriving")).is_empty());
+        fs.delete_bucket("bkt").unwrap();
+        assert!(!bk.exists());
     }
 
     #[test]
@@ -1987,6 +2607,77 @@ mod tests {
             Err(other) => panic!("expected ObjectNotFound, got {other:?}"),
             Ok(_) => panic!("expected GET to fail fast on a missing blob"),
         }
+    }
+
+    #[test]
+    fn read_path_rejects_symlinked_manifest_and_lexical_escape() {
+        // Item #4 (GET-path perf): the read path no longer runs `canonicalize`, but
+        // symlink-containment MUST still hold via (1) lexical checks and (2) O_NOFOLLOW
+        // on the manifest open. This test plants a SYMLINKED manifest leaf pointing at
+        // an external "manifest" that, if followed, would let GET stream a foreign blob
+        // — and asserts GET does NOT follow it. It also asserts the lexical check still
+        // rejects a `..` escape on the read path.
+        //
+        // Mutation evidence: remove O_NOFOLLOW from `read_manifest`'s open and this
+        // test FAILS (GET would read the symlinked external manifest and serve it).
+        let dir = tempfile::tempdir().unwrap();
+        let fs = CasStore::new(dir.path());
+        fs.create_bucket("bkt").unwrap();
+        let bk = dir.path().join("bkt");
+
+        // Stage a real, valid manifest OUTSIDE the bucket's current/ tree so that, if
+        // the symlink were followed, GET would happily parse it and try to stream.
+        let outside = tempfile::tempdir().unwrap();
+        let foreign_blob = blob::write_blob(&bk, &b"FOREIGN BYTES"[..]).unwrap();
+        let external_manifest = Manifest {
+            key: "evil".into(),
+            content_type: "text/plain".into(),
+            content_length: foreign_blob.size,
+            etag: format!("\"{}\"", foreign_blob.md5_hex),
+            last_modified: now_unix(),
+            created: now_unix(),
+            user_metadata: BTreeMap::new(),
+            content_disposition: String::new(),
+            content_encoding: String::new(),
+            cache_control: String::new(),
+            parts: vec![ManifestPartRef {
+                part_number: 1,
+                blob_id: foreign_blob.blob_id.clone(),
+                size: foreign_blob.size,
+                md5_hex: foreign_blob.md5_hex.clone(),
+            }],
+            commit_nonce: Manifest::new_nonce(),
+        };
+        let ext_path = outside.path().join("external.manifest");
+        manifest::write_manifest_temp(&ext_path, &external_manifest, false).unwrap();
+
+        // Plant the live-manifest path for key "evil" as a SYMLINK to that external
+        // manifest (current/evil.s3gw-live.meta -> /outside/external.manifest).
+        let link = manifest::manifest_path(&bk.join("current"), "evil");
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&ext_path, &link).unwrap();
+
+        // GET must NOT follow the symlinked manifest leaf (O_NOFOLLOW → ELOOP). It
+        // surfaces as an error, never the FOREIGN bytes.
+        match fs.get_object("bkt", "evil", None) {
+            Err(_) => { /* O_NOFOLLOW rejected the symlinked manifest leaf — correct. */ }
+            Ok(res) => {
+                let got = read_all(res.body);
+                assert_ne!(got, b"FOREIGN BYTES", "read followed a symlinked manifest");
+            }
+        }
+        // The external manifest file is intact (GET did not write through the link).
+        assert!(ext_path.exists());
+
+        // The lexical read-path check still rejects `..` escapes with no syscall.
+        assert!(matches!(
+            fs.get_object("bkt", "../escape", None),
+            Err(StorageError::PathTraversal)
+        ));
+        assert!(matches!(
+            fs.head_object("bkt", "a/../../etc/passwd").unwrap_err(),
+            StorageError::PathTraversal
+        ));
     }
 
     #[test]
@@ -2307,6 +2998,203 @@ mod tests {
         assert_eq!(read_all(fs.get_object("bkt", "k", None).unwrap().body), b"vB-new");
     }
 
+    // ---- F: per-key publish-lock LOAD-BEARING concurrency regressions ----
+
+    #[test]
+    fn publish_lock_prevents_lost_blob_on_concurrent_overwrite_deterministic() {
+        // LOAD-BEARING regression for the per-key WRITE lock around `publish`. It
+        // forces the exact interleaving the lock exists to prevent and is
+        // DETERMINISTIC (Condvar handshakes, no sleeps).
+        //
+        // CAS makes a TORN object (manifest-of-A + body-of-B) impossible by
+        // construction — blobs are immutable + content-addressed and a version is
+        // published by a single atomic rename, so the live manifest always names
+        // blobs that exist and match it. What the lock DOES protect on concurrent
+        // OVERWRITES of one key is the journal/reclaim bookkeeping: each publish reads
+        // the CURRENT manifest to journal the OLD version's blobs for reclaim. If two
+        // overwrites race, the loser's blob is never journaled by anyone and LEAKS
+        // (an orphan blob that no live manifest references and no journal reclaims) —
+        // a real correctness defect (unbounded space leak; the fallback GC is opt-in).
+        //
+        // Interleaving (seed V0=blobX already live):
+        //   A: write blobA; stage manifest-A(blobA); read old V0 -> journal [blobX].
+        //      PARK here (pre-commit-rename) holding the per-key lock.
+        //   B: write blobB; then take the per-key lock.
+        //      - real lock  => B BLOCKS on lock_key (note_lock_contention). Release A:
+        //        A commits + reclaims blobX, frees lock. B then reads old = manifest-A,
+        //        journals [blobA], commits manifest-B(blobB), RECLAIMS blobA. Final:
+        //        exactly ONE blob (blobB). No leak.
+        //      - lock gone  => B reaches the window itself (second_window). Join B
+        //        first: B reads old V0, journals [blobX], commits manifest-B, reclaims
+        //        blobX. Release A: A commits manifest-A on top, reclaims blobX (gone).
+        //        Final: manifest-A(blobA) live, but blobB is ORPHANED -> TWO blobs.
+        //
+        // THE LOAD-BEARING ASSERTION: exactly one blob remains. With the lock => 1
+        // (loser's blob reclaimed); without => 2 (loser's blob leaked).
+        //
+        // Fail-without-fix evidence: neuter `lock_key` to hand out a guard on a fresh
+        // throwaway `RwLock` each call (no mutual exclusion) and this test FAILS with
+        // "blob leaked" (count==2); the real shared Arc<Vec<RwLock>> makes it PASS.
+        use std::sync::Arc;
+        let _serial = publish_pause::serialize_test(); // single global hook slot.
+        let dir = tempfile::tempdir().unwrap();
+        let fs = Arc::new(CasStore::with_fsync(dir.path(), false));
+        fs.create_bucket("bkt").unwrap();
+        let bk = dir.path().join("bkt");
+        let key = "hot.key";
+
+        // Seed the live version V0 so each overwrite journals an OLD blob.
+        fs.put_object("bkt", key, &b"v0-seed"[..], "text/v0", BTreeMap::new())
+            .unwrap();
+        assert_eq!(count_blobs(&bk), 1);
+
+        // Distinctive, different-length payloads so the survivor is unambiguous.
+        let data_a = vec![0xAAu8; 8192];
+        let data_b = vec![0xBBu8; 4096 + 7];
+
+        let hook = publish_pause::PauseHook::arm(&format!("bkt/{key}"));
+
+        let fa = Arc::clone(&fs);
+        let da = data_a.clone();
+        let a = std::thread::spawn(move || fa.put_object("bkt", key, &da[..], "text/a", BTreeMap::new()));
+
+        // Wait until A is parked in the critical window (manifest-A staged+journaled,
+        // not yet committed) while holding the per-key lock.
+        hook.wait_window_arrived();
+
+        let fb = Arc::clone(&fs);
+        let db = data_b.clone();
+        let b = std::thread::spawn(move || fb.put_object("bkt", key, &db[..], "text/b", BTreeMap::new()));
+
+        let b_blocked_on_lock = hook.wait_b_disposition();
+        let (ra, rb) = if b_blocked_on_lock {
+            hook.release();
+            (a.join().unwrap(), b.join().unwrap())
+        } else {
+            // Lock neutered: B raced into the window. Join B first (it fully published
+            // + reclaimed blobX), THEN release A so A commits manifest-A on top —
+            // leaking blobB.
+            let rb = b.join().unwrap();
+            hook.release();
+            (a.join().unwrap(), rb)
+        };
+        publish_pause::PauseHook::disarm();
+        assert!(ra.is_ok(), "writer A failed: {ra:?}");
+        assert!(rb.is_ok(), "writer B failed: {rb:?}");
+
+        // The published object is always internally consistent (CAS guarantees this
+        // regardless of the lock) and is EXACTLY one writer's object.
+        assert_object_consistent(&fs, "bkt", key)
+            .unwrap_or_else(|e| panic!("published object inconsistent: {e}"));
+        use md5::{Digest, Md5};
+        let head = fs.head_object("bkt", key).unwrap();
+        let body = read_all(fs.get_object("bkt", key, None).unwrap().body);
+        let etag_a = format!("\"{}\"", hex::encode(Md5::digest(&data_a)));
+        let etag_b = format!("\"{}\"", hex::encode(Md5::digest(&data_b)));
+        let is_a = body == data_a && head.etag == etag_a && head.content_type == "text/a";
+        let is_b = body == data_b && head.etag == etag_b && head.content_type == "text/b";
+        assert!(is_a || is_b, "survivor is not a clean A or B: etag={}", head.etag);
+
+        // LOAD-BEARING: no orphan blob. Exactly the survivor's single blob remains.
+        // Without the per-key lock the loser's blob is never journaled -> it leaks and
+        // this is 2.
+        assert_eq!(
+            count_blobs(&bk),
+            1,
+            "the per-key publish lock did not serialize the overwrites — the loser's \
+             blob leaked (orphan); expected exactly the survivor's 1 blob"
+        );
+        // And no journal is left dangling.
+        assert!(list_dir(&bk.join("deleted")).is_empty());
+    }
+
+    #[test]
+    fn publish_lock_serializes_put_vs_delete_deterministic() {
+        // LOAD-BEARING: a PUT (overwrite) and a DELETE of the SAME key must serialize
+        // on the per-key lock. We park a PUT (writer A) in the publish window (holding
+        // the lock), then fire a concurrent DELETE (writer B), DETERMINISTICALLY
+        // (Condvar handshakes, no sleeps).
+        //
+        // Interleaving (seed V0=blobX already live):
+        //   A: write blobA; stage manifest-A(blobA); read old V0 -> journal [blobX].
+        //      PARK (pre-commit-rename) holding the per-key lock.
+        //   B (DELETE): take the per-key lock.
+        //     - real lock => B BLOCKS on lock_key. Release A: A commits manifest-A,
+        //       reclaims blobX. B then reads the LIVE manifest-A, journals [blobA],
+        //       removes the manifest, reclaims blobA. Final: object ABSENT, 0 blobs.
+        //     - lock gone => B reaches the window region itself; join B FIRST: B reads
+        //       V0, journals [blobX], REMOVES the manifest, reclaims blobX. Release A:
+        //       A's commit-rename RE-CREATES the manifest (manifest-A) on top of the
+        //       just-deleted key. Final: object PRESENT — the client's DELETE was LOST.
+        //
+        // THE LOAD-BEARING ASSERTION: under the real lock the deterministic outcome is
+        // ABSENT (DELETE always runs after the PUT commits). Without the lock the
+        // DELETE is lost and the object is PRESENT — so asserting absence FAILS.
+        //
+        // Fail-without-fix evidence: neuter `lock_key` (throwaway RwLock per call) and
+        // this test FAILS with "DELETE was lost"; the real shared lock makes it PASS.
+        use std::sync::Arc;
+        let _serial = publish_pause::serialize_test(); // single global hook slot.
+        let dir = tempfile::tempdir().unwrap();
+        let fs = Arc::new(CasStore::with_fsync(dir.path(), false));
+        fs.create_bucket("bkt").unwrap();
+        let key = "hot.key";
+        let bk = dir.path().join("bkt");
+
+        // Seed an initial version so the overwriting PUT's publish() writes a journal
+        // listing the OLD blob — exactly the blob a racing DELETE would also target.
+        fs.put_object("bkt", key, &b"v0-original"[..], "text/v0", BTreeMap::new())
+            .unwrap();
+
+        let data_a = vec![0xCCu8; 5000];
+        let hook = publish_pause::PauseHook::arm(&format!("bkt/{key}"));
+
+        let fa = Arc::clone(&fs);
+        let da = data_a.clone();
+        let a = std::thread::spawn(move || fa.put_object("bkt", key, &da[..], "text/a", BTreeMap::new()));
+        hook.wait_window_arrived();
+
+        let fb = Arc::clone(&fs);
+        let b = std::thread::spawn(move || fb.delete_object("bkt", key));
+
+        // A DELETE never reaches the window pause, so with the lock MISSING there is no
+        // contention signal — bound the wait so a neutered lock fails cleanly (None)
+        // instead of hanging. `Some(true)` = B blocked on the real lock.
+        let (ra, rb) = match hook.wait_b_disposition_timeout(std::time::Duration::from_secs(5)) {
+            Some(true) => {
+                // Real lock: B is parked on lock_key. Release A; it commits + frees the
+                // lock, then B deletes the now-live object.
+                hook.release();
+                (a.join().unwrap(), b.join().unwrap())
+            }
+            _ => {
+                // Lock missing/neutered (or, defensively, a second_window): B raced the
+                // DELETE ahead unsynchronized. Join B first (it removed the manifest),
+                // THEN release A so its commit re-creates the manifest — the LOST delete.
+                let rb = b.join().unwrap();
+                hook.release();
+                (a.join().unwrap(), rb)
+            }
+        };
+        publish_pause::PauseHook::disarm();
+        assert!(ra.is_ok(), "PUT failed: {ra:?}");
+        assert!(rb.is_ok(), "DELETE failed: {rb:?}");
+
+        // Deterministic under the real lock: DELETE runs AFTER the PUT commits, so the
+        // object is ABSENT with no residual blobs and no dangling journal. If the lock
+        // is gone, the DELETE is lost (object PRESENT) and this fails.
+        match fs.head_object("bkt", key) {
+            Err(StorageError::ObjectNotFound) => {}
+            Ok(_) => panic!(
+                "PUT-vs-DELETE: the DELETE was LOST (object still present) — the \
+                 per-key lock did not serialize the PUT commit against the DELETE"
+            ),
+            Err(other) => panic!("unexpected head_object error: {other:?}"),
+        }
+        assert_eq!(count_blobs(&bk), 0, "serialized DELETE must leave no blobs");
+        assert!(list_dir(&bk.join("deleted")).is_empty(), "no dangling journal");
+    }
+
     #[test]
     fn delete_journal_left_then_recovered() {
         // Simulate "delete committed (manifest gone) but reclaim/cleanup lost":
@@ -2334,7 +3222,7 @@ mod tests {
 
     #[test]
     fn recover_removes_orphan_arriving_manifest_keeps_live_object() {
-        // (i) An orphaned arriving/{uuid}.meta + the blob it would have referenced.
+        // (i) An orphaned arriving/{uuid}.manifest + the blob it would have referenced.
         // recover() removes the staged manifest; the live object is untouched. The
         // orphan blob is left for gc_orphan_blobs (recover does NOT do the full GC).
         let (dir, fs) = store();
@@ -2470,7 +3358,7 @@ mod tests {
         assert_eq!(count_blobs(&bk), 3);
 
         let stats = fs.recover().unwrap();
-        // The upload dir is a {uuid}/ dir, NOT a staged {uuid}.meta -> NOT removed.
+        // The upload dir is a {uuid}/ dir, NOT a staged {uuid}.manifest -> NOT removed.
         assert_eq!(stats.arriving_manifests_removed, 0);
         assert!(
             bk.join("arriving").join(&upload_id).exists(),
@@ -2490,6 +3378,63 @@ mod tests {
         }
         let got = read_all(fs.get_object("bkt", key, None).unwrap().body);
         assert_eq!(md5_hex(&got), md5_hex(&want));
+    }
+
+    #[test]
+    fn gc_abandoned_uploads_reaps_old_keeps_young() {
+        // Item #5 (abandoned-upload sweep): an upload older than max_age is reaped
+        // (dir + part blobs gone); a YOUNGER upload is strictly untouched. We age one
+        // upload by back-dating its upload.json mtime, leave another fresh, then sweep
+        // with a 1-hour threshold.
+        use std::time::{Duration, SystemTime};
+        let (dir, fs) = store();
+        let bk = dir.path().join("bkt");
+
+        // OLD upload: create + one part, then back-date its upload.json by 2 hours.
+        let old_id = fs.create_multipart_upload("bkt", "old/obj", "", BTreeMap::new()).unwrap();
+        fs.upload_part("bkt", "old/obj", &old_id, 1, &vec![1u8; 2048][..]).unwrap();
+        let old_json = bk.join("arriving").join(&old_id).join("upload.json");
+        set_mtime(&old_json, SystemTime::now() - Duration::from_secs(2 * 3600));
+
+        // YOUNG upload: just created (fresh mtime).
+        let young_id = fs.create_multipart_upload("bkt", "young/obj", "", BTreeMap::new()).unwrap();
+        fs.upload_part("bkt", "young/obj", &young_id, 1, &vec![2u8; 1024][..]).unwrap();
+
+        assert_eq!(count_blobs(&bk), 2, "two part blobs before sweep");
+
+        // Sweep with a 1-hour threshold: only the old upload qualifies.
+        let reaped = fs.gc_abandoned_uploads(Duration::from_secs(3600)).unwrap();
+        assert_eq!(reaped, 1, "exactly the old upload should be reaped");
+
+        // OLD upload dir + its part blob are gone.
+        assert!(!bk.join("arriving").join(&old_id).exists());
+        // YOUNG upload is fully intact and still usable.
+        assert!(bk.join("arriving").join(&young_id).exists());
+        assert_eq!(fs.list_parts("bkt", "young/obj", &young_id).unwrap().len(), 1);
+        assert_eq!(count_blobs(&bk), 1, "only the young upload's part blob remains");
+
+        // A second sweep is a no-op (idempotent; the young one is still too fresh).
+        assert_eq!(fs.gc_abandoned_uploads(Duration::from_secs(3600)).unwrap(), 0);
+    }
+
+    #[test]
+    fn gc_abandoned_uploads_off_by_default_via_recover() {
+        // recover() must NOT reap in-flight uploads (the keep-in-flight rule): the
+        // reaper is a SEPARATE opt-in op. An old upload survives recover().
+        use std::time::{Duration, SystemTime};
+        let (dir, fs) = store();
+        let bk = dir.path().join("bkt");
+        let id = fs.create_multipart_upload("bkt", "k", "", BTreeMap::new()).unwrap();
+        fs.upload_part("bkt", "k", &id, 1, &vec![9u8; 512][..]).unwrap();
+        let json = bk.join("arriving").join(&id).join("upload.json");
+        set_mtime(&json, SystemTime::now() - Duration::from_secs(10 * 86_400));
+
+        fs.recover().unwrap();
+        assert!(bk.join("arriving").join(&id).exists(), "recover() must keep in-flight uploads");
+
+        // The explicit reaper does reap it.
+        assert_eq!(fs.gc_abandoned_uploads(Duration::from_secs(86_400)).unwrap(), 1);
+        assert!(!bk.join("arriving").join(&id).exists());
     }
 
     #[test]
@@ -2831,6 +3776,39 @@ mod tests {
         fs.complete_multipart_upload("bkt", key, &upload_id, &complete).unwrap();
         let got = read_all(fs.get_object("bkt", key, None).unwrap().body);
         assert_eq!(got, b"SECOND attempt, the real onepart two");
+    }
+
+    #[test]
+    fn part_ref_filename_content_mismatch_is_dropped() {
+        // Item #6 (defense-in-depth): a tampered `.ref` whose recorded part_number
+        // disagrees with its FILENAME number must be dropped by read_part_refs, so
+        // Complete cannot assemble a part under the wrong index. We hand-tamper part
+        // 1's ref to claim part_number=2 while keeping the filename 00001.ref.
+        let (dir, fs) = store();
+        let bk = dir.path().join("bkt");
+        let key = "tampered";
+        let upload_id = fs.create_multipart_upload("bkt", key, "", BTreeMap::new()).unwrap();
+        let e1 = fs.upload_part("bkt", key, &upload_id, 1, &b"the bytes"[..]).unwrap();
+
+        // Rewrite parts/00001.ref so its body says part_number=2 (mismatch).
+        let ref_path = bk.join("arriving").join(&upload_id).join("parts").join("00001.ref");
+        let mut pref: PartRefFile =
+            serde_json::from_slice(&std::fs::read(&ref_path).unwrap()).unwrap();
+        pref.part_number = 2; // body now disagrees with the filename "00001"
+        std::fs::write(&ref_path, serde_json::to_vec(&pref).unwrap()).unwrap();
+
+        // read_part_refs drops the mismatched entry -> ListParts sees nothing.
+        assert!(fs.list_parts("bkt", key, &upload_id).unwrap().is_empty());
+        // Complete claiming part 1 -> InvalidPart (the ref was dropped).
+        let err = fs
+            .complete_multipart_upload(
+                "bkt",
+                key,
+                &upload_id,
+                &[CompletePart { part_number: 1, etag: e1 }],
+            )
+            .unwrap_err();
+        assert!(matches!(err, StorageError::InvalidPart), "got {err:?}");
     }
 
     #[test]
