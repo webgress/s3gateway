@@ -16,11 +16,15 @@ use std::collections::BTreeMap;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
+use md5::Digest as _;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::blob;
-use super::filesystem::{validate_bucket_name, GetObjectResult, StorageError};
+use super::filesystem::{
+    validate_bucket_name, CompletePart, GetObjectResult, MultipartUpload, PartInfo, StorageError,
+    MAX_UPLOADS_CAP,
+};
 use super::manifest::{
     self, Manifest, ManifestPartRef, ARRIVING_DIR, CURRENT_DIR, DELETED_DIR, META_SUFFIX,
 };
@@ -59,6 +63,21 @@ pub struct Journal {
 pub enum JournalMode {
     Publish,
     Delete,
+}
+
+/// One `.ref`-file-per-part record under `arriving/{upload_id}/parts/{NNNNN}.ref`
+/// (REDESIGN §6 / §13.6). UploadPart writes its OWN ref (no shared file), so
+/// concurrent uploads of different part numbers never contend; Complete reads the
+/// dir to assemble the ordered manifest. Tiny JSON.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PartRefFile {
+    pub part_number: u32,
+    /// The immutable part blob's id (`blobs/xx/yy/{blob_id}`).
+    pub blob_id: String,
+    pub size: u64,
+    /// Hex MD5 of the part blob's bytes (no quotes) — the part ETag and a Complete
+    /// validation input.
+    pub md5_hex: String,
 }
 
 /// Test-only deterministic fault-injection points within the commit/delete
@@ -533,6 +552,20 @@ impl CasStore {
         manifest: &Manifest,
         resolved_range: Option<ByteRange>,
     ) -> Result<Box<dyn Read + Send>> {
+        // [LOW] Validate every part's blob_id syntactically BEFORE it is fed to
+        // `blob::blob_path`. A blob_id is supposed to be a bare uuid resolved through
+        // the fanout; a corrupt or crafted `.meta` whose blob_id contained `/` or
+        // `..` would otherwise build an escaping path. Reject up front as
+        // `Io(InvalidData)` (a malformed on-disk manifest is a server-side data
+        // problem, not a missing object) so no escaping path is ever constructed.
+        for p in &manifest.parts {
+            if !blob::is_valid_blob_id(&p.blob_id) {
+                return Err(StorageError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "manifest part references a malformed blob_id",
+                )));
+            }
+        }
         if manifest.parts.len() == 1 {
             let p = blob::blob_path(bucket_root, &manifest.parts[0].blob_id);
             match PlainFileReader::open(&p, resolved_range) {
@@ -706,6 +739,19 @@ impl CasStore {
         if Path::new(key).is_absolute() {
             return Err(StorageError::PathTraversal);
         }
+        // [REJECT — data loss] Empty-segment key collision. `escape_key_to_relpath`
+        // builds the manifest relpath by `PathBuf::push`-ing each `/`-split segment,
+        // and `push("")` is a no-op that COLLAPSES empty segments — so keys `a` and
+        // `a/`, `a/b` and `a/b/`, `a//b` and `a/b` would all map to the SAME manifest
+        // path → silent overwrite / data loss. Reject any key containing an empty
+        // path segment (a leading/trailing `/` or an internal `//`) up front. Maps to
+        // 400 InvalidArgument via `PathTraversal`. KNOWN LIMITATION: a filesystem-
+        // backed gateway cannot faithfully represent trailing- or empty-segment keys
+        // (real S3 treats `a` and `a/` as distinct objects); we reject them rather
+        // than risk collapsing them onto one manifest.
+        if key.split('/').any(|s| s.is_empty()) {
+            return Err(StorageError::PathTraversal);
+        }
         // The four infra dir names are under the bucket root and never collide
         // with a key (keys live under current/), so no key-segment reservation is
         // needed for them. The `.meta` suffix IS handled by escaping, so a key
@@ -745,6 +791,405 @@ impl CasStore {
         }
         Ok(())
     }
+
+    // ---- multipart (REDESIGN §6 / §9 / §14 Phase 4) ----
+    //
+    // Parts are IMMUTABLE blobs in `blobs/`, referenced via one `.ref`-file-per-part
+    // under the upload working dir `arriving/{upload_id}/parts/{NNNNN}.ref`. This
+    // keeps UploadPart lock-free and fully parallel (each part writes its own blob +
+    // its own ref, no shared manifest mutation), and lets Complete build the ordered
+    // manifest by simply REFERENCING the existing part blobs — no copy/concat, no
+    // second pass over the data.
+
+    /// Working dir for an in-flight upload: `arriving/{upload_id}/`. Validates the
+    /// upload_id is a well-formed uuid FIRST (a crafted id would otherwise join
+    /// outside `arriving/`), and — once the dir exists — rejects a symlinked or
+    /// out-of-root upload dir (the §11 arriving analog of the old F3 upload-dir
+    /// hardening). A not-yet-created dir is fine (create_multipart_upload makes it).
+    fn upload_dir(&self, bucket: &str, upload_id: &str) -> Result<PathBuf> {
+        Uuid::parse_str(upload_id).map_err(|_| StorageError::NoSuchUpload)?;
+        let dir = self.arriving_root(bucket).join(upload_id);
+        match std::fs::symlink_metadata(&dir) {
+            Ok(m) => {
+                if m.file_type().is_symlink() {
+                    return Err(StorageError::NoSuchUpload);
+                }
+                if !m.file_type().is_dir() {
+                    return Err(StorageError::NoSuchUpload);
+                }
+                if let (Ok(real_dir), Ok(real_root)) =
+                    (std::fs::canonicalize(&dir), std::fs::canonicalize(&self.root))
+                {
+                    if !real_dir.starts_with(&real_root) {
+                        return Err(StorageError::NoSuchUpload);
+                    }
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        Ok(dir)
+    }
+
+    /// Load the upload's `upload.json` and require its stored bucket/key match the
+    /// REQUEST path (preserves the B4 fix: a valid upload_id addressed via a
+    /// different object path is `NoSuchUpload`). Read with O_NOFOLLOW so a symlinked
+    /// upload.json is not followed (preserves D5). Also the existence check (missing
+    /// -> NoSuchUpload). Returns the parsed upload on success.
+    fn assert_upload_matches(
+        &self,
+        upload_dir: &Path,
+        bucket: &str,
+        key: &str,
+    ) -> Result<MultipartUpload> {
+        let raw = match read_nofollow(&upload_dir.join("upload.json")) {
+            Ok(d) => d,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(StorageError::NoSuchUpload),
+            Err(e) => return Err(e.into()),
+        };
+        let upload: MultipartUpload = serde_json::from_slice(&raw)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        if upload.bucket != bucket || upload.key != key {
+            return Err(StorageError::NoSuchUpload);
+        }
+        Ok(upload)
+    }
+
+    /// CreateMultipartUpload: generate a v4 upload_id, create `arriving/{id}/parts/`,
+    /// and persist the upload meta (`upload.json`) so Complete can verify the request
+    /// bucket/key match the upload (B4). Signature identical to
+    /// `Filesystem::create_multipart_upload`.
+    pub fn create_multipart_upload(
+        &self,
+        bucket: &str,
+        key: &str,
+        content_type: &str,
+        user_meta: BTreeMap<String, String>,
+    ) -> Result<String> {
+        self.validate_object_path(bucket, key)?;
+        self.head_bucket(bucket)?;
+        self.ensure_infra(bucket)?;
+
+        let upload_id = Uuid::new_v4().to_string();
+        let upload_dir = self.arriving_root(bucket).join(&upload_id);
+        std::fs::create_dir_all(upload_dir.join("parts"))?;
+
+        let meta = MultipartUpload {
+            upload_id: upload_id.clone(),
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            initiated_unix: now_unix(),
+            content_type: content_type.to_string(),
+            user_metadata: user_meta,
+        };
+        let data = serde_json::to_vec_pretty(&meta).map_err(io::Error::other)?;
+        write_nofollow(&upload_dir.join("upload.json"), &data, self.fsync)?;
+        Ok(upload_id)
+    }
+
+    /// UploadPart: stream the part body to a fresh IMMUTABLE blob (Direct-IO,
+    /// one-pass MD5), then write a `parts/{NNNNN}.ref` recording the part's blob_id /
+    /// size / md5. Returns the quoted part ETag (`"md5"`). Signature identical to
+    /// `Filesystem::upload_part`.
+    ///
+    /// Parallel-safe: each UploadPart writes its OWN blob + its OWN ref — no shared
+    /// manifest/part-file mutation, so concurrent UploadParts (even to one upload_id)
+    /// never contend. Overwriting a part (same number) atomically replaces its `.ref`
+    /// and immediately reclaims the superseded blob (it is referenced by nothing).
+    pub fn upload_part<R: Read>(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        part_number: i32,
+        body: R,
+    ) -> Result<String> {
+        // F/B5: S3 part numbers are 1..=10000. Reject out-of-range BEFORE formatting
+        // a path (a negative would format as e.g. `-0001`).
+        if !(1..=10_000).contains(&part_number) {
+            return Err(StorageError::InvalidPart);
+        }
+        let upload_dir = self.upload_dir(bucket, upload_id)?;
+        self.assert_upload_matches(&upload_dir, bucket, key)?;
+
+        let bucket_root = self.bucket_root(bucket);
+        // Stream the part to a fresh immutable blob (lock-free; one-pass MD5; fsync).
+        let info = blob::write_blob(&bucket_root, body).map_err(body_or_io)?;
+        let etag = format!("\"{}\"", info.md5_hex);
+
+        // Atomically install the part ref. If a previous ref for this number existed,
+        // capture its blob_id so we can reclaim the now-orphaned old blob.
+        let ref_path = upload_dir.join("parts").join(format!("{part_number:05}.ref"));
+        let prev_blob = match read_nofollow(&ref_path) {
+            Ok(d) => serde_json::from_slice::<PartRefFile>(&d).ok().map(|p| p.blob_id),
+            Err(_) => None,
+        };
+        let pref = PartRefFile {
+            part_number: part_number as u32,
+            blob_id: info.blob_id.clone(),
+            size: info.size,
+            md5_hex: info.md5_hex.clone(),
+        };
+        let data = serde_json::to_vec(&pref).map_err(io::Error::other)?;
+        // Write the ref to a temp sibling then atomic-rename it into place so a
+        // concurrent reader/Complete never sees a half-written ref.
+        let tmp_ref = upload_dir
+            .join("parts")
+            .join(format!("{part_number:05}.ref.tmp.{}", Uuid::new_v4()));
+        let mut guard = FileGuard::new(tmp_ref.clone());
+        if let Err(e) = write_nofollow(&tmp_ref, &data, self.fsync) {
+            // Roll back our new blob (referenced by nothing).
+            let _ = blob::reclaim_blob(&bucket_root, &info.blob_id);
+            return Err(e.into());
+        }
+        if let Err(e) = super::directio::rename(&tmp_ref, &ref_path) {
+            let _ = blob::reclaim_blob(&bucket_root, &info.blob_id);
+            return Err(e.into());
+        }
+        guard.disarm();
+        // The superseded part's blob (if any) is now unreferenced -> reclaim it.
+        if let Some(old) = prev_blob {
+            if old != info.blob_id {
+                let _ = blob::reclaim_blob(&bucket_root, &old);
+            }
+        }
+        Ok(etag)
+    }
+
+    /// Read all valid `parts/{NNNNN}.ref` entries in an upload dir, keyed by part
+    /// number. Skips temp (`.ref.tmp.`) and unparseable entries.
+    fn read_part_refs(upload_dir: &Path) -> io::Result<std::collections::BTreeMap<u32, PartRefFile>> {
+        let mut out = std::collections::BTreeMap::new();
+        let parts_dir = upload_dir.join("parts");
+        let rd = match std::fs::read_dir(&parts_dir) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(out),
+            Err(e) => return Err(e),
+        };
+        for entry in rd {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if !name.ends_with(".ref") || name.contains(".tmp.") {
+                continue;
+            }
+            let data = match read_nofollow(&entry.path()) {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+            if let Ok(p) = serde_json::from_slice::<PartRefFile>(&data) {
+                out.insert(p.part_number, p);
+            }
+        }
+        Ok(out)
+    }
+
+    /// CompleteMultipartUpload: validate the claimed parts against the stored part
+    /// refs (md5/order), build an ordered manifest REFERENCING the part blobs, and
+    /// PUBLISH via the §3 commit path (atomic rename + journal the OLD key's blobs if
+    /// overwriting). Returns the composite ETag. Signature identical to
+    /// `Filesystem::complete_multipart_upload`.
+    ///
+    /// E2 (retryable failed Complete): the part blobs and refs are NOT touched until
+    /// AFTER the commit succeeds. Any pre-commit failure leaves the upload fully
+    /// intact so the client can retry Complete. No data is copied/concatenated.
+    pub fn complete_multipart_upload(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        parts: &[CompletePart],
+    ) -> Result<String> {
+        let upload_dir = self.upload_dir(bucket, upload_id)?;
+        // B4: cross-check the request path matches the upload.
+        let upload = self.assert_upload_matches(&upload_dir, bucket, key)?;
+        // Defense in depth: re-validate the upload's stored bucket/key.
+        self.validate_object_path(&upload.bucket, &upload.key)?;
+
+        // F/B5: empty parts list is not a valid completion.
+        if parts.is_empty() {
+            return Err(StorageError::InvalidPart);
+        }
+        // F/B5: every claimed part number must be in 1..=10000.
+        for p in parts {
+            if !(1..=10_000).contains(&p.part_number) {
+                return Err(StorageError::InvalidPart);
+            }
+        }
+        // Parts must be strictly ascending by number.
+        for w in parts.windows(2) {
+            if w[1].part_number <= w[0].part_number {
+                return Err(StorageError::InvalidPartOrder);
+            }
+        }
+
+        self.head_bucket(&upload.bucket)?;
+
+        // Load the stored part refs (the immutable blobs each .ref points at). Take
+        // the per-key WRITE lock around validate->build->commit, keyed by the
+        // upload's STORED bucket/key — this serializes Complete vs a concurrent
+        // Delete/Complete on the same key (E3 is structurally gone since part blobs
+        // are immutable at unique paths, but the lock still serializes the manifest
+        // swap + journal creation, §9).
+        let _guard = self.lock_key(&upload.bucket, &upload.key);
+        let stored = Self::read_part_refs(&upload_dir)?;
+
+        // Validate each claimed part against its stored ref; build the ordered
+        // manifest parts referencing the part blobs.
+        let mut manifest_parts: Vec<ManifestPartRef> = Vec::with_capacity(parts.len());
+        let mut md5_concat: Vec<u8> = Vec::with_capacity(parts.len() * 16);
+        let mut total: u64 = 0;
+        for p in parts {
+            let stored_ref = match stored.get(&(p.part_number as u32)) {
+                Some(r) => r,
+                None => return Err(StorageError::InvalidPart),
+            };
+            // F15: an empty client ETag is NOT a free pass — reject it, then compare.
+            let provided = p.etag.trim_matches('"');
+            if provided.is_empty() || provided != stored_ref.md5_hex {
+                return Err(StorageError::InvalidPart);
+            }
+            // The blob backing the ref must be a syntactically valid uuid (it always
+            // is when written by UploadPart; this guards a hand-tampered ref).
+            if !blob::is_valid_blob_id(&stored_ref.blob_id) {
+                return Err(StorageError::InvalidPart);
+            }
+            let raw = hex::decode(&stored_ref.md5_hex)
+                .map_err(|_| StorageError::InvalidPart)?;
+            md5_concat.extend_from_slice(&raw);
+            total += stored_ref.size;
+            manifest_parts.push(ManifestPartRef {
+                part_number: p.part_number as u32,
+                blob_id: stored_ref.blob_id.clone(),
+                size: stored_ref.size,
+                md5_hex: stored_ref.md5_hex.clone(),
+            });
+        }
+
+        // Composite ETag: md5(concat of raw 16-byte part digests)-N. Identical format
+        // to the old impl.
+        let composite = md5::Md5::digest(&md5_concat);
+        let etag = format!("\"{}-{}\"", hex::encode(composite), parts.len());
+
+        let ct = if upload.content_type.is_empty() {
+            "application/octet-stream"
+        } else {
+            &upload.content_type
+        };
+        let now = now_unix();
+        let manifest = Manifest {
+            key: upload.key.clone(),
+            content_type: ct.to_string(),
+            content_length: total,
+            etag: etag.clone(),
+            last_modified: now,
+            created: now,
+            user_metadata: upload.user_metadata.clone(),
+            content_disposition: String::new(),
+            content_encoding: String::new(),
+            cache_control: String::new(),
+            parts: manifest_parts,
+            commit_nonce: Manifest::new_nonce(),
+        };
+
+        // COMMIT via the §3 publish path. The part blobs already live in `blobs/`
+        // (written+fsynced by UploadPart), so publish just stages+journals+renames
+        // the manifest — no part data is copied. A pre-commit failure here returns
+        // Err WITHOUT touching the upload's blobs/refs -> the upload stays RETRYABLE
+        // (E2). We do NOT roll back the part blobs (unlike single-PUT) because they
+        // are owned by the still-live upload, not by this attempt.
+        self.publish(&upload.bucket, &upload.key, &manifest)?;
+
+        // Success: remove the upload working dir. The part blobs are now owned by the
+        // committed manifest; only the refs + upload.json are discarded.
+        let _ = std::fs::remove_dir_all(&upload_dir);
+        Ok(etag)
+    }
+
+    /// AbortMultipartUpload: delete the upload's part blobs (from the stored refs)
+    /// and remove the working dir. Signature identical to
+    /// `Filesystem::abort_multipart_upload`.
+    pub fn abort_multipart_upload(&self, bucket: &str, key: &str, upload_id: &str) -> Result<()> {
+        let upload_dir = self.upload_dir(bucket, upload_id)?;
+        self.assert_upload_matches(&upload_dir, bucket, key)?;
+        let bucket_root = self.bucket_root(bucket);
+        // Reclaim each part blob (immutable; owned exclusively by this upload).
+        if let Ok(refs) = Self::read_part_refs(&upload_dir) {
+            for r in refs.values() {
+                let _ = blob::reclaim_blob(&bucket_root, &r.blob_id);
+            }
+        }
+        std::fs::remove_dir_all(&upload_dir)?;
+        Ok(())
+    }
+
+    /// ListParts: the stored part refs as `PartInfo`, sorted by part number.
+    /// Signature identical to `Filesystem::list_parts`.
+    pub fn list_parts(&self, bucket: &str, key: &str, upload_id: &str) -> Result<Vec<PartInfo>> {
+        let upload_dir = self.upload_dir(bucket, upload_id)?;
+        self.assert_upload_matches(&upload_dir, bucket, key)?;
+        let refs = Self::read_part_refs(&upload_dir)?;
+        // last_modified from each ref file's mtime (best-effort; 0 if unavailable).
+        let mut out = Vec::with_capacity(refs.len());
+        for (num, r) in refs {
+            let ref_path = upload_dir.join("parts").join(format!("{num:05}.ref"));
+            let lm = std::fs::metadata(&ref_path)
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            out.push(PartInfo {
+                part_number: num as i32,
+                size: r.size as i64,
+                etag: format!("\"{}\"", r.md5_hex),
+                last_modified_unix: lm,
+            });
+        }
+        out.sort_by_key(|p| p.part_number);
+        Ok(out)
+    }
+
+    /// ListMultipartUploads for `bucket`, BOUNDED by `max_uploads` (E7: hard-capped
+    /// at [`MAX_UPLOADS_CAP`], returns `is_truncated`). Scans `arriving/{uuid}/
+    /// upload.json`. Signature identical to `Filesystem::list_multipart_uploads`.
+    pub fn list_multipart_uploads(
+        &self,
+        bucket: &str,
+        max_uploads: usize,
+    ) -> Result<(Vec<MultipartUpload>, bool)> {
+        self.head_bucket(bucket)?;
+        let cap = max_uploads.min(MAX_UPLOADS_CAP);
+        let arriving = self.arriving_root(bucket);
+        let rd = match std::fs::read_dir(&arriving) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok((Vec::new(), false)),
+            Err(e) => return Err(e.into()),
+        };
+        let mut out = Vec::new();
+        for entry in rd {
+            let entry = entry?;
+            // Only `{uuid}/` working dirs are uploads; staged `{uuid}.meta` manifests
+            // (single-PUT/Complete temps) are not.
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let meta_path = entry.path().join("upload.json");
+            let data = match read_nofollow(&meta_path) {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+            if let Ok(u) = serde_json::from_slice::<MultipartUpload>(&data) {
+                out.push(u);
+            }
+        }
+        out.sort_by(|a, b| a.key.cmp(&b.key).then_with(|| a.upload_id.cmp(&b.upload_id)));
+        let is_truncated = out.len() > cap;
+        if is_truncated {
+            out.truncate(cap);
+        }
+        Ok((out, is_truncated))
+    }
 }
 
 /// RAII cleanup for a temp file (arriving staged manifest): remove on drop unless
@@ -782,6 +1227,40 @@ fn body_or_io(e: io::Error) -> StorageError {
 
 fn now_unix() -> i64 {
     crate::auth::time::now_unix()
+}
+
+/// Read a small file with O_NOFOLLOW so a planted symlink at the path is rejected
+/// (ELOOP) rather than followed (`std::fs::read` would follow it). Used for
+/// `upload.json` and `parts/{NNNNN}.ref`.
+fn read_nofollow(path: &Path) -> io::Result<Vec<u8>> {
+    use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let mut f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    let mut data = Vec::new();
+    f.read_to_end(&mut data)?;
+    Ok(data)
+}
+
+/// Write a small file with O_NOFOLLOW (so a planted symlink is not followed),
+/// truncating any existing content. When `durable`, fsync the file bytes before
+/// returning. Used for `upload.json` and the staged `parts/{NNNNN}.ref.tmp.*`.
+fn write_nofollow(path: &Path, data: &[u8], durable: bool) -> io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    f.write_all(data)?;
+    if durable {
+        f.sync_all()?;
+    }
+    Ok(())
 }
 
 /// Pure lexical path normalization (no fs access), resolving `.`/`..`.
@@ -1172,6 +1651,75 @@ mod tests {
         assert!(!blob::blob_path(&bk, &info.blob_id).exists());
     }
 
+    // ---- PART 1 residual fixes (load-bearing) ----
+
+    #[test]
+    fn empty_segment_keys_rejected_no_collision() {
+        // [REJECT — data loss] `a` and `a/` must NOT collapse onto one manifest.
+        // PUT `a` succeeds; PUT `a/` is rejected (InvalidArgument via PathTraversal);
+        // GET `a` still returns `a`'s bytes (no silent overwrite). This FAILS if the
+        // empty-segment guard in `validate_object_path` is removed (then `a/` would
+        // `push("")`-collapse to `current/a.meta` and overwrite `a`).
+        let (_dir, fs) = store();
+        fs.put_object("bkt", "a", &b"i am the real a"[..], "", BTreeMap::new())
+            .unwrap();
+
+        // Trailing slash -> empty final segment -> rejected.
+        let err = fs
+            .put_object("bkt", "a/", &b"impostor with trailing slash"[..], "", BTreeMap::new())
+            .unwrap_err();
+        assert!(matches!(err, StorageError::PathTraversal), "a/ -> {err:?}");
+
+        // `a` is untouched: still its original bytes (proves no collision/overwrite).
+        let res = fs.get_object("bkt", "a", None).unwrap();
+        assert_eq!(read_all(res.body), b"i am the real a");
+
+        // All other empty-segment shapes are rejected too.
+        for bad in ["a//b", "/a", "a/", "/", "a/b/", "//"] {
+            let err = fs
+                .put_object("bkt", bad, &b"x"[..], "", BTreeMap::new())
+                .unwrap_err();
+            assert!(matches!(err, StorageError::PathTraversal), "key {bad:?} -> {err:?}");
+        }
+
+        // And `a//b` would otherwise alias `a/b` — confirm `a/b` is unaffected by the
+        // rejected `a//b` write.
+        fs.put_object("bkt", "a/b", &b"genuine a slash b"[..], "", BTreeMap::new())
+            .unwrap();
+        let err = fs
+            .put_object("bkt", "a//b", &b"collision attempt"[..], "", BTreeMap::new())
+            .unwrap_err();
+        assert!(matches!(err, StorageError::PathTraversal));
+        assert_eq!(
+            read_all(fs.get_object("bkt", "a/b", None).unwrap().body),
+            b"genuine a slash b"
+        );
+    }
+
+    #[test]
+    fn malformed_blob_id_in_manifest_errors_no_path_escape() {
+        // [LOW] A corrupt/crafted `.meta` whose part blob_id contains `/`/`..` must
+        // NOT be fed into `blob_path` (which would build an escaping path). GET errors
+        // out (InvalidData) instead. FAILS if the `is_valid_blob_id` guard in
+        // `open_body` is removed (then the malformed id would be path-joined and the
+        // open would either escape or surface a different error class).
+        let (dir, fs) = store();
+        let bk = dir.path().join("bkt");
+        fs.put_object("bkt", "k", &b"legit bytes"[..], "", BTreeMap::new())
+            .unwrap();
+        // Hand-corrupt the manifest's blob_id to a path-escaping string.
+        let mp = manifest::manifest_path(&bk.join("current"), "k");
+        let mut m = manifest::read_manifest(&mp).unwrap();
+        m.parts[0].blob_id = "../../../../etc/passwd".to_string();
+        manifest::write_manifest_temp(&mp, &m, false).unwrap();
+
+        match fs.get_object("bkt", "k", None) {
+            Err(StorageError::Io(e)) => assert_eq!(e.kind(), io::ErrorKind::InvalidData),
+            Err(other) => panic!("expected Io(InvalidData) for malformed blob_id, got {other:?}"),
+            Ok(_) => panic!("expected GET to error on a malformed blob_id, not succeed"),
+        }
+    }
+
     #[test]
     fn fsync_false_mode_still_round_trips() {
         let dir = tempfile::tempdir().unwrap();
@@ -1185,5 +1733,437 @@ mod tests {
             fs.head_object("bkt", "k").unwrap_err(),
             StorageError::ObjectNotFound
         ));
+    }
+
+    // ---- PART 2: multipart on the .ref-per-part model ----
+
+    fn upload_3_parts(fs: &CasStore, bucket: &str, key: &str) -> (String, [Vec<u8>; 3], [String; 3]) {
+        let upload_id = fs
+            .create_multipart_upload(bucket, key, "application/octet-stream", BTreeMap::new())
+            .unwrap();
+        // Three differently-sized parts (deterministic bytes).
+        let p1: Vec<u8> = (0..6_000_000u32).map(|i| (i % 256) as u8).collect();
+        let p2: Vec<u8> = (0..7_000_000u32).map(|i| ((i / 3) % 256) as u8).collect();
+        let p3: Vec<u8> = b"final small part".to_vec();
+        let e1 = fs.upload_part(bucket, key, &upload_id, 1, &p1[..]).unwrap();
+        let e2 = fs.upload_part(bucket, key, &upload_id, 2, &p2[..]).unwrap();
+        let e3 = fs.upload_part(bucket, key, &upload_id, 3, &p3[..]).unwrap();
+        (upload_id, [p1, p2, p3], [e1, e2, e3])
+    }
+
+    fn md5_hex(data: &[u8]) -> String {
+        use md5::{Digest, Md5};
+        hex::encode(Md5::digest(data))
+    }
+
+    #[test]
+    fn multipart_create_upload_complete_round_trip() {
+        let (dir, fs) = store();
+        let bk = dir.path().join("bkt");
+        let key = "big/object.bin";
+        let (upload_id, parts, etags) = upload_3_parts(&fs, "bkt", key);
+
+        // Part ETags are the per-part md5s.
+        for (p, e) in parts.iter().zip(etags.iter()) {
+            assert_eq!(*e, format!("\"{}\"", md5_hex(p)));
+        }
+
+        // ListParts shows 3 ascending parts with correct sizes/etags.
+        let listed = fs.list_parts("bkt", key, &upload_id).unwrap();
+        assert_eq!(listed.len(), 3);
+        assert_eq!(listed[0].part_number, 1);
+        assert_eq!(listed[0].size, parts[0].len() as i64);
+        assert_eq!(listed[2].part_number, 3);
+
+        // 3 part blobs on disk pre-complete.
+        assert_eq!(count_blobs(&bk), 3);
+
+        let complete = vec![
+            CompletePart { part_number: 1, etag: etags[0].clone() },
+            CompletePart { part_number: 2, etag: etags[1].clone() },
+            CompletePart { part_number: 3, etag: etags[2].clone() },
+        ];
+        let composite = fs.complete_multipart_upload("bkt", key, &upload_id, &complete).unwrap();
+
+        // Composite ETag = md5(concat of raw 16-byte part md5s)-3, exact format.
+        let expected = {
+            use md5::{Digest, Md5};
+            let mut concat = Vec::new();
+            for p in &parts {
+                concat.extend_from_slice(&Md5::digest(p));
+            }
+            format!("\"{}-3\"", hex::encode(Md5::digest(&concat)))
+        };
+        assert_eq!(composite, expected);
+        assert!(composite.ends_with("-3\""));
+
+        // HEAD reports composite etag + total length.
+        let total: usize = parts.iter().map(|p| p.len()).sum();
+        let meta = fs.head_object("bkt", key).unwrap();
+        assert_eq!(meta.etag, composite);
+        assert_eq!(meta.content_length, total as i64);
+
+        // GET reassembles the EXACT concatenated bytes.
+        let mut want = Vec::new();
+        for p in &parts {
+            want.extend_from_slice(p);
+        }
+        let res = fs.get_object("bkt", key, None).unwrap();
+        assert_eq!(res.total_size, total as u64);
+        let got = read_all(res.body);
+        assert_eq!(got.len(), want.len());
+        assert_eq!(md5_hex(&got), md5_hex(&want));
+
+        // Upload working dir removed; the 3 part blobs are now the live object's.
+        assert!(!bk.join("arriving").join(&upload_id).exists());
+        assert_eq!(count_blobs(&bk), 3);
+        // No leftover journal (overwrite of a fresh key has no old blobs).
+        assert!(list_dir(&bk.join("deleted")).is_empty());
+    }
+
+    #[test]
+    fn multipart_range_get_spanning_part_boundary() {
+        let (_dir, fs) = store();
+        let key = "ranged";
+        let (upload_id, parts, etags) = upload_3_parts(&fs, "bkt", key);
+        let complete: Vec<CompletePart> = (0..3)
+            .map(|i| CompletePart { part_number: (i + 1) as i32, etag: etags[i].clone() })
+            .collect();
+        fs.complete_multipart_upload("bkt", key, &upload_id, &complete).unwrap();
+
+        let mut full = Vec::new();
+        for p in &parts {
+            full.extend_from_slice(p);
+        }
+        // A range straddling the part1/part2 boundary (part1 len = 6_000_000).
+        let start = 6_000_000 - 100;
+        let end = 6_000_000 + 200;
+        let res = fs
+            .get_object("bkt", key, Some(&format!("bytes={start}-{end}")))
+            .unwrap();
+        assert_eq!(res.resolved_range, Some(ByteRange { start, end }));
+        let got = read_all(res.body);
+        assert_eq!(got, full[start as usize..=end as usize]);
+    }
+
+    #[test]
+    fn multipart_abort_cleans_up_blobs_and_dir() {
+        let (dir, fs) = store();
+        let bk = dir.path().join("bkt");
+        let key = "to-abort";
+        let (upload_id, _parts, _etags) = upload_3_parts(&fs, "bkt", key);
+        assert_eq!(count_blobs(&bk), 3);
+        assert!(bk.join("arriving").join(&upload_id).exists());
+
+        fs.abort_multipart_upload("bkt", key, &upload_id).unwrap();
+        // Part blobs + working dir gone.
+        assert_eq!(count_blobs(&bk), 0);
+        assert!(!bk.join("arriving").join(&upload_id).exists());
+        // The object was never published.
+        assert!(matches!(
+            fs.head_object("bkt", key).unwrap_err(),
+            StorageError::ObjectNotFound
+        ));
+    }
+
+    #[test]
+    fn multipart_overwrite_via_complete_reclaims_old_key_blobs() {
+        let (dir, fs) = store();
+        let bk = dir.path().join("bkt");
+        let key = "overwritten";
+        // v1: a single-part PUT.
+        fs.put_object("bkt", key, &b"the original single-part value"[..], "", BTreeMap::new())
+            .unwrap();
+        let v1_blob = {
+            let m = manifest::read_manifest(&manifest::manifest_path(&bk.join("current"), key)).unwrap();
+            m.parts[0].blob_id.clone()
+        };
+        assert_eq!(count_blobs(&bk), 1);
+
+        // v2: a multipart Complete to the SAME key.
+        let (upload_id, parts, etags) = upload_3_parts(&fs, "bkt", key);
+        // 1 (v1) + 3 (v2 parts) blobs present pre-complete.
+        assert_eq!(count_blobs(&bk), 4);
+        let complete: Vec<CompletePart> = (0..3)
+            .map(|i| CompletePart { part_number: (i + 1) as i32, etag: etags[i].clone() })
+            .collect();
+        fs.complete_multipart_upload("bkt", key, &upload_id, &complete).unwrap();
+
+        // OLD single-part blob journaled + reclaimed; only the 3 new part blobs live.
+        assert!(!blob::blob_path(&bk, &v1_blob).exists(), "old key blob must be reclaimed");
+        assert_eq!(count_blobs(&bk), 3);
+        assert!(list_dir(&bk.join("deleted")).is_empty(), "journal cleaned");
+
+        // GET returns the NEW (multipart) bytes.
+        let mut want = Vec::new();
+        for p in &parts {
+            want.extend_from_slice(p);
+        }
+        let got = read_all(fs.get_object("bkt", key, None).unwrap().body);
+        assert_eq!(md5_hex(&got), md5_hex(&want));
+    }
+
+    #[test]
+    fn multipart_part_overwrite_uses_latest_blob() {
+        let (dir, fs) = store();
+        let bk = dir.path().join("bkt");
+        let key = "reupload";
+        let upload_id = fs
+            .create_multipart_upload("bkt", key, "", BTreeMap::new())
+            .unwrap();
+        // Upload part 1 twice; the second supersedes (old blob reclaimed immediately).
+        fs.upload_part("bkt", key, &upload_id, 1, &b"first attempt of part one"[..])
+            .unwrap();
+        assert_eq!(count_blobs(&bk), 1);
+        let e1b = fs
+            .upload_part("bkt", key, &upload_id, 1, &b"SECOND attempt, the real one"[..])
+            .unwrap();
+        // Superseded blob reclaimed -> still exactly one part blob.
+        assert_eq!(count_blobs(&bk), 1);
+        let e2 = fs.upload_part("bkt", key, &upload_id, 2, &b"part two"[..]).unwrap();
+
+        let complete = vec![
+            CompletePart { part_number: 1, etag: e1b },
+            CompletePart { part_number: 2, etag: e2 },
+        ];
+        fs.complete_multipart_upload("bkt", key, &upload_id, &complete).unwrap();
+        let got = read_all(fs.get_object("bkt", key, None).unwrap().body);
+        assert_eq!(got, b"SECOND attempt, the real onepart two");
+    }
+
+    #[test]
+    fn multipart_complete_rejects_bad_inputs() {
+        let (_dir, fs) = store();
+        let key = "validate";
+        let (upload_id, _parts, etags) = upload_3_parts(&fs, "bkt", key);
+
+        // Empty parts list.
+        assert!(matches!(
+            fs.complete_multipart_upload("bkt", key, &upload_id, &[]).unwrap_err(),
+            StorageError::InvalidPart
+        ));
+        // Out-of-range part numbers.
+        for bad in [0i32, -1, 10_001] {
+            let err = fs
+                .complete_multipart_upload(
+                    "bkt",
+                    key,
+                    &upload_id,
+                    &[CompletePart { part_number: bad, etag: etags[0].clone() }],
+                )
+                .unwrap_err();
+            assert!(matches!(err, StorageError::InvalidPart), "part {bad} -> {err:?}");
+        }
+        // Empty ETag (F15).
+        assert!(matches!(
+            fs.complete_multipart_upload(
+                "bkt", key, &upload_id,
+                &[CompletePart { part_number: 1, etag: String::new() }],
+            ).unwrap_err(),
+            StorageError::InvalidPart
+        ));
+        // Mismatched ETag.
+        assert!(matches!(
+            fs.complete_multipart_upload(
+                "bkt", key, &upload_id,
+                &[CompletePart { part_number: 1, etag: "\"deadbeefdeadbeefdeadbeefdeadbeef\"".into() }],
+            ).unwrap_err(),
+            StorageError::InvalidPart
+        ));
+        // Wrong (descending / non-ascending) order.
+        assert!(matches!(
+            fs.complete_multipart_upload(
+                "bkt", key, &upload_id,
+                &[
+                    CompletePart { part_number: 2, etag: etags[1].clone() },
+                    CompletePart { part_number: 1, etag: etags[0].clone() },
+                ],
+            ).unwrap_err(),
+            StorageError::InvalidPartOrder
+        ));
+        // A part number with no stored ref.
+        assert!(matches!(
+            fs.complete_multipart_upload(
+                "bkt", key, &upload_id,
+                &[CompletePart { part_number: 7, etag: etags[0].clone() }],
+            ).unwrap_err(),
+            StorageError::InvalidPart
+        ));
+
+        // None of those failures destroyed the upload: a correct Complete still works.
+        let complete: Vec<CompletePart> = (0..3)
+            .map(|i| CompletePart { part_number: (i + 1) as i32, etag: etags[i].clone() })
+            .collect();
+        assert!(fs.complete_multipart_upload("bkt", key, &upload_id, &complete).is_ok());
+    }
+
+    #[test]
+    fn multipart_mismatched_bucket_or_key_is_no_such_upload() {
+        let (_dir, fs) = store();
+        fs.create_bucket("other").unwrap();
+        let upload_id = fs
+            .create_multipart_upload("bkt", "real-key", "", BTreeMap::new())
+            .unwrap();
+        let e1 = fs.upload_part("bkt", "real-key", &upload_id, 1, &b"data"[..]).unwrap();
+
+        // upload_part to the wrong key.
+        assert!(matches!(
+            fs.upload_part("bkt", "wrong-key", &upload_id, 2, &b"x"[..]).unwrap_err(),
+            StorageError::NoSuchUpload
+        ));
+        // complete to the wrong bucket.
+        assert!(matches!(
+            fs.complete_multipart_upload(
+                "other", "real-key", &upload_id,
+                &[CompletePart { part_number: 1, etag: e1.clone() }],
+            ).unwrap_err(),
+            StorageError::NoSuchUpload
+        ));
+        // abort to the wrong key.
+        assert!(matches!(
+            fs.abort_multipart_upload("bkt", "wrong-key", &upload_id).unwrap_err(),
+            StorageError::NoSuchUpload
+        ));
+        // list_parts to the wrong key.
+        assert!(matches!(
+            fs.list_parts("bkt", "wrong-key", &upload_id).unwrap_err(),
+            StorageError::NoSuchUpload
+        ));
+        // A bogus (non-uuid) upload id.
+        assert!(matches!(
+            fs.upload_part("bkt", "real-key", "../escape", 1, &b"x"[..]).unwrap_err(),
+            StorageError::NoSuchUpload
+        ));
+    }
+
+    #[test]
+    fn multipart_upload_part_rejects_out_of_range_number() {
+        let (_dir, fs) = store();
+        let upload_id = fs
+            .create_multipart_upload("bkt", "k", "", BTreeMap::new())
+            .unwrap();
+        for bad in [0i32, -1, 10_001] {
+            assert!(matches!(
+                fs.upload_part("bkt", "k", &upload_id, bad, &b"x"[..]).unwrap_err(),
+                StorageError::InvalidPart
+            ));
+        }
+    }
+
+    #[test]
+    fn multipart_failed_complete_is_retryable() {
+        // Inject a pre-commit fault into publish (BeforeCommit) on Complete: the
+        // commit must NOT land AND the upload's parts must survive so a SECOND
+        // Complete (without the fault) succeeds (E2).
+        let (dir, fs) = store();
+        let bk = dir.path().join("bkt");
+        let key = "retryable";
+        let (upload_id, parts, etags) = upload_3_parts(&fs, "bkt", key);
+        let complete: Vec<CompletePart> = (0..3)
+            .map(|i| CompletePart { part_number: (i + 1) as i32, etag: etags[i].clone() })
+            .collect();
+
+        set_fault(Some(FaultPoint::BeforeCommit));
+        let res = fs.complete_multipart_upload("bkt", key, &upload_id, &complete);
+        set_fault(None);
+        assert!(res.is_err(), "injected pre-commit fault must fail Complete");
+
+        // The upload is intact: working dir + all 3 part blobs + 3 refs still present.
+        assert!(bk.join("arriving").join(&upload_id).exists());
+        assert_eq!(count_blobs(&bk), 3, "part blobs must survive a failed Complete");
+        assert_eq!(fs.list_parts("bkt", key, &upload_id).unwrap().len(), 3);
+        // Object not published.
+        assert!(matches!(
+            fs.head_object("bkt", key).unwrap_err(),
+            StorageError::ObjectNotFound
+        ));
+
+        // Retry Complete (no fault) -> succeeds and reassembles correctly.
+        let composite = fs.complete_multipart_upload("bkt", key, &upload_id, &complete).unwrap();
+        assert!(composite.ends_with("-3\""));
+        let mut want = Vec::new();
+        for p in &parts {
+            want.extend_from_slice(p);
+        }
+        let got = read_all(fs.get_object("bkt", key, None).unwrap().body);
+        assert_eq!(md5_hex(&got), md5_hex(&want));
+        assert!(!bk.join("arriving").join(&upload_id).exists());
+    }
+
+    #[test]
+    fn list_multipart_uploads_bounded_and_truncated() {
+        let (_dir, fs) = store();
+        // Create 5 uploads across two keys.
+        let mut ids = Vec::new();
+        for i in 0..5 {
+            let key = format!("k{}", i % 2);
+            ids.push(fs.create_multipart_upload("bkt", &key, "", BTreeMap::new()).unwrap());
+        }
+        // Unbounded-ish (cap above count): all 5, not truncated.
+        let (all, trunc) = fs.list_multipart_uploads("bkt", 100).unwrap();
+        assert_eq!(all.len(), 5);
+        assert!(!trunc);
+        // Sorted by (key, upload-id): keys grouped.
+        assert!(all.windows(2).all(|w| w[0].key <= w[1].key));
+
+        // Bounded to 2 -> truncated.
+        let (page, trunc) = fs.list_multipart_uploads("bkt", 2).unwrap();
+        assert_eq!(page.len(), 2);
+        assert!(trunc);
+
+        // Missing bucket -> NoSuchBucket.
+        assert!(matches!(
+            fs.list_multipart_uploads("nope", 10).unwrap_err(),
+            StorageError::BucketNotFound
+        ));
+    }
+
+    #[test]
+    fn parallel_upload_part_is_consistent() {
+        // Concurrent UploadParts of DIFFERENT part numbers to one upload_id must all
+        // land consistently (each writes its own blob + own ref; no shared mutation).
+        use std::sync::Arc;
+        let (dir, fs) = store();
+        let bk = dir.path().join("bkt");
+        let key = "concurrent";
+        let upload_id = fs
+            .create_multipart_upload("bkt", key, "", BTreeMap::new())
+            .unwrap();
+        let fs = Arc::new(fs);
+        let upload_id = Arc::new(upload_id);
+
+        let n = 16;
+        let mut handles = Vec::new();
+        for part in 1..=n {
+            let fs = Arc::clone(&fs);
+            let upload_id = Arc::clone(&upload_id);
+            let key = key.to_string();
+            handles.push(std::thread::spawn(move || {
+                let body = vec![part as u8; 1000 + part as usize];
+                let etag = fs.upload_part("bkt", &key, &upload_id, part, &body[..]).unwrap();
+                (part, body, etag)
+            }));
+        }
+        let mut results: Vec<(i32, Vec<u8>, String)> =
+            handles.into_iter().map(|h| h.join().unwrap()).collect();
+        results.sort_by_key(|r| r.0);
+
+        // Every part landed: n distinct blobs, n refs.
+        assert_eq!(count_blobs(&bk), n as usize);
+        let listed = fs.list_parts("bkt", key, &upload_id).unwrap();
+        assert_eq!(listed.len(), n as usize);
+
+        // Complete with all parts -> reassembles in order.
+        let complete: Vec<CompletePart> = results
+            .iter()
+            .map(|(p, _, e)| CompletePart { part_number: *p, etag: e.clone() })
+            .collect();
+        fs.complete_multipart_upload("bkt", key, &upload_id, &complete).unwrap();
+        let mut want = Vec::new();
+        for (_, body, _) in &results {
+            want.extend_from_slice(body);
+        }
+        let got = read_all(fs.get_object("bkt", key, None).unwrap().body);
+        assert_eq!(got, want);
     }
 }
