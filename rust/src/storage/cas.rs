@@ -192,6 +192,24 @@ pub(crate) fn set_force_put_blob_dir_fsync_fail(v: bool) {
     FORCE_PUT_BLOB_DIR_FSYNC_FAIL.with(|c| c.set(v));
 }
 
+// E-1/E-2 test hook: when armed, the post-commit `current/`-dir fsync in BOTH
+// `publish` (after the commit rename) and `delete_object` (after the manifest
+// unlink), under --fsync, is forced to fail — so a test can prove the error is
+// PROPAGATED (not swallowed) BEFORE step-4 reclaim / step-5 journal-delete. The
+// journal therefore survives, leaving the commit recoverable: recover()'s
+// nonce/key rule settles to a consistent state (OLD version live OR NEW version
+// live, never a dangling manifest / missing blob). Thread-local — never leaks
+// across the parallel test runner. Compiles out entirely in non-test builds.
+#[cfg(test)]
+thread_local! {
+    static FORCE_COMMIT_DIR_FSYNC_FAIL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_force_commit_dir_fsync_fail(v: bool) {
+    FORCE_COMMIT_DIR_FSYNC_FAIL.with(|c| c.set(v));
+}
+
 /// Test-only, DETERMINISTIC injection points that let a test reproduce the exact
 /// two-writer interleaving the per-key publish lock (`lock_key`) exists to
 /// prevent — without any sleeps or timing races. Ported from the (removed)
@@ -737,9 +755,21 @@ impl CasStore {
         (h as usize) & (BUCKET_LOCK_SHARDS - 1)
     }
 
-    /// Bucket WRITE lock (taken only by `delete_bucket`, across check + remove).
+    /// Bucket WRITE lock (taken by `delete_bucket` and `create_bucket` — the two
+    /// bucket-existence mutators — across their check + create/remove).
     fn lock_bucket(&self, bucket: &str) -> std::sync::RwLockWriteGuard<'_, ()> {
         let idx = Self::bucket_lock_shard(bucket);
+        // Test-only contention probe: if the bucket lock is already held (a
+        // delete_bucket/create_bucket parked holding it), record that this mutator is
+        // about to BLOCK before we actually block. Compiled out in production. This is
+        // what lets the E-3 create-vs-delete test prove create_bucket now serializes on
+        // the per-bucket WRITE lock.
+        #[cfg(test)]
+        {
+            if self.bucket_locks[idx].try_write().is_err() {
+                bucket_pause::note_contention(bucket);
+            }
+        }
         self.bucket_locks[idx]
             .write()
             .unwrap_or_else(|p| p.into_inner())
@@ -784,6 +814,17 @@ impl CasStore {
     /// not already exist (S3 BucketExists semantics).
     pub fn create_bucket(&self, name: &str) -> Result<()> {
         validate_bucket_name(name)?;
+
+        // E-3 [MED — concurrency]: take the per-bucket WRITE lock across the existence
+        // mutation. create_bucket and delete_bucket are the two bucket-existence
+        // mutators and MUST serialize on the same lock — otherwise a concurrent
+        // Create+Delete of the same name can BOTH return Ok (lost update: the create's
+        // dir survives a delete that scanned before it, or the create races a teardown).
+        // WRITE (not READ): both mutate existence, so they must be mutually exclusive.
+        // Deadlock-safe: create_bucket takes NO per-key lock, preserving the global
+        // bucket-before-key lock order.
+        let _bguard = self.lock_bucket(name);
+
         let path = self.bucket_root(name);
         match std::fs::create_dir(&path) {
             Ok(()) => {}
@@ -995,6 +1036,11 @@ impl CasStore {
         let _guard = self.lock_key(bucket, key);
         match self.publish(bucket, key, &manifest) {
             Ok(()) => Ok(etag),
+            // E-1: a `CommitNotDurable` means the manifest COMMITTED (rename landed,
+            // new blob durable) but only the post-commit dir fsync failed. The new
+            // version is LIVE, so we must NOT reclaim the new blob — doing so would
+            // strand the live manifest on a missing blob. Propagate the not-acked error.
+            Err(e @ StorageError::CommitNotDurable(_)) => Err(e),
             Err(e) => {
                 // Pre-commit rollback: our new blob is an orphan -> delete it.
                 let _ = blob::reclaim_blob(&bucket_root, &info.blob_id);
@@ -1092,12 +1138,35 @@ impl CasStore {
         }
         super::directio::rename(&staged, &k)?;
         staged_guard.disarm(); // moved away; no longer ours to clean.
-        // Best-effort durability of the rename (post-commit, never rolled back).
+        // E-1 [HIGH — data loss]: PROPAGATE the post-commit `current/`-dir fsync error
+        // (do NOT swallow it) BEFORE step-4 reclaim / step-5 journal-delete. The new
+        // blobs are already durable (write_blob fsynced them). Ordering is rename ->
+        // dir-fsync(PROPAGATE) -> reclaim -> delete-journal: if the rename's dirent is
+        // not yet durable we must NOT reclaim the OLD blobs / delete the journal, else a
+        // crash could revert `current/K` to the OLD manifest whose blobs were already
+        // gone -> a dangling live object / data loss. Returning Err here leaves the
+        // journal in place, so recover() settles it via the §3.2 nonce rule: if the
+        // rename landed, the new manifest's nonce matches -> OLD blobs reclaimed; if the
+        // rename was lost, the nonce mismatches -> OLD blobs kept (OLD version fully
+        // live). The commit is simply NOT acked; both crash branches stay consistent.
         if self.fsync {
             if let Some(parent) = k.parent() {
-                if let Err(e) = super::directio::fsync_dir(parent) {
-                    tracing::warn!(path = %k.display(), error = %e,
-                        "post-commit directory fsync failed; object published, entry may not be crash-durable");
+                let fsync_res = {
+                    #[cfg(test)]
+                    if FORCE_COMMIT_DIR_FSYNC_FAIL.with(|c| c.get()) {
+                        Err(io::Error::other("forced commit-dir fsync failure (test)"))
+                    } else {
+                        super::directio::fsync_dir(parent)
+                    }
+                    #[cfg(not(test))]
+                    super::directio::fsync_dir(parent)
+                };
+                // POST-commit: the rename landed and the new blobs are already durable,
+                // so this is NOT a pre-commit failure — return the DEDICATED
+                // `CommitNotDurable` so the caller does NOT roll back the now-live new
+                // blobs. The journal stays in place; recover()'s nonce rule settles it.
+                if let Err(e) = fsync_res {
+                    return Err(StorageError::CommitNotDurable(e));
                 }
             }
         }
@@ -1180,15 +1249,33 @@ impl CasStore {
         };
         self.write_journal(&jpath, &journal)?;
 
-        // COMMIT: remove the manifest (+ best-effort parent fsync).
+        // COMMIT: remove the manifest, then PROPAGATE the parent dir fsync.
         match std::fs::remove_file(&k) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e.into()),
         }
+        // E-2 [HIGH — data loss]: PROPAGATE the post-remove manifest-parent dir fsync
+        // (do NOT swallow it) BEFORE reclaiming the blobs / deleting the journal. If the
+        // unlink's dirent is not yet durable a crash could RESURRECT the OLD manifest
+        // with its blobs permanently gone. Returning Err here keeps the delete-journal in
+        // place, so recover() settles it via the §4 rule: if the unlink landed (K absent)
+        // the blobs are reclaimed; if it was lost (K present) reclaim is WITHHELD -> OLD
+        // version stays fully live. The delete is simply NOT acked; both branches stay
+        // consistent. (No blob reclaim / journal delete may run until this fsync lands.)
         if self.fsync {
             if let Some(parent) = k.parent() {
-                let _ = super::directio::fsync_dir(parent);
+                let fsync_res = {
+                    #[cfg(test)]
+                    if FORCE_COMMIT_DIR_FSYNC_FAIL.with(|c| c.get()) {
+                        Err(io::Error::other("forced commit-dir fsync failure (test)"))
+                    } else {
+                        super::directio::fsync_dir(parent)
+                    }
+                    #[cfg(not(test))]
+                    super::directio::fsync_dir(parent)
+                };
+                fsync_res?;
             }
         }
 
@@ -2558,9 +2645,19 @@ impl CasStore {
         // — no part data is copied. On a pre-commit failure we ROLL BACK the moves
         // (restoring the blobs to their original ref ids) and return Err WITHOUT having
         // removed the upload dir -> the upload stays RETRYABLE (E2).
-        if let Err(e) = self.publish(&upload.bucket, &upload.key, &manifest) {
-            rollback_moves(&moved);
-            return Err(e);
+        match self.publish(&upload.bucket, &upload.key, &manifest) {
+            Ok(()) => {}
+            // E-1: a `CommitNotDurable` means the manifest COMMITTED (rename landed; the
+            // part blobs already live under their fresh manifest-owned ids) but only the
+            // post-commit dir fsync failed. The new object is LIVE, so we must NOT
+            // rollback_moves (restoring the blobs to their ref ids would strand the live
+            // manifest on missing blobs). The upload dir is left intact; the write is not
+            // acked and recover() settles it. Propagate the not-acked error.
+            Err(e @ StorageError::CommitNotDurable(_)) => return Err(e),
+            Err(e) => {
+                rollback_moves(&moved);
+                return Err(e);
+            }
         }
 
         // C5 [S3 fidelity]: mark the upload COMPLETED before tearing it down. The rmdir
@@ -5893,6 +5990,240 @@ mod tests {
             matches!(res_del, Err(StorageError::Io(_))),
             "C6: a delete that cannot durably journal its reclaim must fail, got {res_del:?}"
         );
+    }
+
+    #[test]
+    fn e1_publish_propagates_commit_dir_fsync_and_withholds_reclaim() {
+        // E-1 [HIGH — data loss], LOAD-BEARING. On an OVERWRITE, publish does:
+        //   rename(staged -> current/K) -> current/-dir fsync -> reclaim OLD blobs ->
+        //   delete journal.
+        // If the post-commit current/-dir fsync is SWALLOWED and execution falls through
+        // to reclaim+delete-journal, a crash can revert current/K to the OLD manifest
+        // whose blobs were already reclaimed and whose journal was already deleted -> a
+        // dangling live object / data loss.
+        //
+        // The FORCE_COMMIT_DIR_FSYNC_FAIL hook forces ONLY that fsync to fail. The fix
+        // PROPAGATES the error (return Err) BEFORE step-4 reclaim / step-5 journal-delete,
+        // so: (1) publish returns Err, (2) the OLD object's blob is NOT reclaimed, (3) the
+        // journal is NOT deleted -> recover() then settles via the §3.2 nonce rule to a
+        // consistent state (OLD live OR NEW live, never a dangling manifest / missing
+        // blob).
+        //
+        // Fail-without-fix: revert to the swallowed `tracing::warn!` (no `?`) and publish
+        // returns Ok despite a non-durable rename; the OLD blob is reclaimed and the
+        // journal deleted -> assertions (2)/(3) FAIL. (And in a real crash recover() could
+        // no longer settle: the live manifest would dangle on a reclaimed blob.)
+        let dir = tempfile::tempdir().unwrap();
+        let fs = CasStore::with_fsync(dir.path(), true); // --fsync ON (the E-1 path)
+        fs.create_bucket("bkt").unwrap();
+        let bk = dir.path().join("bkt");
+
+        // v1: the OLD version. Remember its blob id.
+        fs.put_object("bkt", "k", &b"v1-old-bytes"[..], "", BTreeMap::new())
+            .unwrap();
+        let v1_blob = {
+            let m = manifest::read_manifest(&manifest::manifest_path(&bk.join("current"), "k")).unwrap();
+            m.parts[0].blob_id.clone()
+        };
+        assert_eq!(count_blobs(&bk), 1, "only v1 before the overwrite");
+
+        // Overwrite (v2) with the commit-dir fsync forced to fail.
+        set_force_commit_dir_fsync_fail(true);
+        let res = fs.put_object("bkt", "k", &b"v2-new-and-longer-bytes"[..], "", BTreeMap::new());
+        set_force_commit_dir_fsync_fail(false);
+
+        // (1) The error PROPAGATES out of publish -> put_object as the DEDICATED
+        //     post-commit `CommitNotDurable` (NOT a pre-commit Io error), so put_object
+        //     does NOT roll back the now-live NEW blob.
+        assert!(
+            matches!(res, Err(StorageError::CommitNotDurable(_))),
+            "E-1: an overwrite that cannot durably fsync its commit dir must fail \
+             with CommitNotDurable, got {res:?}"
+        );
+        // (1b) The NEW blob must NOT be reclaimed (the new version is live).
+        let v2_blob = {
+            let m = manifest::read_manifest(&manifest::manifest_path(&bk.join("current"), "k")).unwrap();
+            m.parts[0].blob_id.clone()
+        };
+        assert!(
+            blob::blob_path(&bk, &v2_blob).exists(),
+            "E-1: the NEW (now-live) blob must NOT be reclaimed on a post-commit fsync error"
+        );
+        assert_eq!(count_blobs(&bk), 2, "E-1: both OLD and NEW blobs present (neither reclaimed)");
+        // (2) The OLD blob was NOT reclaimed (reclaim is withheld until the fsync lands).
+        assert!(
+            blob::blob_path(&bk, &v1_blob).exists(),
+            "E-1: the OLD blob must NOT be reclaimed when the commit-dir fsync failed"
+        );
+        // (3) The journal was NOT deleted -> recover() can settle the commit.
+        assert_eq!(
+            list_dir(&bk.join("deleted")).len(),
+            1,
+            "E-1: the publish journal must be kept for recover() when the commit-dir fsync failed"
+        );
+
+        // recover() settles to a CONSISTENT state. The rename landed in this in-process
+        // test (only the fsync was faked), so recover() sees the NEW manifest, whose nonce
+        // matches the journal -> it reclaims the OLD blob and removes the journal. Either
+        // way (OLD or NEW live), the live object must reference NO missing blob.
+        fs.recover().unwrap();
+        assert_object_consistent(&fs, "bkt", "k")
+            .expect("E-1: after recover() the live object must reference no missing blob");
+        assert!(
+            list_dir(&bk.join("deleted")).is_empty(),
+            "E-1: recover() settles and removes the journal"
+        );
+        // The live object is the NEW version (rename had landed) with exactly one blob.
+        assert_eq!(
+            read_all(fs.get_object("bkt", "k", None).unwrap().body),
+            b"v2-new-and-longer-bytes"
+        );
+        assert_eq!(count_blobs(&bk), 1, "E-1: OLD blob reclaimed by recover(); only NEW remains");
+    }
+
+    #[test]
+    fn e2_delete_propagates_commit_dir_fsync_and_withholds_reclaim() {
+        // E-2 [HIGH — data loss], LOAD-BEARING. delete_object does:
+        //   journal blobs -> remove_file(current/K) -> manifest-parent dir fsync ->
+        //   reclaim blobs -> delete journal.
+        // If the post-remove dir fsync is IGNORED (`let _ = ...`) and reclaim follows, a
+        // crash can RESURRECT the OLD manifest (unlink not durable) with its blobs
+        // permanently gone.
+        //
+        // The FORCE_COMMIT_DIR_FSYNC_FAIL hook forces ONLY that fsync to fail. The fix
+        // PROPAGATES the error BEFORE reclaim / journal-delete, so: (1) delete returns Err,
+        // (2) the blobs are NOT reclaimed, (3) the journal is kept -> recover() settles
+        // via the §4 "K absent" rule to a consistent state.
+        //
+        // Fail-without-fix: revert to `let _ = fsync_dir(...)` and delete returns Ok
+        // despite a non-durable unlink; the blob is reclaimed and the journal deleted ->
+        // assertions (2)/(3) FAIL. (And in a real crash a resurrected OLD manifest would
+        // dangle on a reclaimed blob.)
+        let dir = tempfile::tempdir().unwrap();
+        let fs = CasStore::with_fsync(dir.path(), true); // --fsync ON (the E-2 path)
+        fs.create_bucket("bkt").unwrap();
+        let bk = dir.path().join("bkt");
+
+        fs.put_object("bkt", "k", &b"to-be-deleted"[..], "", BTreeMap::new())
+            .unwrap();
+        let blob_id = {
+            let m = manifest::read_manifest(&manifest::manifest_path(&bk.join("current"), "k")).unwrap();
+            m.parts[0].blob_id.clone()
+        };
+        assert_eq!(count_blobs(&bk), 1);
+
+        set_force_commit_dir_fsync_fail(true);
+        let res = fs.delete_object("bkt", "k");
+        set_force_commit_dir_fsync_fail(false);
+
+        // (1) The error PROPAGATES out of delete_object.
+        assert!(
+            matches!(res, Err(StorageError::Io(_))),
+            "E-2: a delete that cannot durably fsync the manifest-parent dir must fail, got {res:?}"
+        );
+        // (2) The blob was NOT reclaimed (withheld until the fsync lands).
+        assert!(
+            blob::blob_path(&bk, &blob_id).exists(),
+            "E-2: the blob must NOT be reclaimed when the commit-dir fsync failed"
+        );
+        // (3) The delete journal was kept for recover().
+        assert_eq!(
+            list_dir(&bk.join("deleted")).len(),
+            1,
+            "E-2: the delete journal must be kept for recover() when the commit-dir fsync failed"
+        );
+
+        // The unlink landed in-process (only the fsync was faked), so K is absent ->
+        // recover()'s §4 rule reclaims the blob and removes the journal. State stays
+        // consistent: no live manifest dangles on a missing blob, no blob leaks.
+        fs.recover().unwrap();
+        assert!(
+            matches!(fs.get_object("bkt", "k", None), Err(StorageError::ObjectNotFound)),
+            "E-2: the object is gone after the (settled) delete"
+        );
+        assert!(
+            !blob::blob_path(&bk, &blob_id).exists(),
+            "E-2: recover() reclaims the deleted object's blob (K absent)"
+        );
+        assert_eq!(count_blobs(&bk), 0, "E-2: no blob leaked after recover()");
+        assert!(
+            list_dir(&bk.join("deleted")).is_empty(),
+            "E-2: recover() settles and removes the journal"
+        );
+    }
+
+    #[test]
+    fn e3_create_bucket_takes_bucket_write_lock_serializing_against_delete() {
+        // E-3 [MED — concurrency], LOAD-BEARING. create_bucket and delete_bucket are the
+        // two bucket-existence mutators; both must take the per-bucket WRITE lock so a
+        // concurrent Create+Delete of the same name SERIALIZES (cannot both return Ok with
+        // the bucket gone — a lost update).
+        //
+        // Interleaving (deterministic, no sleeps): a delete_bucket thread parks HOLDING
+        // the bucket WRITE lock (existing delete_bucket_pause hook). A concurrent
+        // create_bucket of the SAME name must BLOCK on lock_bucket (the new WRITE-lock
+        // contention probe fires). Release the delete: it removes the bucket; the create
+        // then resumes and recreates it. Final state is CONSISTENT — the bucket EXISTS
+        // (the create that ran second wins) and both ops are well-defined, not both-Ok-
+        // with-bucket-gone.
+        //
+        // Fail-without-fix: remove the bucket WRITE lock from create_bucket and the create
+        // no longer blocks — the contention wait TIMES OUT (None), asserted as a clean
+        // failure; and the create races the delete's remove_dir_all (lost update).
+        use std::sync::Arc;
+        let _serial = bucket_pause::serialize_test(); // single global hook slot.
+        let dir = tempfile::tempdir().unwrap();
+        let fs = Arc::new(CasStore::with_fsync(dir.path(), false));
+        fs.create_bucket("bkt").unwrap(); // pre-exists so delete_bucket has something to remove.
+        let bk = dir.path().join("bkt");
+
+        let hook = bucket_pause::Hook::arm("bkt");
+
+        // Thread A: delete_bucket. Parks holding the bucket WRITE lock (bucket empty).
+        let fa = Arc::clone(&fs);
+        let a = std::thread::spawn(move || fa.delete_bucket("bkt"));
+        hook.wait_delete_parked();
+
+        // Thread B: create_bucket of the SAME name. With the WRITE lock it BLOCKS on
+        // lock_bucket; without it, it proceeds and races the delete's remove_dir_all.
+        let fb = Arc::clone(&fs);
+        let b = std::thread::spawn(move || fb.create_bucket("bkt"));
+
+        // A blocked create fires note_contention (via lock_bucket's probe); a lock-free
+        // create never does, so a missing lock TIMES OUT (None) -> clean failure not hang.
+        let contended = hook.wait_writer_contention_timeout(std::time::Duration::from_secs(5));
+
+        let (ra, rb) = match contended {
+            Some(()) => {
+                hook.release();
+                (a.join().unwrap(), b.join().unwrap())
+            }
+            None => {
+                let rb = b.join().unwrap();
+                hook.release();
+                (a.join().unwrap(), rb)
+            }
+        };
+        bucket_pause::Hook::disarm();
+
+        // LOAD-BEARING #1: the create must have BLOCKED on the bucket WRITE lock. Without
+        // the lock this is None (timeout) and fails here.
+        assert!(
+            contended.is_some(),
+            "create_bucket did NOT block on the per-bucket WRITE lock — create_bucket and \
+             delete_bucket are not serialized; a concurrent create can race a bucket teardown"
+        );
+
+        // LOAD-BEARING #2: final state is consistent. The delete removed the bucket; the
+        // create (which ran second, after the delete released the lock) recreated it ->
+        // the bucket EXISTS, with fresh infra. Not both-Ok-with-bucket-gone.
+        assert!(ra.is_ok(), "delete_bucket failed: {ra:?}");
+        assert!(rb.is_ok(), "create_bucket (second) must recreate the removed bucket: {rb:?}");
+        assert!(bk.is_dir(), "the bucket must exist (recreated by the serialized create)");
+        assert!(bk.join("current").is_dir(), "the recreated bucket has its infra dirs");
+        // And it is usable (a put round-trips), proving a consistent, non-half-created state.
+        fs.put_object("bkt", "after", &b"ok"[..], "", BTreeMap::new()).unwrap();
+        assert_eq!(read_all(fs.get_object("bkt", "after", None).unwrap().body), b"ok");
     }
 
     #[test]

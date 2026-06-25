@@ -13,8 +13,8 @@ pub mod types;
 pub use aligned::{AlignedBuf, ALIGN, DEFAULT_BUF_SIZE};
 pub use directio::{fsync_dir, rename, DioFile};
 pub use metadata::{
-    commit_metadata_temp, read_metadata, write_metadata, write_metadata_durable,
-    write_metadata_temp, write_metadata_temp_durable, ObjectMetadata, PartRef,
+    read_metadata, write_metadata, write_metadata_temp, write_metadata_temp_durable,
+    ObjectMetadata, PartRef,
 };
 pub use reader::{parse_range, ByteRange, MultipartReader, PlainFileReader};
 

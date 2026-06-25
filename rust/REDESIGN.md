@@ -190,7 +190,7 @@ PUBLISH(bucket, key, new_manifest):
                   J = deleted/{uuid}.journal   <- list of OLD manifest's blob_ids
                   write J ; fsync J ; fsync(deleted/) (if --fsync)
   3. COMMIT:   rename(A -> K)                  <- ATOMIC. After this, new version live.
-               fsync(parent dir of K)          (if --fsync; best-effort, see note)
+               fsync(parent dir of K)          (if --fsync; PROPAGATE error, see note)
   4. reclaim:  for blob_id in J: delete blobs/xx/yy/{blob_id}
   5. cleanup:  delete J
 ```
@@ -201,10 +201,20 @@ is no moment where K is absent or half-written. The new blobs were already durab
 the old blobs are still on disk and still referenced by nothing live (K now names the
 new manifest) but recorded in J for deterministic reclaim.
 
-> **Note on step 3's dir-fsync:** as in today's `commit_metadata_temp` (D2), the
-> rename is THE commit point; the post-rename `fsync(parent)` is a *best-effort
-> durability* step whose failure is logged (`tracing::warn`) and **swallowed**, never
-> rolled back. The object is published once the rename succeeds.
+> **Note on step 3's dir-fsync (E-1):** the rename is THE commit point, but the
+> post-rename `fsync(parent)` must **PROPAGATE its error** — it must NOT be swallowed,
+> because steps 4/5 (reclaim of the OLD blobs + journal delete) follow it. Swallowing
+> it and then reclaiming would let a crash revert `current/K` to the OLD manifest whose
+> blobs were already reclaimed and whose journal was already deleted → a dangling live
+> object / data loss. So: on a step-3 fsync error, **return without reclaiming or
+> deleting the journal** (a dedicated `CommitNotDurable` error, so the caller does NOT
+> roll back the now-live NEW blobs). The NEW blobs are already durable; the commit is
+> simply NOT acked, and `recover()` settles it via the §3.2 nonce rule — if the rename
+> landed, the new manifest's nonce matches J and the OLD blobs are reclaimed; if the
+> rename was lost, the nonce mismatches and the OLD blobs are kept (OLD version fully
+> live). Both crash branches stay consistent. (The same rule applies to DELETE step 5,
+> §4: propagate the post-remove `fsync(parent)`; withhold reclaim + journal-delete until
+> it succeeds.)
 
 ### 3.1 Crash analysis — PUBLISH
 
@@ -323,7 +333,9 @@ DELETE(bucket, key):
   4. J = deleted/{uuid}.journal = {commit_nonce: NONE_DELETE_SENTINEL,
                                    supersedes_key: key, mode: "delete",
                                    blobs: [old blob ids]} ; fsync J ; fsync(deleted/)
-  5. COMMIT: remove(K) ; fsync(parent) (best-effort)
+  5. COMMIT: remove(K) ; fsync(parent) (if --fsync; PROPAGATE error — E-2: withhold
+             step-6 reclaim + step-7 journal-delete until it succeeds; recover() settles
+             via the "K absent" rule, see §3's note)
   6. reclaim: delete each blob in J
   7. cleanup: delete J
   8. prune now-empty ancestor dirs in current/ up to (not incl.) current/  (as today)

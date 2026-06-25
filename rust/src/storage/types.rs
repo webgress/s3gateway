@@ -56,6 +56,17 @@ pub enum StorageError {
     /// to 500 `InternalError`. See `map_storage_error`.
     #[error("incomplete request body")]
     IncompleteBody,
+    /// E-1: the object's manifest WAS committed (the atomic rename into `current/`
+    /// landed and the new blobs are already durable), but the post-commit
+    /// `current/`-dir fsync FAILED, so the directory entry is not yet proven
+    /// crash-durable. The write is therefore NOT acked to the client (maps to 500
+    /// InternalError — retryable), but unlike a pre-commit failure the caller MUST
+    /// NOT roll back the new blobs: the new version is live, and `recover()`'s
+    /// nonce rule settles the superseded blobs on the next start. Distinct from
+    /// `Io` solely so the two `publish` callers can suppress their new-blob
+    /// rollback for this one post-commit case.
+    #[error("commit not durable (manifest committed, dir fsync failed)")]
+    CommitNotDurable(#[source] io::Error),
     #[error("io error: {0}")]
     Io(#[from] io::Error),
 }

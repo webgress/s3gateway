@@ -7,7 +7,7 @@
 //! used by the journal/sweep "did my commit land?" check (REDESIGN §3.2).
 //!
 //! The manifest is published by an atomic temp+rename (ported from the old
-//! `write_metadata_temp_durable`/`commit_metadata_temp` discipline), so a reader's
+//! `write_metadata_temp_durable` + rename discipline), so a reader's
 //! `open`+`read` of `current/K.meta` always observes a consistent snapshot — the
 //! pre-rename inode or the post-rename inode, never a torn file.
 

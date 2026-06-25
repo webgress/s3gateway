@@ -242,6 +242,9 @@ pub fn map_storage_error(e: &StorageError) -> S3ErrorCode {
         // (read_metadata / assert_upload_matches, reached by GET/HEAD/LIST/complete),
         // so it must stay a 500 InternalError — not be mis-reported as a client error.
         StorageError::IncompleteBody => S3ErrorCode::IncompleteBody,
+        // E-1: a committed-but-not-durably-fsynced publish — the write is NOT acked
+        // (the client must retry), same client-facing status as a generic Io error.
+        StorageError::CommitNotDurable(_) => S3ErrorCode::InternalError,
         StorageError::Io(_) => S3ErrorCode::InternalError,
     }
 }

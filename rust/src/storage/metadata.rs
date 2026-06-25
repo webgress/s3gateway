@@ -53,11 +53,10 @@ impl ObjectMetadata {
 
 /// Write metadata atomically (temp file + rename), matching the Go impl.
 ///
-/// This is the non-durable variant (no fsync). For crash-safe publication use
-/// [`write_metadata_durable`], which fsyncs the sidecar before rename. The
-/// `.tmp` suffix here would collide with the list-scan's `.tmp.` skip filter, so
-/// it is deliberately a plain `.tmp` (no trailing dot) and the sidecar itself is
-/// never returned by listings (it ends in `.s3meta`).
+/// This is the non-durable variant (no fsync). The `.tmp` suffix here would
+/// collide with the list-scan's `.tmp.` skip filter, so it is deliberately a
+/// plain `.tmp` (no trailing dot) and the sidecar itself is never returned by
+/// listings (it ends in `.s3meta`).
 pub fn write_metadata(path: &Path, meta: &ObjectMetadata) -> io::Result<()> {
     let data = serde_json::to_vec_pretty(meta).map_err(io::Error::other)?;
     let tmp = with_suffix(path, ".tmp");
@@ -71,47 +70,11 @@ pub fn write_metadata(path: &Path, meta: &ObjectMetadata) -> io::Result<()> {
     }
 }
 
-/// Write metadata atomically AND durably: write the temp sidecar, fsync its
-/// bytes to stable storage, rename it into place, then fsync the parent
-/// directory so the rename (the new directory entry) survives a crash. Use this
-/// on the object-publication path when `--fsync` is enabled.
-pub fn write_metadata_durable(path: &Path, meta: &ObjectMetadata) -> io::Result<()> {
-    use super::directio::{fsync_dir, DioFile};
-    let data = serde_json::to_vec_pretty(meta).map_err(io::Error::other)?;
-    let tmp = with_suffix(path, ".tmp");
-    {
-        let f = DioFile::create_write(&tmp)?;
-        let mut off = 0u64;
-        let mut buf: &[u8] = &data;
-        while !buf.is_empty() {
-            let n = f.pwrite_at(buf, off)?;
-            if n == 0 {
-                let _ = std::fs::remove_file(&tmp);
-                return Err(io::Error::new(io::ErrorKind::WriteZero, "pwrite wrote 0"));
-            }
-            off += n as u64;
-            buf = &buf[n..];
-        }
-        f.fsync()?;
-    }
-    match std::fs::rename(&tmp, path) {
-        Ok(()) => {}
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(e);
-        }
-    }
-    if let Some(parent) = path.parent() {
-        fsync_dir(parent)?;
-    }
-    Ok(())
-}
-
 /// Write a metadata sidecar to an explicit temp path and fsync its bytes to
 /// stable storage, WITHOUT renaming it into place. Used by the multipart-complete
 /// commit sequence (C1), where the sidecar rename is deferred to be the LAST
 /// durable step so nothing the prior object's live sidecar references changes
-/// until the new sidecar is committed. Pair with [`commit_metadata_temp`].
+/// until the new sidecar is committed. Pair with a subsequent atomic rename.
 pub fn write_metadata_temp_durable(tmp: &Path, meta: &ObjectMetadata) -> io::Result<()> {
     use super::directio::DioFile;
     let data = serde_json::to_vec_pretty(meta).map_err(io::Error::other)?;
@@ -137,56 +100,6 @@ pub fn write_metadata_temp_durable(tmp: &Path, meta: &ObjectMetadata) -> io::Res
 pub fn write_metadata_temp(tmp: &Path, meta: &ObjectMetadata) -> io::Result<()> {
     let data = serde_json::to_vec_pretty(meta).map_err(io::Error::other)?;
     std::fs::write(tmp, &data)
-}
-
-/// Commit a previously-staged temp sidecar (from [`write_metadata_temp_durable`]
-/// or [`write_metadata_temp`]) by RENAMING it into place at `path`. The rename is
-/// THE COMMIT POINT — its `Err` is the ONLY signal a caller should treat as a
-/// pre-commit failure and roll back data/parts on. After a SUCCESSFUL rename the
-/// new sidecar is already live, so this returns `Ok(())` even if the subsequent
-/// best-effort directory fsync (for crash durability) fails.
-///
-/// D2: the previous version fsync'd the parent dir AFTER the rename and returned
-/// that fsync's `Err`, which both callers (put_object, complete) treated as
-/// pre-commit and rolled back data/parts — leaving the (already-live) new sidecar
-/// describing rolled-back data (sidecar/data mismatch). The rename is now the sole
-/// rollback-triggering step; the dir fsync is a SEPARATE best-effort durability
-/// step ([`fsync_commit_dir`]) whose failure is logged, never rolled back.
-pub fn commit_metadata_temp(tmp: &Path, path: &Path, durable: bool) -> io::Result<()> {
-    match std::fs::rename(tmp, path) {
-        Ok(()) => {}
-        Err(e) => {
-            let _ = std::fs::remove_file(tmp);
-            return Err(e);
-        }
-    }
-    // The sidecar is now live (the commit succeeded). Make the rename durable with
-    // a BEST-EFFORT parent-dir fsync — a failure here is a durability warning, NOT
-    // a commit failure, so it must not propagate as an Err that triggers rollback.
-    if durable {
-        if let Some(parent) = path.parent() {
-            fsync_commit_dir(parent, path);
-        }
-    }
-    Ok(())
-}
-
-/// D2: best-effort post-commit parent-dir fsync. The sidecar rename has already
-/// committed the object; this only improves crash durability of the rename. A
-/// failure is logged (tracing::warn) and SWALLOWED — the object is published and
-/// must not be rolled back. Separated from the rename so the rename's `Err`
-/// remains the sole rollback-triggering signal for callers.
-fn fsync_commit_dir(parent: &Path, committed: &Path) {
-    use super::directio::fsync_dir;
-    let res = fsync_dir(parent);
-    if let Err(e) = res {
-        tracing::warn!(
-            path = %committed.display(),
-            error = %e,
-            "post-commit directory fsync failed; object is published but the \
-             directory entry may not be crash-durable"
-        );
-    }
 }
 
 /// Read+parse a metadata sidecar.
