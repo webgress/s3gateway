@@ -3023,6 +3023,24 @@ impl CasStore {
             );
         }
 
+        // Pass J [LOW — dirent durability]: make the `completed` marker's DIRENT durable
+        // (mirrors create_multipart_upload's fsync_dir at the upload.json site) so a crash
+        // before the best-effort rmdir cannot lose the dirent and re-expose the completed
+        // uploadId as in-flight. Non-fatal: the object is already durably published, so this
+        // is a hygiene backstop, not a commit gate. MUST come BEFORE the remove_dir_all below
+        // (the rmdir already tolerates a surviving dir).
+        if self.fsync {
+            #[cfg(test)]
+            bump_pass_i_fsync();
+            if let Err(e) = super::directio::fsync_dir(&upload_dir) {
+                tracing::warn!(
+                    upload_id = %upload_id,
+                    error = %e,
+                    "could not fsync the completed-marker dir (object is live)"
+                );
+            }
+        }
+
         // Success: remove the upload working dir. This is now SAFE as best-effort — the
         // upload's `.ref`s point at the moved-away (ENOENT) original ids, so even if the
         // rmdir fails (or a crash hits here) any later abort/gc/Complete-RETRY reclaim
@@ -6886,6 +6904,53 @@ mod tests {
             !dir.path().join("bkt").exists(),
             "delete_bucket must remove the bucket dir"
         );
+    }
+
+    #[test]
+    fn pass_j_complete_fsyncs_completed_marker_dir_under_fsync() {
+        // J [LOW — dirent durability], LOAD-BEARING. CompleteMultipartUpload writes a
+        // `completed` marker file (its BYTES fsynced under --fsync) but, pre-J, did NOT
+        // fsync the marker's PARENT dir — so a crash before the best-effort rmdir could
+        // lose the dirent and re-expose the completed uploadId as in-flight. The J fix adds
+        // an fsync_dir(&upload_dir) (mirroring create_multipart_upload's upload.json site)
+        // gated on --fsync, wired to the pass-I fsync counter. A crash is not unit-testable,
+        // so we assert the marker-dir fsync RAN: the pass-I counter must increase across
+        // Complete by MORE than it would without the J block.
+        //
+        // Fail-without-fix: remove the new `bump_pass_i_fsync()` + fsync_dir(&upload_dir)
+        // block and the post-Complete counter drops by 1, so `after >= before + EXPECTED`
+        // FAILS.
+        let dir = tempfile::tempdir().unwrap();
+        let fs = CasStore::with_fsync(dir.path(), true); // --fsync ON (fsync store)
+        fs.create_bucket("bkt").unwrap();
+        let key = "j/mp/object.bin";
+        let (upload_id, parts, etags) = upload_3_parts(&fs, "bkt", key);
+
+        let complete: Vec<CompletePart> = (0..3)
+            .map(|i| CompletePart { part_number: (i + 1) as i32, etag: etags[i].clone() })
+            .collect();
+
+        let before = pass_i_fsync_count();
+        fs.complete_multipart_upload("bkt", key, &upload_id, &complete).unwrap();
+        let after = pass_i_fsync_count();
+
+        // The new marker-dir fsync contributes EXACTLY +1 to the pass-I counter beyond any
+        // pre-existing blob/commit fsyncs that also bump it. Assert STRICTLY GREATER so the
+        // J block is load-bearing regardless of how many other sites bumped during Complete.
+        assert!(
+            after > before,
+            "J: Complete under --fsync must fsync the completed-marker dir \
+             (pass-I counter must increase): before={before} after={after}"
+        );
+
+        // The object is still durably published and round-trips bit-for-bit.
+        let mut want = Vec::new();
+        for p in &parts {
+            want.extend_from_slice(p);
+        }
+        let got = read_all(fs.get_object("bkt", key, None).unwrap().body);
+        assert_eq!(got, want, "J: Complete must still round-trip the assembled object");
+        assert_object_consistent(&fs, "bkt", key).unwrap();
     }
 
     #[test]
