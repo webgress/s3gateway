@@ -716,6 +716,89 @@ mod upload_part_pause {
     }
 }
 
+/// Codex pass H deterministic test hook: a one-barrier handshake that parks
+/// `complete_multipart_upload` AFTER its pre-lock upload validation
+/// (`assert_upload_matches`) but BEFORE it takes the bucket READ + per-key locks and
+/// calls `read_part_refs`. A test arms it for one `{bucket}/{key}`, parks an in-flight
+/// Complete there, then (deterministically) ABORTS the upload (removing the upload
+/// dir) in the exact window the H re-check guards, then releases Complete. With the H
+/// fix the resumed Complete re-checks the upload UNDER the per-key lock, finds the dir
+/// gone, and returns NoSuchUpload; without it `read_part_refs` returns an empty map and
+/// Complete reports InvalidPart for the (now-missing) claimed parts. No-op outside tests.
+#[inline(always)]
+fn complete_pre_lock_pause(_bucket: &str, _key: &str) {
+    #[cfg(test)]
+    complete_pause::pause(_bucket, _key);
+}
+
+#[cfg(test)]
+mod complete_pause {
+    use std::sync::{Condvar, Mutex, OnceLock};
+
+    pub(super) struct Hook {
+        pub key: String,
+        state: Mutex<State>,
+        cv: Condvar,
+    }
+    #[derive(Default)]
+    struct State {
+        arrived: bool,
+        released: bool,
+    }
+
+    static HOOK: OnceLock<Mutex<Option<&'static Hook>>> = OnceLock::new();
+    static SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn slot() -> &'static Mutex<Option<&'static Hook>> {
+        HOOK.get_or_init(|| Mutex::new(None))
+    }
+
+    pub(super) fn serialize_test() -> std::sync::MutexGuard<'static, ()> {
+        SERIAL.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    impl Hook {
+        pub(super) fn arm(bucket: &str, key: &str) -> &'static Hook {
+            let h = Box::leak(Box::new(Hook {
+                key: format!("{bucket}/{key}"),
+                state: Mutex::new(State::default()),
+                cv: Condvar::new(),
+            }));
+            *slot().lock().unwrap() = Some(h);
+            h
+        }
+        pub(super) fn disarm() {
+            *slot().lock().unwrap() = None;
+        }
+        /// Block until Complete has parked at the pre-lock point.
+        pub(super) fn wait_arrived(&self) {
+            let mut st = self.state.lock().unwrap();
+            while !st.arrived {
+                st = self.cv.wait(st).unwrap();
+            }
+        }
+        pub(super) fn release(&self) {
+            let mut st = self.state.lock().unwrap();
+            st.released = true;
+            self.cv.notify_all();
+        }
+    }
+
+    pub(super) fn pause(bucket: &str, key: &str) {
+        let hook = { *slot().lock().unwrap() };
+        let Some(hook) = hook else { return };
+        if hook.key != format!("{bucket}/{key}") {
+            return;
+        }
+        let mut st = hook.state.lock().unwrap();
+        st.arrived = true;
+        hook.cv.notify_all();
+        while !st.released {
+            st = hook.cv.wait(st).unwrap();
+        }
+    }
+}
+
 /// Content-addressed store rooted at `root` (the data dir).
 #[derive(Debug, Clone)]
 pub struct CasStore {
@@ -2622,6 +2705,12 @@ impl CasStore {
         // Defense in depth: re-validate the upload's stored bucket/key.
         self.validate_object_path(&upload.bucket, &upload.key)?;
 
+        // H deterministic test hook: park here AFTER the pre-lock validation but BEFORE
+        // acquiring the bucket READ + per-key locks, so a test can deterministically
+        // ABORT the upload (removing the upload dir) in the exact window the H re-check
+        // below guards. No-op in production.
+        complete_pre_lock_pause(&upload.bucket, &upload.key);
+
         // F/B5: empty parts list is not a valid completion.
         if parts.is_empty() {
             return Err(StorageError::InvalidPart);
@@ -2654,6 +2743,21 @@ impl CasStore {
         // are immutable at unique paths, but the lock still serializes the manifest
         // swap + journal creation, §9).
         let _guard = self.lock_key(&upload.bucket, &upload.key);
+
+        // H [LOW — S3 error code on a concurrent race]: RE-CHECK the upload UNDER the
+        // per-key lock before reading its part refs. The `assert_upload_matches` above
+        // ran BEFORE this lock; a concurrent Abort/Complete on the SAME key (which holds
+        // this very lock across its remove_dir_all) could have removed the upload dir in
+        // the window between that validation and now. Without this re-check `read_part_refs`
+        // would see the gone parts/ dir, return an EMPTY map, and the per-part lookup would
+        // report `InvalidPart` — the wrong S3 error for a vanished upload. Re-running
+        // `assert_upload_matches` under the lock maps a removed/completed upload to the
+        // correct `NoSuchUpload`. Once it passes, the per-key lock keeps the dir present
+        // for the rest of this critical section (the racing Abort/Complete must take the
+        // SAME lock to remove it). A genuine upload with NO parts uploaded still passes
+        // this re-check (the dir + upload.json exist) and falls through to the existing
+        // `InvalidPart` path on the per-part lookup below — preserving that distinction.
+        self.assert_upload_matches(&upload_dir, &upload.bucket, &upload.key)?;
         let stored = Self::read_part_refs(&upload_dir)?;
         let bucket_root = self.bucket_root(&upload.bucket);
 
@@ -7079,6 +7183,126 @@ mod tests {
             fs.complete_multipart_upload("bkt", "k", &bogus, &complete).unwrap_err(),
             StorageError::NoSuchUpload
         ));
+    }
+
+    #[test]
+    fn h_complete_racing_abort_returns_no_such_upload_not_invalid_part() {
+        // Codex pass H [LOW — S3 error code on a concurrent race], LOAD-BEARING.
+        // `complete_multipart_upload` validates the upload (assert_upload_matches) PRE-lock,
+        // then takes the per-key lock and calls read_part_refs. A concurrent Abort that
+        // removes the upload dir in that window makes read_part_refs return an EMPTY map,
+        // so the per-part lookup reports InvalidPart — the WRONG error for a vanished
+        // upload (should be NoSuchUpload).
+        //
+        // Deterministic interleaving (no sleeps): a Complete thread parks at the H pre-lock
+        // hook (after pre-lock validation, before the bucket/per-key locks). The main thread
+        // then ABORTS the upload (which takes the per-key lock — free, since Complete has
+        // not taken it yet — and removes the upload dir). Releasing Complete: with the fix it
+        // takes the per-key lock, re-checks the upload, finds the dir gone, and returns
+        // NoSuchUpload.
+        //
+        // Fail-without-fix: remove the post-lock `assert_upload_matches` re-check in
+        // complete_multipart_upload and the resumed Complete's read_part_refs returns an
+        // empty map -> the per-part lookup yields InvalidPart -> this assertion FAILS.
+        use std::sync::Arc;
+        let _serial = complete_pause::serialize_test(); // single global hook slot.
+        let dir = tempfile::tempdir().unwrap();
+        let fs = Arc::new(CasStore::with_fsync(dir.path(), false));
+        fs.create_bucket("bkt").unwrap();
+        let bk = dir.path().join("bkt");
+        let key = "h/object";
+        let upload_id = fs
+            .create_multipart_upload("bkt", key, "application/octet-stream", BTreeMap::new())
+            .unwrap();
+        let etag = fs.upload_part("bkt", key, &upload_id, 1, &vec![7u8; 4096][..]).unwrap();
+
+        let hook = complete_pause::Hook::arm("bkt", key);
+
+        // Thread C: Complete. Parks at the pre-lock hook (validation already passed).
+        let fc = Arc::clone(&fs);
+        let uid = upload_id.clone();
+        let et = etag.clone();
+        let c = std::thread::spawn(move || {
+            fc.complete_multipart_upload(
+                "bkt",
+                "h/object",
+                &uid,
+                &[CompletePart { part_number: 1, etag: et }],
+            )
+        });
+        hook.wait_arrived();
+
+        // While C is parked: abort the upload (removes the whole upload dir under the
+        // per-key lock — uncontended, C has not taken it yet).
+        fs.abort_multipart_upload("bkt", key, &upload_id).unwrap();
+        assert!(
+            !bk.join("arriving").join(&upload_id).exists(),
+            "the upload dir must be gone after a successful Abort"
+        );
+
+        // Release C: with the H fix it takes the per-key lock, re-checks the upload, and
+        // returns NoSuchUpload.
+        hook.release();
+        let res = c.join().unwrap();
+        complete_pause::Hook::disarm();
+
+        assert!(
+            matches!(res, Err(StorageError::NoSuchUpload)),
+            "H: Complete racing a concurrent Abort (upload removed before read_part_refs) \
+             must return NoSuchUpload, not InvalidPart, got {res:?}"
+        );
+        // The Abort reclaimed the only part blob; Complete published nothing.
+        assert_eq!(count_blobs(&bk), 0, "H: no blob may leak / be published on the lost race");
+        assert!(
+            matches!(fs.get_object("bkt", key, None), Err(StorageError::ObjectNotFound)),
+            "H: nothing must be published for the raced-away upload"
+        );
+    }
+
+    #[test]
+    fn h_complete_empty_and_bad_parts_still_invalid_part() {
+        // H boundary: the re-check must NOT turn the genuinely-empty-parts case (a real,
+        // present upload with NO parts uploaded) OR the bad-part case into NoSuchUpload —
+        // both stay InvalidPart. This proves the fix distinguishes "upload dir gone ->
+        // NoSuchUpload" from "upload exists but no/unknown parts -> InvalidPart".
+        let (_dir, fs) = store();
+        let key = "h/empty";
+        let upload_id = fs
+            .create_multipart_upload("bkt", key, "", BTreeMap::new())
+            .unwrap();
+
+        // Upload exists, but the client claims a part that was never uploaded -> InvalidPart
+        // (read_part_refs returns an empty map for the present-but-partless upload, and the
+        // per-part lookup misses).
+        let claim = vec![CompletePart { part_number: 1, etag: "\"deadbeef\"".to_string() }];
+        assert!(
+            matches!(
+                fs.complete_multipart_upload("bkt", key, &upload_id, &claim).unwrap_err(),
+                StorageError::InvalidPart
+            ),
+            "a present upload with no uploaded parts must be InvalidPart, not NoSuchUpload"
+        );
+
+        // Upload part 1, then claim a WRONG etag -> InvalidPart (upload present).
+        let etag = fs.upload_part("bkt", key, &upload_id, 1, &b"abc"[..]).unwrap();
+        let _ = etag;
+        let bad = vec![CompletePart { part_number: 1, etag: "\"00000000\"".to_string() }];
+        assert!(
+            matches!(
+                fs.complete_multipart_upload("bkt", key, &upload_id, &bad).unwrap_err(),
+                StorageError::InvalidPart
+            ),
+            "a present upload with a mismatched part etag must be InvalidPart, not NoSuchUpload"
+        );
+
+        // An empty parts list is still InvalidPart (pre-lock guard, upload present).
+        assert!(
+            matches!(
+                fs.complete_multipart_upload("bkt", key, &upload_id, &[]).unwrap_err(),
+                StorageError::InvalidPart
+            ),
+            "an empty parts list must be InvalidPart, not NoSuchUpload"
+        );
     }
 
     #[test]
