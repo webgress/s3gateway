@@ -2359,6 +2359,14 @@ impl CasStore {
         if !(1..=10_000).contains(&part_number) {
             return Err(StorageError::InvalidPart);
         }
+        // G [LOW — S3 error precedence]: prove the bucket exists BEFORE resolving the
+        // upload dir, so a request against a MISSING bucket gets NoSuchBucket (not
+        // NoSuchUpload), matching S3 and put_object/create_multipart_upload. head_bucket
+        // takes NO lock (lock-free symlink_metadata), so it runs ahead of the per-bucket
+        // / per-key locks below without touching the lock ordering. (The bucket may still
+        // race away after this check; the F-3 head_bucket re-check UNDER the bucket READ
+        // lock below remains the authority — this only fixes the FIRST error code.)
+        self.head_bucket(bucket)?;
         let upload_dir = self.upload_dir(bucket, upload_id)?;
         let upload = self.assert_upload_matches(&upload_dir, bucket, key)?;
 
@@ -2601,6 +2609,13 @@ impl CasStore {
         upload_id: &str,
         parts: &[CompletePart],
     ) -> Result<String> {
+        // G [LOW — S3 error precedence]: prove the bucket exists BEFORE resolving the
+        // upload dir, so a MISSING bucket yields NoSuchBucket (not NoSuchUpload), matching
+        // S3. head_bucket is lock-free, so it runs ahead of the bucket READ + per-key
+        // locks below without touching the lock ordering. The authoritative re-check stays
+        // the head_bucket UNDER the bucket READ lock below (A3); this only fixes the FIRST
+        // error code for an absent bucket.
+        self.head_bucket(bucket)?;
         let upload_dir = self.upload_dir(bucket, upload_id)?;
         // B4: cross-check the request path matches the upload.
         let upload = self.assert_upload_matches(&upload_dir, bucket, key)?;
@@ -2834,6 +2849,11 @@ impl CasStore {
     /// and remove the working dir. Signature identical to
     /// `Filesystem::abort_multipart_upload`.
     pub fn abort_multipart_upload(&self, bucket: &str, key: &str, upload_id: &str) -> Result<()> {
+        // G [LOW — S3 error precedence]: prove the bucket exists BEFORE resolving the
+        // upload dir, so a MISSING bucket yields NoSuchBucket (not NoSuchUpload), matching
+        // S3. (Abort previously never called head_bucket at all.) head_bucket is lock-free,
+        // so it runs ahead of the per-key lock below without touching the lock ordering.
+        self.head_bucket(bucket)?;
         let upload_dir = self.upload_dir(bucket, upload_id)?;
         let upload = self.assert_upload_matches(&upload_dir, bucket, key)?;
         let bucket_root = self.bucket_root(bucket);
@@ -2870,6 +2890,11 @@ impl CasStore {
     /// ListParts: the stored part refs as `PartInfo`, sorted by part number.
     /// Signature identical to `Filesystem::list_parts`.
     pub fn list_parts(&self, bucket: &str, key: &str, upload_id: &str) -> Result<Vec<PartInfo>> {
+        // G [LOW — S3 error precedence]: prove the bucket exists BEFORE resolving the
+        // upload dir, so a MISSING bucket yields NoSuchBucket (not NoSuchUpload), matching
+        // S3. (ListParts previously never called head_bucket at all.) head_bucket is
+        // lock-free; ListParts takes no other lock, so this changes no lock ordering.
+        self.head_bucket(bucket)?;
         let upload_dir = self.upload_dir(bucket, upload_id)?;
         self.assert_upload_matches(&upload_dir, bucket, key)?;
         let refs = Self::read_part_refs(&upload_dir)?;
@@ -6994,6 +7019,112 @@ mod tests {
         // A bogus (non-uuid) upload id.
         assert!(matches!(
             fs.upload_part("bkt", "real-key", "../escape", 1, &b"x"[..]).unwrap_err(),
+            StorageError::NoSuchUpload
+        ));
+    }
+
+    // ----- Codex pass G: multipart ops check head_bucket first (NoSuchBucket precedence)
+    //
+    // Each test proves the FIRST error for a request against a MISSING bucket is
+    // NoSuchBucket (BucketNotFound), NOT NoSuchUpload — matching S3 and the other
+    // handlers — while the normal path (existing bucket, missing/wrong upload) still
+    // yields NoSuchUpload. The upload id used for the "missing bucket" case is a VALID
+    // uuid (so upload_dir's parse succeeds): without the up-front head_bucket the op
+    // would resolve the (absent) upload dir and return NoSuchUpload.
+
+    #[test]
+    fn g_upload_part_missing_bucket_is_no_such_bucket() {
+        let (_dir, fs) = store();
+        // A live upload in the real bucket gives us a valid uuid to reuse.
+        let upload_id = fs
+            .create_multipart_upload("bkt", "k", "", BTreeMap::new())
+            .unwrap();
+
+        // Missing bucket -> NoSuchBucket (precedence), NOT NoSuchUpload.
+        assert!(
+            matches!(
+                fs.upload_part("nope", "k", &upload_id, 1, &b"x"[..]).unwrap_err(),
+                StorageError::BucketNotFound
+            ),
+            "upload_part against a missing bucket must be NoSuchBucket, not NoSuchUpload"
+        );
+        // Existing bucket, missing upload -> still NoSuchUpload.
+        let bogus = Uuid::new_v4().to_string();
+        assert!(matches!(
+            fs.upload_part("bkt", "k", &bogus, 1, &b"x"[..]).unwrap_err(),
+            StorageError::NoSuchUpload
+        ));
+    }
+
+    #[test]
+    fn g_complete_missing_bucket_is_no_such_bucket() {
+        let (_dir, fs) = store();
+        let upload_id = fs
+            .create_multipart_upload("bkt", "k", "", BTreeMap::new())
+            .unwrap();
+        let etag = fs.upload_part("bkt", "k", &upload_id, 1, &b"x"[..]).unwrap();
+        let complete = vec![CompletePart { part_number: 1, etag: etag.clone() }];
+
+        // Missing bucket -> NoSuchBucket (precedence), NOT NoSuchUpload.
+        assert!(
+            matches!(
+                fs.complete_multipart_upload("nope", "k", &upload_id, &complete).unwrap_err(),
+                StorageError::BucketNotFound
+            ),
+            "complete against a missing bucket must be NoSuchBucket, not NoSuchUpload"
+        );
+        // Existing bucket, missing upload -> still NoSuchUpload.
+        let bogus = Uuid::new_v4().to_string();
+        assert!(matches!(
+            fs.complete_multipart_upload("bkt", "k", &bogus, &complete).unwrap_err(),
+            StorageError::NoSuchUpload
+        ));
+    }
+
+    #[test]
+    fn g_abort_missing_bucket_is_no_such_bucket() {
+        let (_dir, fs) = store();
+        let upload_id = fs
+            .create_multipart_upload("bkt", "k", "", BTreeMap::new())
+            .unwrap();
+
+        // Missing bucket -> NoSuchBucket (precedence). Abort previously never called
+        // head_bucket at all, so without the fix this returned NoSuchUpload.
+        assert!(
+            matches!(
+                fs.abort_multipart_upload("nope", "k", &upload_id).unwrap_err(),
+                StorageError::BucketNotFound
+            ),
+            "abort against a missing bucket must be NoSuchBucket, not NoSuchUpload"
+        );
+        // Existing bucket, missing upload -> still NoSuchUpload.
+        let bogus = Uuid::new_v4().to_string();
+        assert!(matches!(
+            fs.abort_multipart_upload("bkt", "k", &bogus).unwrap_err(),
+            StorageError::NoSuchUpload
+        ));
+    }
+
+    #[test]
+    fn g_list_parts_missing_bucket_is_no_such_bucket() {
+        let (_dir, fs) = store();
+        let upload_id = fs
+            .create_multipart_upload("bkt", "k", "", BTreeMap::new())
+            .unwrap();
+
+        // Missing bucket -> NoSuchBucket (precedence). ListParts previously never called
+        // head_bucket at all, so without the fix this returned NoSuchUpload.
+        assert!(
+            matches!(
+                fs.list_parts("nope", "k", &upload_id).unwrap_err(),
+                StorageError::BucketNotFound
+            ),
+            "list_parts against a missing bucket must be NoSuchBucket, not NoSuchUpload"
+        );
+        // Existing bucket, missing upload -> still NoSuchUpload.
+        let bogus = Uuid::new_v4().to_string();
+        assert!(matches!(
+            fs.list_parts("bkt", "k", &bogus).unwrap_err(),
             StorageError::NoSuchUpload
         ));
     }
