@@ -196,24 +196,32 @@ pub(crate) fn take_fsync_dir_calls() -> usize {
     })
 }
 
-/// C1 [HIGH — durability]: fsync a blob's fanout PARENT dir (`blobs/{ab}/{cd}/`) so
-/// the blob's DIRENT — not just its file bytes — is durable. `write_blob` /
-/// `move_blob_to_new_id` fsync the blob FILE (and create its two fanout dirs), but a
-/// crash can still lose the just-created DIRENT in the fanout parent. The caller MUST
-/// invoke this (under `--fsync`) AFTER writing/moving the blob and BEFORE committing
-/// the manifest that references it (`publish`), so the blob is reachable on disk
-/// before the manifest points at it — otherwise a durable manifest can reference a
-/// blob whose dirent was lost (a dangling live object).
+/// C1 [HIGH — durability] + Codex pass F-1: fsync the blob's fanout DIRENT chain so
+/// the blob's directory entries — not just its file bytes — are durable. `write_blob`
+/// / `move_blob_to_new_id` fsync the blob FILE (and `create_dir_all` its two fanout
+/// dirs), but a crash can still lose a just-created DIRENT anywhere in the fanout
+/// chain. The caller MUST invoke this (under `--fsync`) AFTER writing/moving the blob
+/// and BEFORE committing the manifest that references it (`publish`), so the blob is
+/// reachable on disk before the manifest points at it — otherwise a durable manifest
+/// can reference a blob whose dirent was lost (a dangling live object).
 ///
-/// Best-effort on the missing-parent case (the parent always exists post-write); a
-/// genuine fsync error is propagated so the caller fails BEFORE the commit rather
+/// F-1 [HIGH]: fsyncing ONLY the leaf fanout dir (`blobs/{ab}/{cd}/`) is insufficient.
+/// For the FIRST blob landing in a fresh fanout, `create_dir_all` also creates
+/// `blobs/{ab}/` (and possibly `blobs/`); those newly-created intermediate DIRENTS are
+/// not fsynced by a leaf-only fsync, so a crash can lose the path to a first-in-fanout
+/// blob while a committed manifest references it. We therefore fsync the WHOLE chain
+/// from the leaf fanout dir up to (and including) `bucket_root/blobs` — which is made
+/// durable by ensure_infra (site-4), so it is the already-durable stop_at boundary.
+///
+/// A genuine fsync error is propagated so the caller fails BEFORE the commit rather
 /// than acking a non-durable blob.
 pub fn fsync_blob_dir(bucket_root: &Path, blob_id: &str) -> io::Result<()> {
     #[cfg(test)]
     FSYNC_DIR_CALLS.with(|c| c.set(c.get() + 1));
     let path = blob_path(bucket_root, blob_id);
+    let blobs_root = bucket_root.join(BLOBS_DIR);
     if let Some(parent) = path.parent() {
-        super::directio::fsync_dir(parent)?;
+        super::directio::fsync_dir_chain(parent, &blobs_root)?;
     }
     Ok(())
 }

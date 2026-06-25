@@ -178,6 +178,47 @@ pub fn fsync_dir(dir: &Path) -> io::Result<()> {
     rustix::fs::fsync(fd.as_fd()).map_err(io::Error::from)
 }
 
+/// Codex pass F: fsync the chain of newly-created ancestor directories so that
+/// NOT JUST the leaf dir but EVERY ancestor DIRENT up to (and INCLUDING) an
+/// already-durable stop point is on stable storage before a commit/ack is
+/// considered durable.
+///
+/// When a write creates a fresh path like `blobs/{ab}/{cd}/` (or a nested
+/// manifest key path `current/a/b/c.meta`), fsyncing only the leaf dir leaves
+/// the intermediate dirents (`blobs/{ab}/`, `blobs/`) un-fsynced. A crash can
+/// then lose one of those intermediate dirents while a committed manifest /
+/// journal references the leaf — making the committed object/blob unreachable.
+/// (The "fsync only the leaf, not the newly-created ancestor chain" durability
+/// class.)
+///
+/// This walks from `leaf` upward, fsyncing each directory, and STOPS after
+/// fsyncing `stop_at` (it never goes above `stop_at`). `stop_at` must be an
+/// ancestor of (or equal to) `leaf`. Callers pick a `stop_at` that is ALREADY
+/// made durable elsewhere (e.g. `bucket_root/blobs` and `bucket_root/current`,
+/// whose dirents are fsynced by the bucket-creation path), so this chain reaches
+/// a known-durable boundary and need not climb to the filesystem root.
+///
+/// fsyncing an already-durable directory is a cheap no-op, so unconditionally
+/// walking the chain on every commit is fine. Errors are PROPAGATED — a caller
+/// under `--fsync` must not ack a commit whose ancestor dirents are not durable.
+pub fn fsync_dir_chain(leaf: &Path, stop_at: &Path) -> io::Result<()> {
+    let mut cur = leaf;
+    loop {
+        fsync_dir(cur)?;
+        if cur == stop_at {
+            break;
+        }
+        match cur.parent() {
+            // Reached the filesystem root without ever hitting `stop_at`: stop
+            // rather than fsync above the intended boundary. (A mis-paired
+            // leaf/stop_at would otherwise climb forever; this is the safety net.)
+            Some(parent) if parent != cur => cur = parent,
+            _ => break,
+        }
+    }
+    Ok(())
+}
+
 /// A5 (read-path symlink hardening): VERIFY that `rel` (a path RELATIVE to
 /// `root_dir`) resolves entirely BENEATH `root_dir` with NO symlink anywhere in the
 /// chain — including intermediate directory components, which plain `O_NOFOLLOW` (a
@@ -267,6 +308,38 @@ mod tests {
         rename(&a, &b).unwrap();
         assert!(!a.exists());
         assert!(b.exists());
+    }
+
+    #[test]
+    fn fsync_dir_chain_walks_leaf_to_stop_inclusive() {
+        // Codex pass F: fsync_dir_chain must fsync the leaf, every intermediate
+        // ancestor, AND the stop_at dir — then STOP (never climb above stop_at).
+        // We can't observe fsync directly, so assert it (a) succeeds for a real
+        // nested chain, and (b) does not error / does not require dirs above
+        // stop_at to exist.
+        let root = tempfile::tempdir().unwrap();
+        let stop = root.path().join("blobs");
+        let leaf = stop.join("ab").join("cd");
+        std::fs::create_dir_all(&leaf).unwrap();
+        // Chain from leaf up to (and including) stop_at succeeds.
+        fsync_dir_chain(&leaf, &stop).unwrap();
+        // leaf == stop_at: a single-level fsync, no climb.
+        fsync_dir_chain(&stop, &stop).unwrap();
+    }
+
+    #[test]
+    fn fsync_dir_chain_stops_at_boundary_even_if_unreachable() {
+        // Safety net: if `stop_at` is NOT an ancestor of `leaf` (mis-pairing), the
+        // walk must terminate at the filesystem root rather than loop forever. It
+        // fsyncs the existing dirs it climbs through and returns Ok (the dirs above
+        // are all real, durable dirs).
+        let root = tempfile::tempdir().unwrap();
+        let leaf = root.path().join("a").join("b");
+        std::fs::create_dir_all(&leaf).unwrap();
+        let unreachable_stop = root.path().join("not-an-ancestor");
+        std::fs::create_dir_all(&unreachable_stop).unwrap();
+        // Terminates (does not hang) and succeeds: climbs to "/" and stops.
+        fsync_dir_chain(&leaf, &unreachable_stop).unwrap();
     }
 
     #[test]

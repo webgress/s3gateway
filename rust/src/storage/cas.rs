@@ -633,6 +633,89 @@ fn delete_bucket_pause(_bucket: &str) {
     bucket_pause::pause(_bucket);
 }
 
+/// Codex pass F-3 deterministic test hook: a one-barrier handshake that parks
+/// `upload_part` AFTER its pre-lock upload validation but BEFORE it takes the
+/// bucket READ lock + calls `write_blob`. A test arms it for one `{bucket}`,
+/// parks an in-flight upload_part there, then (deterministically) aborts the
+/// upload + deletes the bucket, then releases upload_part. With the F-3 fix the
+/// resumed upload_part re-checks `head_bucket` under the read lock and returns
+/// NoSuchBucket WITHOUT recreating the torn-down bucket; without the fix it would
+/// `write_blob` and recreate `bucket/blobs/...` (a phantom bucket). No-op outside
+/// tests.
+#[inline(always)]
+fn upload_part_pre_lock_pause(_bucket: &str) {
+    #[cfg(test)]
+    upload_part_pause::pause(_bucket);
+}
+
+#[cfg(test)]
+mod upload_part_pause {
+    use std::sync::{Condvar, Mutex, OnceLock};
+
+    pub(super) struct Hook {
+        pub bucket: String,
+        state: Mutex<State>,
+        cv: Condvar,
+    }
+    #[derive(Default)]
+    struct State {
+        arrived: bool,
+        released: bool,
+    }
+
+    static HOOK: OnceLock<Mutex<Option<&'static Hook>>> = OnceLock::new();
+    static SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn slot() -> &'static Mutex<Option<&'static Hook>> {
+        HOOK.get_or_init(|| Mutex::new(None))
+    }
+
+    pub(super) fn serialize_test() -> std::sync::MutexGuard<'static, ()> {
+        SERIAL.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    impl Hook {
+        pub(super) fn arm(bucket: &str) -> &'static Hook {
+            let h = Box::leak(Box::new(Hook {
+                bucket: bucket.to_string(),
+                state: Mutex::new(State::default()),
+                cv: Condvar::new(),
+            }));
+            *slot().lock().unwrap() = Some(h);
+            h
+        }
+        pub(super) fn disarm() {
+            *slot().lock().unwrap() = None;
+        }
+        /// Block until upload_part has parked at the pre-lock point.
+        pub(super) fn wait_arrived(&self) {
+            let mut st = self.state.lock().unwrap();
+            while !st.arrived {
+                st = self.cv.wait(st).unwrap();
+            }
+        }
+        pub(super) fn release(&self) {
+            let mut st = self.state.lock().unwrap();
+            st.released = true;
+            self.cv.notify_all();
+        }
+    }
+
+    pub(super) fn pause(bucket: &str) {
+        let hook = { *slot().lock().unwrap() };
+        let Some(hook) = hook else { return };
+        if hook.bucket != bucket {
+            return;
+        }
+        let mut st = hook.state.lock().unwrap();
+        st.arrived = true;
+        hook.cv.notify_all();
+        while !st.released {
+            st = hook.cv.wait(st).unwrap();
+        }
+    }
+}
+
 /// Content-addressed store rooted at `root` (the data dir).
 #[derive(Debug, Clone)]
 pub struct CasStore {
@@ -833,6 +916,15 @@ impl CasStore {
             }
             Err(e) => return Err(e.into()),
         }
+        // Codex pass F site-4 [HIGH — durability]: under --fsync, make the new
+        // `bucket/` DIRENT durable by fsyncing the DATA-ROOT (its parent). Without
+        // this the first committed write into a fresh bucket can be lost after a
+        // crash because the bucket directory entry itself was never on stable
+        // storage. (This also makes `bucket_root` itself exist durably, so the
+        // bucket-root fsync in ensure_infra below is well-defined.)
+        if self.fsync {
+            super::directio::fsync_dir(&self.root)?;
+        }
         self.ensure_infra(name)?;
         Ok(())
     }
@@ -844,6 +936,17 @@ impl CasStore {
         std::fs::create_dir_all(self.arriving_root(bucket))?;
         std::fs::create_dir_all(self.bucket_root(bucket).join(blob::BLOBS_DIR))?;
         std::fs::create_dir_all(self.deleted_root(bucket))?;
+        // Codex pass F site-4 [HIGH — durability]: under --fsync, make the four
+        // infra-dir DIRENTS (`current/`, `arriving/`, `blobs/`, `deleted/`)
+        // durable by fsyncing the BUCKET-ROOT. Without this, the FIRST write to a
+        // fresh bucket can commit a manifest/journal/blob into an infra dir whose
+        // dirent is not yet on stable storage — a crash then loses the infra dir
+        // (and everything committed under it). Making `bucket_root/blobs` and
+        // `bucket_root/current` durable here is also what lets `fsync_dir_chain`
+        // use them as already-durable `stop_at` boundaries (F-1 / F-2).
+        if self.fsync {
+            super::directio::fsync_dir(&self.bucket_root(bucket))?;
+        }
         Ok(())
     }
 
@@ -1149,6 +1252,13 @@ impl CasStore {
         // rename landed, the new manifest's nonce matches -> OLD blobs reclaimed; if the
         // rename was lost, the nonce mismatches -> OLD blobs kept (OLD version fully
         // live). The commit is simply NOT acked; both crash branches stay consistent.
+        //
+        // Codex pass F-2 [HIGH — durability]: fsync NOT JUST `k.parent()` but the
+        // WHOLE newly-created ancestor chain from `k.parent()` up to (and including)
+        // `current/`. A nested key (`a/b/c`) `create_dir_all`s `current/a/b/`; if a
+        // crash loses an intermediate dirent (`current/a/`) the committed manifest is
+        // unreachable even though `current/a/b/` itself was fsynced. `current/` is
+        // already made durable by ensure_infra (site-4), so it is the stop_at boundary.
         if self.fsync {
             if let Some(parent) = k.parent() {
                 let fsync_res = {
@@ -1156,10 +1266,10 @@ impl CasStore {
                     if FORCE_COMMIT_DIR_FSYNC_FAIL.with(|c| c.get()) {
                         Err(io::Error::other("forced commit-dir fsync failure (test)"))
                     } else {
-                        super::directio::fsync_dir(parent)
+                        super::directio::fsync_dir_chain(parent, &current_root)
                     }
                     #[cfg(not(test))]
-                    super::directio::fsync_dir(parent)
+                    super::directio::fsync_dir_chain(parent, &current_root)
                 };
                 // POST-commit: the rename landed and the new blobs are already durable,
                 // so this is NOT a pre-commit failure — return the DEDICATED
@@ -2252,11 +2362,28 @@ impl CasStore {
         let upload_dir = self.upload_dir(bucket, upload_id)?;
         let upload = self.assert_upload_matches(&upload_dir, bucket, key)?;
 
+        // F-3 deterministic test hook: park here AFTER the pre-lock validation but
+        // BEFORE acquiring the bucket READ lock, so a test can deterministically
+        // abort the upload + delete the bucket in the window the F-3 re-check guards.
+        // No-op in production.
+        upload_part_pre_lock_pause(bucket);
+
         // A3: hold the bucket READ lock across the part-blob write + ref install, so a
         // concurrent delete_bucket cannot reclaim the bucket mid-upload. Acquired BEFORE
         // the per-key lock below (global order: bucket -> key); `upload.bucket == bucket`
         // (asserted above), so this is the same bucket the per-key lock keys on.
         let _bguard = self.rlock_bucket(bucket);
+
+        // F-3 [MED — phantom bucket]: RE-CHECK head_bucket UNDER the bucket READ lock
+        // BEFORE write_blob. The pre-lock validation above ran lock-free; an abort +
+        // DeleteBucket straggler could have torn the bucket down in the window before
+        // we took the read lock. Without this re-check, `write_blob`'s
+        // `create_dir_all(bucket/blobs/...)` would RECREATE the deleted bucket (a
+        // phantom bucket that list_buckets would then report). put_object /
+        // create_multipart_upload already re-check head_bucket under the read lock; only
+        // upload_part skipped it. Under the read lock a concurrent delete_bucket (bucket
+        // WRITE lock) cannot be mid-teardown, so once this passes the bucket stays.
+        self.head_bucket(bucket)?;
 
         let bucket_root = self.bucket_root(bucket);
         // Stream the part to a fresh immutable blob (lock-free; one-pass MD5; fsync).
@@ -6079,6 +6206,188 @@ mod tests {
             b"v2-new-and-longer-bytes"
         );
         assert_eq!(count_blobs(&bk), 1, "E-1: OLD blob reclaimed by recover(); only NEW remains");
+    }
+
+    #[test]
+    fn f2_publish_nested_key_chain_fsync_fail_is_commit_not_durable_and_withholds_reclaim() {
+        // Codex pass F-2 [HIGH — durability], LOAD-BEARING. publish() must fsync the
+        // WHOLE newly-created manifest ancestor CHAIN (from `k.parent()` up to and
+        // including `current/`) — not just `k.parent()` — before acking the commit. A
+        // crash that lost an intermediate dirent (`current/a/`) would make a committed
+        // nested-key manifest (`current/a/b/c.s3gw-live.meta`) unreachable.
+        //
+        // We verify the PROPAGATION + withheld-reclaim contract on a NESTED key (so the
+        // chain has real intermediate dirs `current/a/`, `current/a/b/`): the
+        // FORCE_COMMIT_DIR_FSYNC_FAIL hook now wraps the `fsync_dir_chain` call, so a
+        // forced chain-fsync failure on an OVERWRITE must (1) return the dedicated
+        // CommitNotDurable (post-commit, NOT a pre-commit Io rollback), (2) NOT reclaim
+        // the OLD blob, (3) keep the journal for recover(). Fail-without-fix: revert
+        // publish's chain fsync to `let _ = fsync_dir(parent)` (swallowed) and publish
+        // returns Ok despite a non-durable commit -> assertions (1)/(2)/(3) FAIL.
+        let dir = tempfile::tempdir().unwrap();
+        let fs = CasStore::with_fsync(dir.path(), true); // --fsync ON (the F-2 path)
+        fs.create_bucket("bkt").unwrap();
+        let bk = dir.path().join("bkt");
+        let key = "a/b/c.bin"; // nested -> current/a/b/ chain
+
+        // v1: the OLD version. Remember its blob id.
+        fs.put_object("bkt", key, &b"v1-old"[..], "", BTreeMap::new()).unwrap();
+        let v1_blob = {
+            let m = manifest::read_manifest(&manifest::manifest_path(&bk.join("current"), key)).unwrap();
+            m.parts[0].blob_id.clone()
+        };
+        assert_eq!(count_blobs(&bk), 1, "only v1 before the overwrite");
+
+        // Overwrite (v2) with the commit-dir CHAIN fsync forced to fail.
+        set_force_commit_dir_fsync_fail(true);
+        let res = fs.put_object("bkt", key, &b"v2-new-longer-bytes"[..], "", BTreeMap::new());
+        set_force_commit_dir_fsync_fail(false);
+
+        // (1) Dedicated post-commit error -> caller does NOT roll back the now-live blob.
+        assert!(
+            matches!(res, Err(StorageError::CommitNotDurable(_))),
+            "F-2: a nested-key overwrite that cannot durably fsync its manifest ancestor \
+             chain must fail with CommitNotDurable, got {res:?}"
+        );
+        // (1b) The NEW (now-live) blob is NOT reclaimed.
+        let v2_blob = {
+            let m = manifest::read_manifest(&manifest::manifest_path(&bk.join("current"), key)).unwrap();
+            m.parts[0].blob_id.clone()
+        };
+        assert!(blob::blob_path(&bk, &v2_blob).exists(), "F-2: NEW blob must survive");
+        assert_eq!(count_blobs(&bk), 2, "F-2: both OLD and NEW blobs present (neither reclaimed)");
+        // (2) The OLD blob is NOT reclaimed (reclaim withheld until the chain fsync lands).
+        assert!(
+            blob::blob_path(&bk, &v1_blob).exists(),
+            "F-2: the OLD blob must NOT be reclaimed when the manifest-chain fsync failed"
+        );
+        // (3) The journal is kept for recover().
+        assert_eq!(
+            list_dir(&bk.join("deleted")).len(),
+            1,
+            "F-2: the publish journal must be kept for recover() when the chain fsync failed"
+        );
+
+        // recover() settles to a CONSISTENT state (rename had landed; NEW manifest's
+        // nonce matches the journal -> OLD blob reclaimed, journal removed).
+        fs.recover().unwrap();
+        assert_object_consistent(&fs, "bkt", key)
+            .expect("F-2: after recover() the live nested-key object must reference no missing blob");
+        assert_eq!(read_all(fs.get_object("bkt", key, None).unwrap().body), b"v2-new-longer-bytes");
+        assert_eq!(count_blobs(&bk), 1, "F-2: OLD blob reclaimed by recover(); only NEW remains");
+    }
+
+    #[test]
+    fn f1_site4_fresh_bucket_put_fsyncs_full_ancestor_chain_and_round_trips() {
+        // Codex pass F-1 + site-4 [HIGH — durability], LOAD-BEARING under --fsync.
+        // On the FIRST PUT into a freshly-created bucket, the durability class requires
+        // that EVERY newly-created ancestor dirent be fsynced before the commit is acked:
+        //   * site-4: the `bucket/` dirent (data-root fsync in create_bucket) and the
+        //     four infra dirents `current/`,`arriving/`,`blobs/`,`deleted/` (bucket-root
+        //     fsync in ensure_infra);
+        //   * F-1: the blob fanout CHAIN `blobs/{ab}/{cd}/` -> `blobs/{ab}/` -> `blobs/`
+        //     (fsync_blob_dir now walks the chain, not just the leaf);
+        //   * F-2: the manifest key-path chain up to `current/` (publish, exercised here
+        //     trivially via a top-level key whose parent IS `current/`).
+        // Crash-durability itself is not observable in a unit test, so we assert the
+        // fsync CHAIN is INVOKED (fanout-dir counter incremented) and that correctness
+        // is preserved (the object round-trips), per the deliverable's guidance.
+        //
+        // Fail-without-fix: drop the create_bucket/ensure_infra fsyncs (site-4) — the
+        // round-trip still passes in-process but a fresh-bucket crash loses the bucket;
+        // drop the F-1 chain walk and a first-in-fanout blob's intermediate dirent is
+        // lost. The counter assertion below proves fsync_blob_dir (the chain entry
+        // point) ran on this first-in-fresh-bucket PUT.
+        let dir = tempfile::tempdir().unwrap();
+        let fs = CasStore::with_fsync(dir.path(), true); // --fsync ON
+        // create_bucket under --fsync now fsyncs the data-root (bucket/ dirent) and the
+        // bucket-root (infra dirents). It must succeed without error.
+        fs.create_bucket("fresh").unwrap();
+        let bk = dir.path().join("fresh");
+        assert!(bk.join("blobs").is_dir() && bk.join("current").is_dir());
+
+        let _ = blob::take_fsync_dir_calls(); // reset on this thread
+        let body = vec![3u8; 200_000];
+        // A top-level key: parent == current/, exercising the F-2 chain trivially; the
+        // blob is the FIRST in its fanout, exercising the F-1 intermediate-dir chain.
+        fs.put_object("fresh", "first-object.bin", &body[..], "application/octet-stream", BTreeMap::new())
+            .unwrap();
+        // F-1: the blob fanout-dir CHAIN fsync ran (fsync_blob_dir == chain entry point).
+        assert!(
+            blob::take_fsync_dir_calls() >= 1,
+            "F-1: the first-in-fresh-bucket PUT must fsync the blob fanout ancestor chain"
+        );
+        // Correctness preserved: the object round-trips bit-for-bit and is consistent.
+        let got = read_all(fs.get_object("fresh", "first-object.bin", None).unwrap().body);
+        assert_eq!(got, body, "F-1/site-4 first-bucket PUT must round-trip");
+        assert_object_consistent(&fs, "fresh", "first-object.bin").unwrap();
+    }
+
+    #[test]
+    fn f3_upload_part_racing_delete_bucket_returns_no_such_bucket_no_phantom() {
+        // Codex pass F-3 [MED — phantom bucket], LOAD-BEARING. upload_part validates the
+        // upload PRE-lock, takes the bucket READ lock, then write_blob's
+        // `create_dir_all(bucket/blobs/...)`. Without a head_bucket re-check UNDER the
+        // read lock, a concurrent abort + DeleteBucket straggler lets upload_part
+        // RECREATE the torn-down bucket (a phantom bucket).
+        //
+        // Deterministic interleaving (no sleeps): an upload_part thread parks at the
+        // F-3 pre-lock hook (after pre-lock validation, before the read lock). The main
+        // thread then ABORTS the upload (removes the upload dir) and DELETEs the bucket
+        // (now empty + no in-flight upload -> succeeds, removing the whole bucket).
+        // Releasing upload_part: with the fix it takes the read lock, re-checks
+        // head_bucket -> NoSuchBucket, and does NOT recreate the bucket. list_buckets is
+        // then empty (no phantom).
+        //
+        // Fail-without-fix: remove the `self.head_bucket(bucket)?` re-check in
+        // upload_part and the resumed write_blob recreates `bucket/blobs/...`; the
+        // result is Ok (a part written into a phantom bucket) and list_buckets reports
+        // "bkt" -> both asserts FAIL.
+        use std::sync::Arc;
+        let _serial = upload_part_pause::serialize_test(); // single global hook slot.
+        let dir = tempfile::tempdir().unwrap();
+        let fs = Arc::new(CasStore::with_fsync(dir.path(), false));
+        fs.create_bucket("bkt").unwrap();
+        let bk = dir.path().join("bkt");
+        let key = "mp/object";
+        let upload_id = fs
+            .create_multipart_upload("bkt", key, "application/octet-stream", BTreeMap::new())
+            .unwrap();
+
+        let hook = upload_part_pause::Hook::arm("bkt");
+
+        // Thread U: upload_part. Parks at the pre-lock hook (validation already passed).
+        let fu = Arc::clone(&fs);
+        let uid = upload_id.clone();
+        let u = std::thread::spawn(move || fu.upload_part("bkt", "mp/object", &uid, 1, &vec![5u8; 4096][..]));
+        hook.wait_arrived();
+
+        // While U is parked: abort the upload (remove the upload dir) then delete the
+        // bucket. With no in-flight upload + no objects, DeleteBucket SUCCEEDS.
+        fs.abort_multipart_upload("bkt", key, &upload_id).unwrap();
+        fs.delete_bucket("bkt").unwrap();
+        assert!(!bk.exists(), "the bucket dir must be gone after a successful DeleteBucket");
+
+        // Release U: it takes the read lock and re-checks head_bucket.
+        hook.release();
+        let res = u.join().unwrap();
+        upload_part_pause::Hook::disarm();
+
+        // LOAD-BEARING #1: upload_part must fail NoSuchBucket (the F-3 re-check fired).
+        assert!(
+            matches!(res, Err(StorageError::BucketNotFound)),
+            "F-3: upload_part racing a successful DeleteBucket must return NoSuchBucket, got {res:?}"
+        );
+        // LOAD-BEARING #2: NO phantom bucket — the bucket dir was NOT recreated, and
+        // list_buckets reports none.
+        assert!(
+            !bk.exists(),
+            "F-3: upload_part must NOT recreate the torn-down bucket (no phantom bucket dir)"
+        );
+        assert!(
+            fs.list_buckets().unwrap().is_empty(),
+            "F-3: a phantom bucket must not appear in list_buckets"
+        );
     }
 
     #[test]
