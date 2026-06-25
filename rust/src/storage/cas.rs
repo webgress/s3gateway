@@ -1179,6 +1179,12 @@ impl CasStore {
             if !entry.file_type()?.is_dir() {
                 continue; // staged {uuid}.manifest temps are not uploads.
             }
+            // A completed-but-not-yet-removed upload dir is no longer addressable via S3
+            // (consistent with ListMultipartUploads and assert_upload_matches); it must not
+            // wedge DeleteBucket with BucketNotEmpty.
+            if entry.path().join("completed").exists() {
+                continue;
+            }
             if read_nofollow(&entry.path().join("upload.json")).is_ok() {
                 return Ok(true);
             }
@@ -6318,6 +6324,65 @@ mod tests {
         assert!(
             !uploads.iter().any(|u| u.upload_id == upload_id),
             "a completed upload must not appear in ListMultipartUploads"
+        );
+    }
+
+    #[test]
+    fn pass_k_delete_bucket_ignores_completed_upload_dir() {
+        // Codex pass K [MEDIUM — consistency], LOAD-BEARING. A completed-but-not-yet-
+        // removed `arriving/{uuid}/` dir (Complete committed durably + wrote the
+        // `completed` marker, but its best-effort rmdir failed or the process crashed)
+        // is no longer addressable via S3: it is NOT listed (ListMultipartUploads) and
+        // NOT abortable (assert_upload_matches -> NoSuchUpload). Such a survivor must NOT
+        // wedge DeleteBucket with BucketNotEmpty — has_in_flight_upload must skip it, the
+        // same way the other two `arriving/{uuid}/` walkers honor the `completed` marker.
+        //
+        // Fail-without-fix: remove the `completed`-marker `continue` block in
+        // has_in_flight_upload and this test FAILS (has_in_flight_upload -> true,
+        // delete_bucket -> BucketNotEmpty).
+        let (dir, fs) = store(); // creates an empty "bkt"
+        let arriving = dir.path().join("bkt").join("arriving");
+
+        // A marker-LESS upload dir (upload.json only) IS in-flight -> true.
+        let live_id = "00000000-0000-0000-0000-0000000000aa";
+        let live_dir = arriving.join(live_id);
+        std::fs::create_dir_all(live_dir.join("parts")).unwrap();
+        std::fs::write(
+            live_dir.join("upload.json"),
+            serde_json::to_vec(&MultipartUpload {
+                upload_id: live_id.into(),
+                bucket: "bkt".into(),
+                key: "k/live".into(),
+                initiated_unix: now_unix(),
+                content_type: "application/octet-stream".into(),
+                user_metadata: BTreeMap::new(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            fs.has_in_flight_upload("bkt").unwrap(),
+            "a marker-less upload dir (upload.json only) is in-flight"
+        );
+        assert!(
+            matches!(fs.delete_bucket("bkt"), Err(StorageError::BucketNotEmpty)),
+            "DeleteBucket must refuse while a live upload exists"
+        );
+
+        // Add the `completed` marker (Complete finished, rmdir did not) -> no longer
+        // in-flight. With only this completed survivor present, the predicate is false.
+        std::fs::write(live_dir.join("completed"), b"1").unwrap();
+        assert!(
+            !fs.has_in_flight_upload("bkt").unwrap(),
+            "a completed-marker upload dir is NOT in-flight (must not wedge DeleteBucket)"
+        );
+
+        // And DeleteBucket SUCCEEDS, tearing down the whole tree (including the survivor).
+        fs.delete_bucket("bkt")
+            .expect("DeleteBucket must clear once only completed-marker upload dirs remain");
+        assert!(
+            matches!(fs.head_bucket("bkt"), Err(StorageError::BucketNotFound)),
+            "bucket is gone after a successful DeleteBucket"
         );
     }
 
