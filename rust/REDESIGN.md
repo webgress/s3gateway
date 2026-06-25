@@ -852,6 +852,23 @@ acceptable for a pre-deployment clean break. Document this in README/DESIGN.
   leaves the journal in place so `recover()` retries the reclaim (the §3.2 nonce / "K absent"
   rules keep the retry safe), instead of dropping the journal and leaking the blob.
 
+### 13.7 Codex review pass L — resolutions & accepted residuals
+
+- **L1 — UploadPart fsyncs the part-blob fanout dir before acking (durability fix, IMPLEMENTED).**
+  Under `--fsync`, `upload_part` now `fsync_blob_dir`s the new part blob's fanout DIRENT
+  immediately after `write_blob` and BEFORE the `.ref` is made durable — mirroring the publish
+  paths (`put_object`, Complete's `move_blob_to_new_id`), which `upload_part` previously skipped.
+  Without it the acked `.ref`'s parent-dir fsync (on the disjoint `parts/` tree) never made the
+  blob dirent durable, so a crash could keep an acked part whose blob was lost → later Complete
+  `InvalidPart`. On a fanout-fsync error the just-written blob is reclaimed (best-effort) before
+  the error propagates, so no orphan is left (mirrors `put_object`'s C1-residual reclaim).
+- **L2 — Completed-marker dir-fsync stays non-fatal (ACCEPTED LOW residual, by design).** The
+  `fsync_dir` of the `completed`-marker upload dir in `complete_multipart_upload` is intentionally
+  non-fatal: the object is already durably published, so Complete must NOT gate on it. A lost
+  marker dirent after a rare dir-fsync-EIO + crash/rmdir-failure can re-expose a completed upload
+  as in-flight (a wedged `DeleteBucket`, recoverable via the opt-in `gc_abandoned_uploads`) — an
+  accepted LOW durability-rigor residual, no data loss.
+
 ---
 
 ## 14. Phased implementation plan (dispatchable to coders)

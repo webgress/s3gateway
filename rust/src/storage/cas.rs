@@ -192,6 +192,22 @@ pub(crate) fn set_force_put_blob_dir_fsync_fail(v: bool) {
     FORCE_PUT_BLOB_DIR_FSYNC_FAIL.with(|c| c.set(v));
 }
 
+// Codex pass L test hook: when armed, `upload_part`'s pre-ref `fsync_blob_dir` (under
+// --fsync) is forced to fail, so a test can prove the just-written part blob is
+// RECLAIMED (not leaked as an orphan) before the error is propagated. This fsync runs
+// BEFORE the per-key lock + .ref install, so its error never reaches the ref-install
+// rollback arms — the explicit reclaim in upload_part is what prevents the orphan.
+// Thread-local; compiles out in non-test builds.
+#[cfg(test)]
+thread_local! {
+    static FORCE_UPLOAD_PART_BLOB_DIR_FSYNC_FAIL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_force_upload_part_blob_dir_fsync_fail(v: bool) {
+    FORCE_UPLOAD_PART_BLOB_DIR_FSYNC_FAIL.with(|c| c.set(v));
+}
+
 // E-1/E-2 test hook: when armed, the post-commit `current/`-dir fsync in BOTH
 // `publish` (after the commit rename) and `delete_object` (after the manifest
 // unlink), under --fsync, is forced to fail — so a test can prove the error is
@@ -2579,6 +2595,34 @@ impl CasStore {
         // The big I/O happens BEFORE the per-key lock is taken — no lock is ever held
         // across a streaming body read.
         let info = blob::write_blob(&bucket_root, body).map_err(body_or_io)?;
+        // Codex pass L [MED — durability]: under --fsync, make the part blob's fanout
+        // DIRENT durable (write_blob fsyncs only the file + create_dir_all's the fanout)
+        // BEFORE the `.ref` that references it is made durable below — otherwise a crash
+        // after the 200 can preserve the acked `.ref` (its parent-dir fsync is on the
+        // DISJOINT `parts/` tree) while losing the blob's dirent -> blob unreachable ->
+        // a later Complete stats the blob (ENOENT) -> InvalidPart. Both publish paths
+        // (put_object ~1230, complete's move_blob_to_new_id) already fsync the blob
+        // fanout dir before committing; upload_part was the inconsistent outlier. This
+        // fsync runs BEFORE the per-key lock + ref install below, so (mirroring
+        // put_object's C1-residual) its error returns WITHOUT reaching the ref-install
+        // rollback arms — reclaim the just-written blob (best-effort) before propagating
+        // so no orphan is left.
+        if self.fsync {
+            let fsync_res = {
+                #[cfg(test)]
+                if FORCE_UPLOAD_PART_BLOB_DIR_FSYNC_FAIL.with(|c| c.get()) {
+                    Err(io::Error::other("forced upload_part blob-dir fsync failure (test)"))
+                } else {
+                    blob::fsync_blob_dir(&bucket_root, &info.blob_id)
+                }
+                #[cfg(not(test))]
+                blob::fsync_blob_dir(&bucket_root, &info.blob_id)
+            };
+            if let Err(e) = fsync_res {
+                let _ = blob::reclaim_blob(&bucket_root, &info.blob_id);
+                return Err(StorageError::Io(e));
+            }
+        }
         let etag = format!("\"{}\"", info.md5_hex);
 
         // Take the per-key WRITE lock around the .ref install (read-prev + tmp-write
@@ -3035,6 +3079,11 @@ impl CasStore {
         // uploadId as in-flight. Non-fatal: the object is already durably published, so this
         // is a hygiene backstop, not a commit gate. MUST come BEFORE the remove_dir_all below
         // (the rmdir already tolerates a surviving dir).
+        // Pass L [accepted LOW residual]: Intentionally non-fatal: the object is already
+        // durably published at publish() above, so we must NOT gate Complete on this. A lost
+        // marker dirent after a rare dir-fsync-EIO + crash/rmdir-failure can re-expose a
+        // completed upload as in-flight (wedged DeleteBucket, recoverable via opt-in
+        // gc_abandoned_uploads) — an accepted LOW durability-rigor residual, no data loss.
         if self.fsync {
             #[cfg(test)]
             bump_pass_i_fsync();
@@ -5904,6 +5953,106 @@ mod tests {
         let got = read_all(fs.get_object("bkt", key, None).unwrap().body);
         assert_eq!(got, want, "C1 Complete must round-trip the assembled object");
         assert_object_consistent(&fs, "bkt", key).unwrap();
+    }
+
+    #[test]
+    fn pass_l_upload_part_fsyncs_blob_fanout_dir_under_fsync() {
+        // Codex pass L [MED — durability], LOAD-BEARING under --fsync. UploadPart writes a
+        // fresh part blob, then makes its `.ref` durable; without the fix the blob's fanout
+        // DIRENT is never fsynced (the `.ref`'s parent-dir fsync is on the DISJOINT `parts/`
+        // tree), so a crash can keep the acked `.ref` while losing the blob -> later Complete
+        // InvalidPart. The fix fsyncs the blob fanout dir BEFORE the `.ref` is staged, exactly
+        // like put_object/complete. We assert (a) the fanout-dir fsync RAN (the shared C1
+        // counter incremented across the upload_part call) and (b) the part round-trips via
+        // Complete. Fail-without-fix: drop the new `fsync_blob_dir` block in upload_part and
+        // the counter stays 0 -> this asserts FAIL.
+        let dir = tempfile::tempdir().unwrap();
+        let fs = CasStore::with_fsync(dir.path(), true); // --fsync ON
+        fs.create_bucket("bkt").unwrap();
+        let key = "pass-l/upload-part/object.bin";
+        let upload_id = fs
+            .create_multipart_upload("bkt", key, "application/octet-stream", BTreeMap::new())
+            .unwrap();
+
+        let _ = blob::take_fsync_dir_calls(); // reset on this thread, right before UploadPart
+        let body = vec![9u8; 100_000];
+        let etag = fs.upload_part("bkt", key, &upload_id, 1, &body[..]).unwrap();
+        assert!(
+            blob::take_fsync_dir_calls() >= 1,
+            "UploadPart under --fsync must fsync the part blob's fanout dir (pass L)"
+        );
+
+        // The part is intact: Complete assembles it and the object round-trips bit-for-bit.
+        let complete = vec![CompletePart { part_number: 1, etag }];
+        fs.complete_multipart_upload("bkt", key, &upload_id, &complete).unwrap();
+        let got = read_all(fs.get_object("bkt", key, None).unwrap().body);
+        assert_eq!(got, body, "pass L: the part must round-trip through Complete");
+
+        // Control: with --fsync OFF the new path is NOT taken (no fanout-dir fsync), but the
+        // part still round-trips.
+        let dir2 = tempfile::tempdir().unwrap();
+        let fs2 = CasStore::with_fsync(dir2.path(), false);
+        fs2.create_bucket("bkt").unwrap();
+        let upload_id2 = fs2
+            .create_multipart_upload("bkt", "k", "", BTreeMap::new())
+            .unwrap();
+        let _ = blob::take_fsync_dir_calls();
+        let etag2 = fs2.upload_part("bkt", "k", &upload_id2, 1, &body[..]).unwrap();
+        assert_eq!(
+            blob::take_fsync_dir_calls(),
+            0,
+            "no blob fanout-dir fsync should run in upload_part without --fsync"
+        );
+        let complete2 = vec![CompletePart { part_number: 1, etag: etag2 }];
+        fs2.complete_multipart_upload("bkt", "k", &upload_id2, &complete2).unwrap();
+        assert_eq!(read_all(fs2.get_object("bkt", "k", None).unwrap().body), body);
+    }
+
+    #[test]
+    fn pass_l_upload_part_reclaims_blob_on_blob_dir_fsync_error() {
+        // Codex pass L [MED — durability] rollback, LOAD-BEARING for the reclaim. In
+        // upload_part the pre-ref `fsync_blob_dir` (under --fsync) runs BEFORE the per-key
+        // lock + `.ref` install, so its error returns WITHOUT reaching the ref-install
+        // rollback arms — leaking the just-written part blob as an orphan. The fix reclaims
+        // that blob (best-effort) before propagating the error, so NO orphan is left
+        // (mirroring put_object's C1-residual reclaim).
+        //
+        // The FORCE_UPLOAD_PART_BLOB_DIR_FSYNC_FAIL hook forces ONLY that fsync to fail, so
+        // the blob FILE is written but its fanout-dir fsync errors — isolating exactly this
+        // path. Fail-without-fix: drop the reclaim before the error return and count_blobs
+        // would be 1 (orphan leaked).
+        let dir = tempfile::tempdir().unwrap();
+        let fs = CasStore::with_fsync(dir.path(), true); // --fsync ON (the pass-L path)
+        fs.create_bucket("bkt").unwrap();
+        let bk = dir.path().join("bkt");
+        let key = "pass-l/reclaim";
+        let upload_id = fs
+            .create_multipart_upload("bkt", key, "application/octet-stream", BTreeMap::new())
+            .unwrap();
+
+        set_force_upload_part_blob_dir_fsync_fail(true);
+        let res = fs.upload_part("bkt", key, &upload_id, 1, &b"orphan-on-fsync-error"[..]);
+        set_force_upload_part_blob_dir_fsync_fail(false);
+
+        assert!(
+            matches!(res, Err(StorageError::Io(_))),
+            "the blob-dir fsync error must propagate from upload_part, got {res:?}"
+        );
+        // The just-written part blob was RECLAIMED before the error returned -> no orphan.
+        assert_eq!(
+            count_blobs(&bk),
+            0,
+            "pass L: the orphan part blob must be reclaimed on a blob-dir fsync error"
+        );
+        // No `.ref` was installed (the failure returned before the per-key ref install).
+        assert!(!bk.join("arriving").join(&upload_id).join("parts").join("00001.ref").exists());
+
+        // A subsequent (un-armed) UploadPart succeeds and leaves exactly one blob.
+        let etag = fs.upload_part("bkt", key, &upload_id, 1, &b"hello"[..]).unwrap();
+        assert_eq!(count_blobs(&bk), 1);
+        let complete = vec![CompletePart { part_number: 1, etag }];
+        fs.complete_multipart_upload("bkt", key, &upload_id, &complete).unwrap();
+        assert_eq!(read_all(fs.get_object("bkt", key, None).unwrap().body), b"hello");
     }
 
     #[test]
