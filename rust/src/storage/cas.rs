@@ -210,6 +210,32 @@ pub(crate) fn set_force_commit_dir_fsync_fail(v: bool) {
     FORCE_COMMIT_DIR_FSYNC_FAIL.with(|c| c.set(v));
 }
 
+// Codex pass I test hook: a THREAD-LOCAL counter of the idempotent/already-done
+// durability fsyncs added by pass I — the three sites where a success path that
+// short-circuits BEFORE the op's normal durability fsync (delete of an absent
+// key, create_bucket on an existing bucket, delete_bucket data-root) must STILL
+// force the prior in-flight write durable on a retry. Each such site bumps this
+// when it runs under --fsync, so a test can assert "the durability fsync ran on
+// this idempotent path" (a crash itself is not unit-testable). THREAD-LOCAL (not
+// process-wide): the pass-I sites run on the CALLING thread in unit tests, so a
+// per-thread counter makes a before/after delta DETERMINISTIC and load-bearing —
+// a parallel test bumping the same site on another thread cannot pollute this
+// thread's count. Compiles out entirely in non-test builds.
+#[cfg(test)]
+thread_local! {
+    static PASS_I_FSYNC_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn bump_pass_i_fsync() {
+    PASS_I_FSYNC_COUNT.with(|c| c.set(c.get() + 1));
+}
+
+#[cfg(test)]
+pub(crate) fn pass_i_fsync_count() -> u64 {
+    PASS_I_FSYNC_COUNT.with(|c| c.get())
+}
+
 /// Test-only, DETERMINISTIC injection points that let a test reproduce the exact
 /// two-writer interleaving the per-key publish lock (`lock_key`) exists to
 /// prevent — without any sleeps or timing races. Ported from the (removed)
@@ -995,7 +1021,24 @@ impl CasStore {
         match std::fs::create_dir(&path) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                return Err(StorageError::BucketExists)
+                // Codex pass I (I-2) [MED — durability]: the bucket already exists, so
+                // this is the IDEMPOTENT create path (the handler maps BucketExists ->
+                // 200). But this short-circuit would otherwise return BEFORE the site-4
+                // data-root fsync AND before ensure_infra, so a RETRY of a create whose
+                // FIRST attempt's data-root fsync FAILED would ack 200 while the bucket
+                // dirent is still non-durable. Make the durability HONEST on the retry:
+                // re-run ensure_infra (idempotent; it fsyncs the bucket-root so the four
+                // infra dirents are durable) and fsync the DATA-ROOT (so the bucket
+                // dirent itself is durable). Both are cheap no-ops once durable. We then
+                // STILL return BucketExists — the handler's 200 mapping is unchanged;
+                // only the durability of the ack is fixed.
+                if self.fsync {
+                    self.ensure_infra(name)?;
+                    super::directio::fsync_dir(&self.root)?;
+                    #[cfg(test)]
+                    bump_pass_i_fsync();
+                }
+                return Err(StorageError::BucketExists);
             }
             Err(e) => return Err(e.into()),
         }
@@ -1106,6 +1149,17 @@ impl CasStore {
         // Empty: tear down the whole bucket (infra dirs + any orphan blobs / staged
         // temps / spent journals included).
         std::fs::remove_dir_all(&path)?;
+        // Codex pass I (delete_bucket data-root, symmetric to create_bucket's site-4)
+        // [MED — durability]: under --fsync, make the bucket-REMOVAL dirent durable by
+        // fsyncing the DATA-ROOT (the bucket's parent) BEFORE we ack the 204. Without
+        // this the removal is acked non-durably, so a crash can RESURRECT the just-
+        // deleted bucket (resurrected-but-consistent; no corruption). Errors PROPAGATE
+        // — a delete_bucket that cannot make the removal durable must not ack success.
+        if self.fsync {
+            super::directio::fsync_dir(&self.root)?;
+            #[cfg(test)]
+            bump_pass_i_fsync();
+        }
         Ok(())
     }
 
@@ -1427,7 +1481,45 @@ impl CasStore {
         // K absent -> idempotent success (after head_bucket above, mirrors C7).
         let old = match manifest::read_manifest(&k) {
             Ok(m) => m,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                // Codex pass I (I-1) [MED — durability]: this is the IDEMPOTENT
+                // absent-key path — a delete of a key whose manifest is already gone
+                // returns 204. But a RETRY of a delete whose FIRST attempt's unlink
+                // SUCCEEDED while its post-unlink manifest-parent dir fsync FAILED would
+                // ack 204 here WITHOUT ever making that earlier unlink durable -> a crash
+                // could RESURRECT the acked-deleted object (resurrected-but-consistent;
+                // no corruption). Make the durability HONEST on the retry: under --fsync,
+                // fsync the manifest-parent dir before returning. A real fsync error
+                // PROPAGATES (don't ack a non-durable delete); a NotFound on the dir
+                // itself (a never-existed key, or the parent already pruned) is a no-op
+                // -> Ok. Cheap no-op for a key that never existed; forces the prior
+                // in-flight unlink durable on the retry.
+                if self.fsync {
+                    if let Some(parent) = k.parent() {
+                        let fsync_res = {
+                            #[cfg(test)]
+                            if FORCE_COMMIT_DIR_FSYNC_FAIL.with(|c| c.get()) {
+                                Err(io::Error::other("forced commit-dir fsync failure (test)"))
+                            } else {
+                                super::directio::fsync_dir(parent)
+                            }
+                            #[cfg(not(test))]
+                            super::directio::fsync_dir(parent)
+                        };
+                        match fsync_res {
+                            Ok(()) => {
+                                #[cfg(test)]
+                                bump_pass_i_fsync();
+                            }
+                            // The parent dir itself never existed / was already pruned:
+                            // nothing to make durable, so the idempotent delete succeeds.
+                            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                            Err(e) => return Err(e.into()),
+                        }
+                    }
+                }
+                return Ok(());
+            }
             Err(e) => return Err(e.into()),
         };
 
@@ -6662,6 +6754,138 @@ mod tests {
         // And it is usable (a put round-trips), proving a consistent, non-half-created state.
         fs.put_object("bkt", "after", &b"ok"[..], "", BTreeMap::new()).unwrap();
         assert_eq!(read_all(fs.get_object("bkt", "after", None).unwrap().body), b"ok");
+    }
+
+    // ---- Codex pass I: honest durability ACK on idempotent/already-done success paths ----
+
+    #[test]
+    fn pass_i1_delete_absent_key_fsyncs_manifest_parent_under_fsync() {
+        // I-1 [MED — durability]. delete_object's IDEMPOTENT absent-key path (manifest
+        // already gone -> 204) must, under --fsync, fsync the manifest-parent dir before
+        // returning Ok. Rationale: a RETRY of a delete whose first attempt's unlink
+        // SUCCEEDED but post-unlink dir fsync FAILED would otherwise ack 204 here without
+        // ever making that earlier unlink durable -> a crash could resurrect the acked-
+        // deleted object. A crash is not unit-testable, so we assert the durability fsync
+        // RAN on this path (pass-I counter +1) and the op still returns Ok.
+        let dir = tempfile::tempdir().unwrap();
+        let fs = CasStore::with_fsync(dir.path(), true); // --fsync ON
+        fs.create_bucket("bkt").unwrap();
+
+        // Put then delete a key so its manifest-parent dir (current/) EXISTS; a second
+        // delete of the SAME (now-absent) key exercises the idempotent absent-key path on
+        // a parent that exists — exactly the retry-of-a-real-delete scenario.
+        fs.put_object("bkt", "k", &b"v"[..], "", BTreeMap::new()).unwrap();
+        fs.delete_object("bkt", "k").unwrap();
+
+        let before = pass_i_fsync_count();
+        let res = fs.delete_object("bkt", "k"); // absent now -> idempotent success
+        let after = pass_i_fsync_count();
+
+        assert!(res.is_ok(), "I-1: idempotent delete of an absent key must return Ok, got {res:?}");
+        assert!(
+            after > before,
+            "I-1: the absent-key delete path under --fsync must fsync the manifest parent dir \
+             (pass-I counter must increase): before={before} after={after}"
+        );
+    }
+
+    #[test]
+    fn pass_i1_delete_absent_key_propagates_manifest_parent_fsync_error() {
+        // I-1 [MED — durability], LOAD-BEARING. The absent-key fsync must PROPAGATE a real
+        // fsync error (not swallow it): an idempotent retry whose durability fsync FAILS
+        // must NOT ack 204. The FORCE_COMMIT_DIR_FSYNC_FAIL hook forces ONLY that fsync to
+        // fail (it now also wraps the absent-key path), so delete returns Err.
+        //
+        // Fail-without-fix: remove the absent-path fsync (revert I-1) and the retry returns
+        // Ok despite a non-durable prior unlink -> this assertion FAILS (the err vanishes).
+        let dir = tempfile::tempdir().unwrap();
+        let fs = CasStore::with_fsync(dir.path(), true);
+        fs.create_bucket("bkt").unwrap();
+        fs.put_object("bkt", "k", &b"v"[..], "", BTreeMap::new()).unwrap();
+        fs.delete_object("bkt", "k").unwrap(); // now absent; current/ parent exists
+
+        set_force_commit_dir_fsync_fail(true);
+        let res = fs.delete_object("bkt", "k"); // absent-key path; forced fsync failure
+        set_force_commit_dir_fsync_fail(false);
+
+        assert!(
+            matches!(res, Err(StorageError::Io(_))),
+            "I-1: an idempotent absent-key delete whose manifest-parent fsync FAILS must \
+             return Err (honest durability ACK), got {res:?}"
+        );
+    }
+
+    #[test]
+    fn pass_i1_delete_never_existed_key_is_ok_without_fsync_error() {
+        // I-1 corollary. For a key that NEVER existed (manifest-parent dir absent) the
+        // fsync targets a non-existent dir; a NotFound on the dir itself is a no-op and the
+        // idempotent delete still succeeds (Ok) — it must NOT surface NotFound as an error.
+        let dir = tempfile::tempdir().unwrap();
+        let fs = CasStore::with_fsync(dir.path(), true);
+        fs.create_bucket("bkt").unwrap();
+        // Deeply-nested key whose parent dir under current/ has never been created.
+        let res = fs.delete_object("bkt", "never/created/here/k");
+        assert!(
+            res.is_ok(),
+            "I-1: delete of a never-existed key must be idempotent Ok even when its \
+             manifest-parent dir does not exist, got {res:?}"
+        );
+    }
+
+    #[test]
+    fn pass_i2_create_bucket_existing_fsyncs_data_root_under_fsync() {
+        // I-2 [MED — durability]. create_bucket on an ALREADY-EXISTING bucket is the
+        // idempotent create path (handler maps BucketExists -> 200). Under --fsync it must
+        // re-run ensure_infra + fsync the data-root so a RETRY of a create whose first
+        // attempt's data-root fsync FAILED makes the bucket dirent durable before acking.
+        // Assert the durability fsync RAN (counter +1) and the result is still the
+        // idempotent BucketExists.
+        let dir = tempfile::tempdir().unwrap();
+        let fs = CasStore::with_fsync(dir.path(), true); // --fsync ON
+        fs.create_bucket("bkt").unwrap(); // first create
+
+        let before = pass_i_fsync_count();
+        let res = fs.create_bucket("bkt"); // already exists -> idempotent path
+        let after = pass_i_fsync_count();
+
+        assert!(
+            matches!(res, Err(StorageError::BucketExists)),
+            "I-2: create_bucket on an existing bucket must return the idempotent \
+             BucketExists (handler maps to 200), got {res:?}"
+        );
+        assert!(
+            after > before,
+            "I-2: the create-exists path under --fsync must fsync the data-root \
+             (pass-I counter must increase): before={before} after={after}"
+        );
+        // And the bucket is still consistent/usable after the idempotent retry.
+        assert!(dir.path().join("bkt").join("current").is_dir());
+    }
+
+    #[test]
+    fn pass_i_delete_bucket_fsyncs_data_root_before_ok() {
+        // delete_bucket data-root fold-in [MED — durability]. A successful delete_bucket
+        // under --fsync must fsync the DATA-ROOT (so the bucket-removal dirent is durable)
+        // BEFORE acking the 204 — symmetric to create_bucket's site-4. Assert the
+        // durability fsync RAN (counter +1) and the bucket is gone.
+        let dir = tempfile::tempdir().unwrap();
+        let fs = CasStore::with_fsync(dir.path(), true); // --fsync ON
+        fs.create_bucket("bkt").unwrap();
+
+        let before = pass_i_fsync_count();
+        let res = fs.delete_bucket("bkt"); // empty -> removed
+        let after = pass_i_fsync_count();
+
+        assert!(res.is_ok(), "delete_bucket of an empty bucket must succeed, got {res:?}");
+        assert!(
+            after > before,
+            "delete_bucket under --fsync must fsync the data-root before Ok \
+             (pass-I counter must increase): before={before} after={after}"
+        );
+        assert!(
+            !dir.path().join("bkt").exists(),
+            "delete_bucket must remove the bucket dir"
+        );
     }
 
     #[test]
